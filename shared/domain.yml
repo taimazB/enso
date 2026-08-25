@@ -1,0 +1,77 @@
+# Grid geometry and variable metadata, shared by `api` and `process`.
+#
+# Two grids are described here and they must not be confused:
+#
+#   `global`  — the full NOAA OISST v2.1 0.25-degree grid. Cell indices stored in
+#               ClickHouse (`gy`, `gx`) are indices into THIS grid, never into the
+#               regional subset. That is deliberate: if the archive is ever
+#               re-subset to a wider box, previously-ingested rows keep their
+#               identity and no reindex or re-ingest is needed.
+#
+#   `subset`  — the box the NetCDF files on disk actually cover, produced by
+#               `cdo -sellonlatbox,-180,-90,0,90`. Used for map extents, sanity
+#               checks at ingest time, and the default render bounds. Widen this
+#               after a re-subset; the schema does not change.
+
+global:
+  resolution: 0.25
+  # Cell-centre of index 0 on each axis.
+  lat0: -89.875
+  lon0: 0.125
+  nlat: 720   # gy in [0, 719]
+  nlon: 1440  # gx in [0, 1439]
+
+subset:
+  name: North Pacific
+  # Cell-centre bounds of the files currently in ./data (degrees_east 0-360).
+  lat_min: 0.125
+  lat_max: 89.875
+  lon_min: 180.125
+  lon_max: 269.875
+  nlat: 360
+  nlon: 360
+
+variables:
+  anom:
+    long_name: Daily sea surface temperature anomaly
+    short_name: SST anomaly
+    units: degC
+    precision: 2
+    # Source encoding: short * scale_factor + add_offset, _FillValue -999.
+    scale_factor: 0.01
+    add_offset: 0.0
+    fill_value: -999
+    # Symmetric diverging range for map rendering, in units above. Daily values
+    # reach about +/-5 at the extremes, but saturating at +/-3 is what makes an
+    # ordinary day readable rather than uniformly pale. Change here and both the
+    # rendered PNGs and the frontend legend follow.
+    vmin: -3.0
+    vmax: 3.0
+    colormap: RdBu_r
+
+# Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
+# degrees_east (0-360) / degrees_north. Boxes not fully inside `subset` are
+# flagged `partial: true` — they are computable but truncated by the current box.
+regions:
+  ne_pacific:
+    label: NE Pacific (the Blob)
+    lat: [40.0, 60.0]
+    lon: [200.0, 235.0]
+  gulf_of_alaska:
+    label: Gulf of Alaska
+    lat: [50.0, 60.0]
+    lon: [205.0, 225.0]
+  bering_sea:
+    label: Bering Sea
+    lat: [55.0, 65.0]
+    lon: [180.0, 200.0]
+  pdo_north_pacific:
+    label: North Pacific (PDO domain)
+    lat: [20.0, 70.0]
+    lon: [180.0, 250.0]
+  nino34:
+    label: Nino 3.4
+    lat: [-5.0, 5.0]
+    lon: [190.0, 240.0]
+    # The current subset is clipped at the equator, so only 0-5N is present.
+    partial: true

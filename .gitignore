@@ -1,0 +1,52 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+*.log
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# === Virtualenv tool (uv) ===
+.venv-*/
+
+# === NetCDF / large data ===
+**.nc
+*.nc4
+
+# === Downloaded data (the OISST archive lives here, untracked) ===
+data/
+
+# === ClickHouse local volumes ===
+clickhouse/data/
+clickhouse/logs/
+
+# === Generated tiles / rendered imagery ===
+out_tiles/
+front/public/tiles/
+
+# === Node / Nuxt (front) ===
+node_modules/
+/front/.nuxt/
+/front/.output/
+/front/dist/
+/front/.cache/
+npm-debug.log*
+yarn-error.log*
+
+# === Env files (secrets) ===
+.env
+.env.*
+!.env.example
+
+# === Docker / CI / Editor ===
+docker-compose.yml
+docker-compose.override.yml
+.vscode/
+.idea/
+.DS_Store
+
+/secrets
+*.native

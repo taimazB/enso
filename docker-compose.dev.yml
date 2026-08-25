@@ -1,0 +1,113 @@
+services:
+  front:
+    build:
+      target: development
+      context: ./front
+      args:
+        - NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL:-http://localhost:9021}
+        - NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION:-unknown}
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "${FRONT_PORT:-3000}:3000"
+    volumes:
+      - ./front:/app
+      - /app/node_modules
+    environment:
+      - NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL:-http://localhost:9021}
+      # Used only by the Nitro server during SSR; the browser never sees it.
+      - API_INTERNAL_BASE_URL=${API_INTERNAL_BASE_URL:-http://api:4000}
+      - NUXT_PUBLIC_MAPBOX_TOKEN=${NUXT_PUBLIC_MAPBOX_TOKEN:-}
+      - NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION:-unknown}
+    depends_on:
+      - api
+    env_file:
+      - .env.dev
+    command: npm run dev
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    # Rendered tiles are cached into the bind-mounted ./data; without this they
+    # land root-owned on the host.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./api:/app
+      - ./shared:/app/shared
+      - ./data:/opt/data
+    ports:
+      - "${API_PORT:-4000}:4000"
+    env_file:
+      - .env.dev
+    environment:
+      - HDF5_USE_FILE_LOCKING=FALSE
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      # ClickHouse: local docker-compose instance (db-ch service) by default
+      - CH_HOST=${CH_HOST:-db-ch}
+      - CH_PORT=${CH_PORT:-8123}
+      - CH_USER=${CH_USER:-default}
+      - CH_PASSWORD=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}
+      - CH_DATABASE=${CH_DATABASE:-enso}
+      # Set CH_USE_REMOTE=true and CH_REMOTE_URL to query a remote ClickHouse instead
+      - CH_USE_REMOTE=${CH_USE_REMOTE:-false}
+      - CH_REMOTE_URL=${CH_REMOTE_URL:-}
+      - CH_REMOTE_USER=${CH_REMOTE_USER:-}
+      - CH_REMOTE_PASSWORD=${CH_REMOTE_PASSWORD:-}
+    depends_on:
+      db-ch:
+        condition: service_healthy
+    command: uvicorn SERVER:app --reload --host 0.0.0.0 --port 4000
+    restart: unless-stopped
+
+  db-ch:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "${CH_HTTP_PORT:-9023}:8123"
+      - "${CH_NATIVE_PORT:-9024}:9000"
+    volumes:
+      - ./clickhouse/data:/var/lib/clickhouse
+      - ./clickhouse/logs:/var/log/clickhouse-server
+      - ./clickhouse/users.d:/etc/clickhouse-server/users.d
+    environment:
+      CLICKHOUSE_DB: "${CH_DATABASE:-enso}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-}"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  process:
+    build:
+      context: .
+      dockerfile: process/Dockerfile
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - .env.dev
+    environment:
+      - HDF5_USE_FILE_LOCKING=FALSE
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      # Override any host-IP values from .env.dev with the compose service name
+      - CH_HOST=db-ch
+      - CH_PORT=8123
+      - CH_USER=${CH_USER:-default}
+      - CH_PASSWORD=
+      - CH_DATABASE=${CH_DATABASE:-enso}
+    volumes:
+      - ./process:/app
+      - ./shared:/app/shared
+      - ./data:/opt/data
+    depends_on:
+      db-ch:
+        condition: service_healthy
+    # No long-running work yet — ingest is invoked on demand:
+    #   docker compose run --rm process python -m OISST.cli ingest
+    command: ["sleep", "infinity"]

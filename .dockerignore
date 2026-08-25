@@ -1,0 +1,9 @@
+clickhouse/data
+clickhouse/logs
+data
+front/node_modules
+front/.nuxt
+front/.output
+**/__pycache__
+**/.venv
+.git

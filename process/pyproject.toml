@@ -1,0 +1,19 @@
+[project]
+name = "enso-process"
+version = "0.1.0"
+description = "OISST daily SST-anomaly NetCDF -> ClickHouse ingest pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "clickhouse-connect>=0.8.0",
+    "netCDF4>=1.7.0",
+    "numpy>=2.0",
+    "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false
