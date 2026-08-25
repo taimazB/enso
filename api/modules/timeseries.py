@@ -161,3 +161,106 @@ def coverage() -> dict:
         "WHERE status = 'success_ingest'"
     ).result_rows[0][0]
     return {"rows": int(row[0]), "start": str(row[1]), "end": str(row[2]), "days": int(days)}
+
+
+def _full_months() -> tuple[dt.date, dt.date] | None:
+    """The span of calendar months the archive covers *completely*.
+
+    A month at either edge of the archive is only half-collected, and its mean
+    would otherwise be ranked against whole-month means as though it were one --
+    August 2026, on 24 days, lands at rank 2 at some cells. Trimming to whole
+    months is what makes the ranking honest.
+
+    A month missing an *interior* day still counts: 1986-03-18 is absent from
+    OISST itself, so March 1986 has 30 days. That is a source gap, not a partial
+    month, and dropping the month over it would lose a real observation.
+    """
+    lo, hi = client().query(
+        f"SELECT min(date), max(date) FROM {DATABASE}.sst_anom"
+    ).result_rows[0]
+    if lo is None:
+        return None
+
+    # Day 32 of any month lands in the next one -- the same trick periods.span()
+    # uses to find a month's last day without a calendar table.
+    first = lo if lo.day == 1 else (lo.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+    hi_month_end = (hi.replace(day=1) + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
+    last = hi_month_end if hi == hi_month_end else hi.replace(day=1) - dt.timedelta(days=1)
+    return (first, last) if first <= last else None
+
+
+def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
+    """Every complete calendar month at the nearest cell, ranked within its month-of-year.
+
+    One row per (month-of-year, year): the mean daily anomaly, the standard
+    deviation of the daily values inside that month, and the year's rank among
+    all years for that month, warmest first.
+
+    `sd` is day-to-day spread at a single cell, so it is much wider than the same
+    statistic on an area mean -- spatial averaging cancels daily noise that one
+    cell keeps. That is signal about the cell, not error in the mean.
+
+    Reads only the ~16k rows for one cell: `ORDER BY (gy, gx, date)` puts the
+    whole 45-year record for a point in one contiguous run, so all twelve months
+    come back from a single query in milliseconds and need no precomputation.
+    """
+    box = subset()
+    if not box.contains(lat, lon):
+        raise OutsideDomainError(
+            f"({lat:.3f}, {lon:.3f}) is outside the ingested domain "
+            f"({box.lat_min}..{box.lat_max}N, {box.lon_min}..{box.lon_max}E)",
+            lat,
+            lon,
+        )
+
+    grid = global_grid()
+    gy, gx = int(grid.gy(lat)), int(grid.gx(lon))
+    months: dict[str, list[dict]] = {str(m): [] for m in range(1, 13)}
+    span = _full_months()
+
+    if span is not None:
+        first, last = span
+        rows = client().query(
+            f"""
+            SELECT toMonth(date) AS month,
+                   toYear(date)  AS year,
+                   avg(anom)     AS mean_anom,
+                   stddevSamp(anom) AS sd,
+                   count()       AS n,
+                   row_number() OVER (
+                       PARTITION BY toMonth(date) ORDER BY avg(anom) DESC
+                   ) AS rank
+            FROM {DATABASE}.sst_anom
+            WHERE gy = %(gy)s AND gx = %(gx)s
+              AND date >= %(first)s AND date <= %(last)s
+            GROUP BY month, year
+            ORDER BY month, rank
+            """,
+            parameters={"gy": gy, "gx": gx, "first": first, "last": last},
+        ).result_rows
+
+        for month, year, mean_anom, sd, n, rank in rows:
+            months[str(month)].append({
+                "year": int(year),
+                "mean": round(float(mean_anom), 3),
+                "sd": None if sd is None else round(float(sd), 3),
+                "n": int(n),
+                "rank": int(rank),
+            })
+
+    return {
+        "variable": "anom",
+        "units": "degC",
+        "requested": {"lat": lat, "lon": lon},
+        "cell": {
+            "gy": gy,
+            "gx": gx,
+            "lat": float(grid.lat(gy)),
+            "lon": float(grid.lon(gx)),
+        },
+        # The complete-month window actually ranked, which is narrower than
+        # /coverage: the archive's trailing partial month is excluded.
+        "span": None if span is None else {"start": str(span[0]), "end": str(span[1])},
+        "top": top,
+        "months": months,
+    }

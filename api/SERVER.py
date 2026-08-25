@@ -22,6 +22,7 @@ from modules.periods import Period
 from modules.timeseries import (
     OutsideDomainError,
     coverage,
+    monthly_ranking,
     named_region_timeseries,
     point_timeseries,
     region_timeseries,
@@ -50,6 +51,12 @@ class PointRequest(BaseModel):
     start: dt.date | None = None
     end: dt.date | None = None
     period: Period = "daily"
+
+
+class RankingRequest(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-360, le=360)
+    top: int = Field(10, ge=1, le=100)
 
 
 class BoxRequest(BaseModel):
@@ -127,6 +134,30 @@ def variables_endpoint() -> dict:
 # --- Timeseries -------------------------------------------------------------
 
 
+def _outside_domain(exc: OutsideDomainError) -> JSONResponse:
+    """The 400 body for a point outside the ingested box.
+
+    Carries both a plain-string `detail` and a structured `error`: callers that
+    just print `detail` keep working, while `error.code` lets the UI show this as
+    an informational empty state rather than a red failure.
+    """
+    box = subset()
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": exc.message,
+            "error": {
+                "code": "outside_domain",
+                "requested": {"lat": exc.lat, "lon": exc.lon},
+                "domain": {
+                    "lat": [box.lat_min, box.lat_max],
+                    "lon": [box.lon_min, box.lon_max],
+                },
+            },
+        },
+    )
+
+
 @app.post("/timeseries")
 def timeseries(request: PointRequest):
     """Full anomaly record at the grid cell nearest a point.
@@ -140,24 +171,7 @@ def timeseries(request: PointRequest):
             request.lat, request.lon, request.start, request.end, request.period
         )
     except OutsideDomainError as exc:
-        box = subset()
-        # Carries both a plain-string `detail` and a structured `error`: callers
-        # that just print `detail` keep working, while `error.code` lets the UI
-        # show this as an informational state rather than a red failure.
-        return JSONResponse(
-            status_code=400,
-            content={
-                "detail": exc.message,
-                "error": {
-                    "code": "outside_domain",
-                    "requested": {"lat": exc.lat, "lon": exc.lon},
-                    "domain": {
-                        "lat": [box.lat_min, box.lat_max],
-                        "lon": [box.lon_min, box.lon_max],
-                    },
-                },
-            },
-        )
+        return _outside_domain(exc)
 
 
 @app.post("/regionTimeseries")
@@ -179,6 +193,23 @@ def named_region(
     if key not in regions():
         raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
     return named_region_timeseries(key, start, end, period)
+
+
+@app.post("/monthlyRanking")
+def monthly_ranking_endpoint(request: RankingRequest):
+    """Each calendar month's years at one cell, ranked warmest-first.
+
+    Always monthly regardless of the caller's `period`: ranking weekly buckets
+    against each other is a different question, and letting the period toggle
+    change what this means would make it unreadable.
+
+    Only *complete* months are ranked -- the archive's trailing partial month is
+    excluded rather than competing on a fortnight's worth of days.
+    """
+    try:
+        return monthly_ranking(request.lat, request.lon, request.top)
+    except OutsideDomainError as exc:
+        return _outside_domain(exc)
 
 
 # --- Map imagery ------------------------------------------------------------

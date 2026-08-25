@@ -169,6 +169,7 @@ business, not the API's.
 | `POST /timeseries` | `{lat, lon, start?, end?, period?}` → full record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region |
+| `POST /monthlyRanking` | `{lat, lon, top?}` → every complete calendar month at that cell, ranked within its month-of-year |
 | `GET /image/{date}.png` | one day (or week/month) as a Web-Mercator PNG |
 
 **`period` — `daily` (default) / `weekly` / `monthly`** — is accepted by every timeseries
@@ -179,6 +180,23 @@ and the render side (`span()`, a date range) come from that module, which is wha
 chart point and the map frame for the same date cover exactly the same days. The frontend
 mirrors the same arithmetic in `front/app/utils/periods.ts` — **change one and change the
 other.** Buckets at the edges of the archive are simply short.
+
+**`/monthlyRanking` is always monthly, whatever the caller's `period`.** It returns
+one row per (calendar month, year) at a cell — mean daily anomaly, the standard
+deviation of that month's daily values, the day count, and the year's rank among all
+years for that month. Two decisions:
+
+- **Only complete months are ranked.** `_full_months()` trims to whole calendar months
+  at both ends of the archive, because a trailing part-month otherwise competes on a
+  fortnight's data — at 45.125°N, 200.125°E, August 2026 lands at rank 2 on 24 days.
+  A month missing an *interior* day still counts: 1986-03-18 is absent from OISST
+  itself, so March 1986 legitimately has 30 days.
+- **`sd` is day-to-day spread at one cell**, so it is far wider than the same statistic
+  on an area mean — spatial averaging cancels daily noise a single cell keeps. Bars
+  two to three times the width of a published regional plot's are expected, not a bug.
+
+It reads only the ~16k rows for one cell, so all twelve months come back from a single
+query in milliseconds — no precomputed table, no new schema.
 
 **Area means are cos(latitude)-weighted** (`sum(anom*cos(lat)) / sum(cos(lat))`). At 60°N a
 0.25° cell covers half the area of one at the equator, so a plain `avg()` over-weights the
@@ -229,14 +247,53 @@ app/components/AnomalyMap.vue      MapboxGL + the anomaly image source
 app/components/TimeControl.vue     period toggle + date stepper (±1 bucket, ±1 year)
 app/components/ColorLegend.vue     gradient built from /domain's colorStops
 app/components/TimeseriesChart.vue ECharts line with dataZoom
+app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
 app/composables/useApi.ts          axios wrapper
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
+app/utils/ranking.ts               ranking layout + both ECharts options (pure -> testable headlessly)
+app/utils/colorScale.ts            domain.yml's colour stops evaluated at a single value
+app/app.config.ts                  maps Nuxt UI's internal icons onto mdi
 app/stores/main.ts                 Pinia store
 ```
 
 **The chart rail is point-only, and the map click is the only selection.** There was a
 `Point | Region mean` tab pair here; the region side is gone from the UI, though
 `/region/{key}` and `/regionTimeseries` still exist and still take `period`.
+
+**The monthly-ranking browser lives in a fullscreen modal**, opened from the rail,
+because one month of ~45 years is already taller than the chart rail. It is
+**master–detail, not a grid**: a scrollable left rail of twelve thumbnails, and the
+selected month drawn full size beside it. Twelve panels at once was the first shape and
+was legible only by scrolling ~1800px, which is what killed it.
+
+Both ECharts options are built by `utils/ranking.ts` rather than inside the SFC, for the
+same reason `periods.ts` exists: being pure functions of their inputs they can be rendered
+head-lessly with echarts' SSR mode and asserted on, which is much cheaper than driving a
+browser for chart maths.
+
+- **The rail's thumbnails are marks only** — no axes, no labels. A month's name is HTML
+  next to its canvas, where it stays crisp, focusable and selectable; the card is the
+  click target. At ~1.4px per year, whiskers and tick labels would be mush, so what
+  survives the size is the spine's shape and its colour, which is what the rail is
+  scanned for.
+- **The rail shares one x-domain across all twelve; the open month scales to itself.**
+  Comparability is the rail's job now, so the detail is free to spend its full width on
+  the month being read — at a cell whose August reaches +6 °C, a shared domain left
+  January using a third of the pane. `xDomainOf()` serves both: pass all twelve months
+  for the rail, the one month for the detail.
+- **The detail's row pitch is spent out of the pane's height** (`detailPitch()`, clamped
+  to 9–22px), so 45 years normally fit with no scrolling at all. Only a short pane hits
+  the floor and lets the panel overflow. Measure the scroll container, not the section —
+  the heading sits outside it deliberately.
+- **Picking a month in the rail does not move the map.** `activeMonth` is seeded from
+  `selectedDate`'s month and re-seeded whenever the map moves to another month, but it is
+  local state; only clicking a *row* emits `select`.
+
+Three encodings, three separate jobs, deliberately not overlapping: **dot colour** is the
+anomaly on `domain.yml`'s diverging scale — the same colour that cell has on the map;
+**label weight and ink** mark the top N (never hue, which already means anomaly); **amber**
+is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
+ringed in the detail and in every thumbnail, and the map's month name is amber in the rail.
 
 **`store.selectedDate` is always a bucket start**, snapped through `store.setDate()` /
 `store.setPeriod()` — never assign it directly. `store.period` drives the chart request and
@@ -290,6 +347,10 @@ values; `dataZoom` is what makes that browsable.
   `width` is a separate render and a separate file. The cache layout gained the `{period}`
   level, so any PNGs left directly under `./data/images/anom/YYYY/` are from the old layout
   and are dead — `mv`ing those year directories into `./data/images/anom/daily/` reclaims them.
+- **Nuxt UI's own icons default to the `lucide` collection**, and only `@iconify-json/mdi`
+  is installed. A component reaching for one of its internal icons (`UModal`'s close button
+  is the first that does) logs `Collection lucide is not found locally` and renders nothing.
+  `app/app.config.ts` remaps them; add an entry there rather than installing lucide.
 - **Nuxt UI v4 renamed `UButtonGroup` to `UFieldGroup`**, and the old name resolves to an
   empty comment node instead of erroring — the control simply vanishes from the DOM.
 - **The API's ClickHouse client is per-*thread*, not per-process**
@@ -306,12 +367,29 @@ values; `dataZoom` is what makes that browsable.
 Verified working end to end: schema creation, ingest (round-trip checked cell-by-cell
 against the source NetCDF), the ingest status/skip/force logic, every API endpoint at all
 three periods (weekly/monthly means cross-checked against the mean of their own daily
-values), PNG rendering, and SSR of the frontend page.
+values), PNG rendering, and SSR of the frontend page. `/monthlyRanking` is checked against the
+whole-month and interior-gap edge cases, and both ranking ECharts options are rendered
+head-lessly (echarts SSR -> SVG) and asserted on: 539 marks across the twelve thumbnails,
+one dot and one `rank. year` label per row in the detail, and the pitch clamped so 45
+rows fit a 900px pane. That SSR check is cheap and worth reusing for chart maths, but it
+does **not** catch mount-order bugs — the grid first shipped blank because its canvas
+sits inside `<ClientOnly>`, so `container.value` was still null at `onMounted` and nothing
+ever observed it. Watch the template ref, not the mount.
 
-**Not yet verified in a real browser**: the Mapbox raster overlay, the ECharts point chart,
-and the period toggle's effect on them — the dev machine used for the initial build had no
-GPU, and Mapbox's style load never completes under software WebGL, so `map.on('load')` never
-fires there. The code path is reached correctly up to that point.
+**Browser verification works here** — an earlier note in this file claimed it did not.
+Headless Chromium renders the Mapbox canvas fine under ANGLE/SwiftShader; launch it with
+`args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']`. Note the
+host's default node is 18 and Playwright needs 20+, so run it under
+`$HOME/.nvm/versions/node/v22.23.1/bin`.
+
+The style loads, `map.on('load')` fires, and a synthetic click on `canvas.mapboxgl-canvas`
+selects a cell — the only way to drive the rest of the UI, since every panel keys off the
+selected point. Verified end to end in Chromium this way: the Mapbox raster overlay, the point
+chart, and the monthly-ranking modal (opening, twelve named thumbnails drawn, the open
+month sized to the pane with no overflow, picking March from the rail, tooltip contents,
+and click-a-row moving the map — a March row set 2017-03-01).
+
+**Still unverified in a browser**: the period toggle's effect on the map and chart.
 
 Not built yet: NCEI downloader, region-aggregate tables (`region_daily`), climatology /
 marine-heatwave analytics, tile pyramid, production compose files, PostHog analytics,

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { useApi } from '~/composables/useApi'
 import type { Period } from '~/utils/periods'
+import type { MonthlyRanking } from '~/utils/ranking'
 import { bucketStart } from '~/utils/periods'
 
 export interface DomainMeta {
@@ -48,6 +49,8 @@ export const useMainStore = defineStore('main', {
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
+    /** Per-calendar-month year rankings at the selected cell. Always monthly. */
+    monthlyRanking: null as MonthlyRanking | null,
     loadingPoint: false,
     /** Set when the clicked point falls outside the ingested box. */
     outsideDomain: null as string | null,
@@ -83,15 +86,25 @@ export const useMainStore = defineStore('main', {
     },
 
     async selectPoint(lat: number, lon: number) {
+      // The ranking is period-independent, so a period toggle — which re-enters
+      // here with the same cell — must not refetch it and flash the grid.
+      const sameCell = this.selectedPoint?.lat === lat
+        && this.selectedPoint?.lon === lon
+        && this.monthlyRanking !== null
+
       this.selectedPoint = { lat, lon }
       this.outsideDomain = null
       this.loadingPoint = true
       try {
-        this.pointSeries = await useApi().post<Series>('/timeseries', {
-          lat,
-          lon,
-          period: this.period,
-        })
+        const api = useApi()
+        const [series, ranking] = await Promise.all([
+          api.post<Series>('/timeseries', { lat, lon, period: this.period }),
+          sameCell
+            ? Promise.resolve(this.monthlyRanking!)
+            : api.post<MonthlyRanking>('/monthlyRanking', { lat, lon }),
+        ])
+        this.pointSeries = series
+        this.monthlyRanking = ranking
       }
       catch (error: unknown) {
         // The API answers an out-of-box point with a structured 400 rather than
@@ -99,6 +112,7 @@ export const useMainStore = defineStore('main', {
         const body = (error as { response?: { data?: { error?: { code?: string }, detail?: string } } }).response?.data
         if (body?.error?.code === 'outside_domain') {
           this.pointSeries = null
+          this.monthlyRanking = null
           this.outsideDomain = body.detail ?? 'Outside the ingested domain'
         }
         else { throw error }
