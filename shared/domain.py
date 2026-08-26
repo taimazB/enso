@@ -2,7 +2,8 @@
 
 The single source of truth for converting between latitude/longitude and the
 integer cell indices (``gy``, ``gx``) stored in ClickHouse. Those indices are
-into the *global* OISST grid, not the regional subset — see ``domain.yml``.
+into the *global* CoralTemp grid, not the Pacific subset — see ``domain.yml``,
+which also documents the two orientation conventions this file assumes.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ _DOMAIN_YML = Path(__file__).with_name("domain.yml")
 
 @dataclass(frozen=True)
 class GlobalGrid:
-    """The full OISST 0.25-degree grid that cell indices are defined against."""
+    """The full CoralTemp 0.05-degree grid cell indices are defined against."""
 
     resolution: float
     lat0: float
@@ -46,7 +47,7 @@ class GlobalGrid:
 
 @dataclass(frozen=True)
 class Subset:
-    """The box the NetCDF files on disk actually cover."""
+    """The box that is actually ingested and rendered."""
 
     name: str
     lat_min: float
@@ -56,19 +57,42 @@ class Subset:
     nlat: int
     nlon: int
 
+    def gy_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive ``(first, last)`` global row index covered by the box."""
+        return int(grid.gy(self.lat_min)), int(grid.gy(self.lat_max))
+
+    def gx_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive ``(first, last)`` global column index covered by the box.
+
+        Contiguous, not wrapping — which is the entire reason `domain.yml` puts
+        `lon0` on the 0-360 convention. On the source's native -180..180 grid a
+        Pacific box straddles the array edge and this would have to return two
+        ranges, and every `WHERE gx BETWEEN` in the codebase would have to know.
+        """
+        return int(grid.gx(self.lon_min)), int(grid.gx(self.lon_max))
+
     @property
     def bounds(self) -> tuple[float, float, float, float]:
-        """``(west, south, east, north)`` with longitudes in -180..180."""
-        west = ((self.lon_min + 180.0) % 360.0) - 180.0
-        east = ((self.lon_max + 180.0) % 360.0) - 180.0
-        return (west, self.lat_min, east, self.lat_max)
+        """``(west, south, east, north)`` for a Mapbox image source.
+
+        Longitudes are returned **unwrapped** — a box reaching 290 is reported
+        as 290, not -70. Mapbox accepts that and places the quad correctly
+        across the antimeridian (verified in Chromium: `project([290,0])` and
+        `project([-70,0])` return the same pixel). Wrapping the east edge into
+        -180..180 would make west > east and collapse the image source.
+        """
+        return (self.lon_min, self.lat_min, self.lon_max, self.lat_max)
 
     def contains(self, lat: float, lon: float) -> bool:
-        lon360 = lon % 360.0
-        return (
-            self.lat_min - 0.125 <= lat <= self.lat_max + 0.125
-            and self.lon_min - 0.125 <= lon360 <= self.lon_max + 0.125
-        )
+        """Whether a point falls in the box. Accepts either lon convention."""
+        half = 0.5 * (self.lon_max - self.lon_min) / max(self.nlon - 1, 1)
+        if not (self.lat_min - half <= lat <= self.lat_max + half):
+            return False
+        # Bring the point onto the box's own 0-360 frame. A box crossing 360
+        # (none today, but Box B ends at 289.975 and a wider one could) needs
+        # the shifted comparison rather than a plain modulo.
+        lon360 = (lon - self.lon_min) % 360.0 + self.lon_min
+        return self.lon_min - half <= lon360 <= self.lon_max + half
 
 
 @dataclass(frozen=True)
@@ -84,6 +108,8 @@ class Variable:
     vmin: float
     vmax: float
     colormap: str
+    # `anom` is computed as `sst - climatology(mmdd)` rather than stored.
+    derived: bool = False
 
 
 @dataclass(frozen=True)

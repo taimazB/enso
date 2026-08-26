@@ -1,58 +1,116 @@
-# Grid geometry and variable metadata, shared by `api` and `process`.
+# Grid geometry, variable metadata and named regions, shared by `api` and `process`.
+#
+# Source: NOAA Coral Reef Watch CoralTemp v3.1, 0.05 degree, daily, 1985 onward.
 #
 # Two grids are described here and they must not be confused:
 #
-#   `global`  — the full NOAA OISST v2.1 0.25-degree grid. Cell indices stored in
-#               ClickHouse (`gy`, `gx`) are indices into THIS grid, never into the
-#               regional subset. That is deliberate: if the archive is ever
-#               re-subset to a wider box, previously-ingested rows keep their
-#               identity and no reindex or re-ingest is needed.
+#   `global`  — the full CoralTemp 7200x3600 grid. Cell indices stored in
+#               ClickHouse (`gy`, `gx`) are indices into THIS grid, never into
+#               the Pacific subset. Widening the subset later therefore needs no
+#               reindex and no re-ingest; only the `subset` block changes.
 #
-#   `subset`  — the box the NetCDF files on disk actually cover, produced by
-#               `cdo -sellonlatbox,-180,-90,0,90`. Used for map extents, sanity
-#               checks at ingest time, and the default render bounds. Widen this
-#               after a re-subset; the schema does not change.
+#   `subset`  — the box actually ingested and rendered. Used for map extents,
+#               ingest-time subsetting, and render bounds.
+#
+# TWO ORIENTATION FACTS, both of which produce plausible-looking wrong output if
+# ignored. `shared/fields.py` is the single place either is applied:
+#
+#   1. `lon0: 0.025` is a 0-360 convention. The source files are -180..180, so
+#      ingest rolls them by half a grid (gx + 3600) % 7200. Without it the
+#      Pacific box straddles the array edge and every box query becomes two
+#      wrapping ranges. This never reaches Mapbox — `GlobalGrid.gx()` takes
+#      either convention on the way in, and `bounds()` hands Mapbox unwrapped
+#      100..290, which it accepts (verified in Chromium).
+#
+#   2. `lat0: -89.975` is south-up, matching the DAILY files. The 366
+#      CLIMATOLOGY files are north-up and must be flipped at read time.
+#      Subtracting them unflipped yields a global anomaly field in the
+#      +/-18 degC range instead of +/-5 — wrong everywhere, and it looks fine.
 
 global:
-  resolution: 0.25
+  resolution: 0.05
   # Cell-centre of index 0 on each axis.
-  lat0: -89.875
-  lon0: 0.125
-  nlat: 720   # gy in [0, 719]
-  nlon: 1440  # gx in [0, 1439]
+  lat0: -89.975
+  lon0: 0.025
+  nlat: 3600  # gy in [0, 3599]
+  nlon: 7200  # gx in [0, 7199]
 
 subset:
-  name: North Pacific
-  # Cell-centre bounds of the files currently in ./data (degrees_east 0-360).
-  lat_min: 0.125
-  lat_max: 89.875
-  lon_min: 180.125
-  lon_max: 269.875
-  nlat: 360
-  nlon: 360
+  name: Pacific
+  # 60S-65N, 100E-70W. Cell-centre bounds, degrees_east 0-360.
+  # Index ranges: gy 600..3099, gx 2000..5799.
+  #
+  # 100E rather than 120E because CoralTemp is a coral-reef product and 120
+  # clips the Coral Triangle and the Java/Banda seas. 65N/60S captures the
+  # Blob, the PDO domain, the Bering Sea, and the ACC at Pacific longitudes.
+  # 7,477,923 ocean cells per day, 96.8% of them with a climatology.
+  lat_min: -59.975
+  lat_max: 64.975
+  lon_min: 100.025
+  lon_max: 289.975
+  nlat: 2500
+  nlon: 3800
 
 variables:
+  sst:
+    long_name: Daily sea surface temperature
+    short_name: SST
+    units: degC
+    precision: 2
+    # Source encoding: short * scale_factor + add_offset, _FillValue -32768.
+    scale_factor: 0.01
+    add_offset: 0.0
+    fill_value: -32768
+    # SEQUENTIAL, and it must stay that way: an absolute temperature has no
+    # meaningful midpoint, so a diverging map would invent one and read as a
+    # signed field. Range covers the ocean from freezing to the warm pool.
+    vmin: -2.0
+    vmax: 32.0
+    colormap: turbo
   anom:
     long_name: Daily sea surface temperature anomaly
     short_name: SST anomaly
     units: degC
     precision: 2
-    # Source encoding: short * scale_factor + add_offset, _FillValue -999.
     scale_factor: 0.01
     add_offset: 0.0
-    fill_value: -999
-    # Symmetric diverging range for map rendering, in units above. Daily values
-    # reach about +/-5 at the extremes, but saturating at +/-3 is what makes an
-    # ordinary day readable rather than uniformly pale. Change here and both the
-    # rendered images and the frontend legend follow.
+    fill_value: -32768
+    # DIVERGING about zero. Daily values reach about +/-5 at the extremes, but
+    # saturating at +/-3 is what makes an ordinary day readable rather than
+    # uniformly pale.
     vmin: -3.0
     vmax: 3.0
     colormap: RdBu_r
+    # Not stored. Computed as `sst - climatology(mmdd)` at query and render
+    # time; see `sst_clim` in shared/ch.py. About 3.2% of the box's ocean cells
+    # have SST but no climatology (the seasonal ice fringe, which the source
+    # flags explicitly) and have no anomaly at all — rendered neutral grey
+    # rather than transparent, which would read as land, or as a scale colour,
+    # which would read as zero.
+    derived: true
 
 # Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
-# degrees_east (0-360) / degrees_north. Boxes not fully inside `subset` are
-# flagged `partial: true` — they are computable but truncated by the current box.
+# degrees_east (0-360) / degrees_north, and all of them fit inside `subset`.
 regions:
+  # --- ENSO indices, computable for the first time now the domain reaches
+  # south of the equator.
+  nino34:
+    label: Nino 3.4
+    lat: [-5.0, 5.0]
+    lon: [190.0, 240.0]
+  nino3:
+    label: Nino 3
+    lat: [-5.0, 5.0]
+    lon: [210.0, 270.0]
+  nino4:
+    label: Nino 4
+    lat: [-5.0, 5.0]
+    lon: [160.0, 210.0]
+  nino12:
+    label: Nino 1+2
+    lat: [-10.0, 0.0]
+    lon: [270.0, 280.0]
+  # --- North Pacific / marine-heatwave boxes.
   ne_pacific:
     label: NE Pacific (the Blob)
     lat: [40.0, 60.0]
@@ -67,11 +125,6 @@ regions:
     lon: [180.0, 200.0]
   pdo_north_pacific:
     label: North Pacific (PDO domain)
-    lat: [20.0, 70.0]
+    # The conventional PDO domain runs to 70N; clipped to the subset's 65N.
+    lat: [20.0, 65.0]
     lon: [180.0, 250.0]
-  nino34:
-    label: Nino 3.4
-    lat: [-5.0, 5.0]
-    lon: [190.0, 240.0]
-    # The current subset is clipped at the equator, so only 0-5N is present.
-    partial: true
