@@ -114,7 +114,9 @@ DDL: tuple[str, ...] = (
         gx        UInt16  CODEC(DoubleDelta, ZSTD(3)),
         clim_raw  Int16   CODEC(ZSTD(3)),
 
-        clim      Float32 ALIAS clim_raw * 0.01
+        clim      Float32 ALIAS clim_raw * 0.01,
+        lat       Float32 ALIAS -89.975 + gy * 0.05,
+        lon       Float32 ALIAS 0.025 + gx * 0.05
     )
     ENGINE = MergeTree
     ORDER BY (gy, gx, mmdd)
