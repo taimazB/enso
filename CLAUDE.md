@@ -7,6 +7,12 @@ compose shape (`front` / `api` / `db-ch` / `process`), same ClickHouse-as-sole-d
 approach, same conventions for env files and Dockerfiles. Where this project differs,
 it is noted below.
 
+**This project used to run on NOAA OISST v2.1 (0.25°, global, SST + shipped anomaly).**
+It does not any more — that source is retired, its tables dropped and its files deleted.
+Anything describing a 0.25° grid, an `sst_anom` table, a `by_date` projection, or a
+`_preliminary`/final download lifecycle is from that era. The OISST work is preserved on
+the `wip/oisst-global` branch and is not intended to merge.
+
 ## Services & Ports
 
 Host ports come from `docker-compose.dev.yml`'s `${VAR:-default}` fallbacks, overridden by
@@ -18,7 +24,7 @@ ports you'll actually hit:
 | `front` | Nuxt 4 frontend | 9020 |
 | `api` | FastAPI backend | 9021 |
 | `db-ch` | ClickHouse | 9023 (HTTP), 9024 (native) |
-| `process` | NetCDF → ClickHouse ingest | — |
+| `process` | NetCDF → ClickHouse ingest + image rendering | — |
 
 Ports are deliberately offset from the ocean-acidification-dashboard's 9010–9014 so both
 stacks can run at once.
@@ -32,20 +38,21 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
 Without `--env-file .env.dev`, compose falls back to the in-file defaults (front 3000,
 api 4000) and can recreate dependent services on the wrong ports.
 
-**Ingest CLI** (the `process` service has no long-running work; it idles on `sleep infinity`
-and is driven on demand):
+**Pipeline CLI** (the `process` service idles on `sleep infinity` and is driven on demand):
 ```bash
 docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
-  python -m OISST.cli <command>
+  python -m CRW.cli <command>
 
-python -m OISST.cli init                                    # create database + tables
-python -m OISST.cli scan   [--limit N]                      # disk vs. already ingested
-python -m OISST.cli ingest [--date|--start|--end] [--limit N] [--force] [--batch N]
-python -m OISST.cli status                                  # per-status day/row counts
+python -m CRW.cli init                                    # tables + climatology + region means
+python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested
+python -m CRW.cli backfill [--start|--end] [--reverse] [--fresh] [--delete-nc]
+python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
+python -m CRW.cli status                                  # per-status day/row counts
 ```
-A full-archive load is `... run --rm process python -m OISST.cli ingest` with no
-filters. Measured rate: ~30 days (2.9M rows) in ~4 s, so ~16,400 days ≈ 45 min for
-~1.6 billion rows.
+
+`init` is not just DDL — it loads all 366 climatology files (2.68 B rows, ~20 min) and
+then builds `region_clim`. It is idempotent and resumable: an interrupted load skips the
+MMDD keys already present.
 
 **ClickHouse client:**
 ```bash
@@ -53,15 +60,14 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev exec db-ch \
   clickhouse-client --database enso --query "SHOW TABLES"
 ```
 
-**Pre-render the image cache** (`api/prerender.py`, warms every bucket `/image` would
-render on demand):
+**Pre-render the image cache** (`api/prerender.py`):
 ```bash
 docker compose -f docker-compose.dev.yml --env-file .env.dev exec api \
-  python prerender.py --workers 12          # --period/--start/--end/--width/--force/--dry-run
+  python prerender.py --workers 12   # --variable/--period/--start/--end/--width/--force
 ```
-~19,300 buckets (16.4k days + 2.3k weeks + 540 months) at width 720 is ~7 min and ~1.2 GB.
-Only *closed* buckets are written, and the script writes the cache file itself rather than
-letting `render()` do it — see the note under Map imagery.
+**This reads NetCDF, not ClickHouse**, so it has a hard prerequisite: the daily archive
+must still be on disk. Run it before `backfill --delete-nc` and before the daily retention
+prune has eaten the range. Afterwards the source for those frames is gone.
 
 **Frontend (outside Docker):**
 ```bash
@@ -72,212 +78,279 @@ cd front && npm install && npm run dev
 
 ### Data Source
 
-**NOAA OISST v2.1** (`oisst-avhrr-v02r01.YYYYMMDD.nc`), one file per day in `./data/`,
-mounted at `/opt/data/` in the `api` and `process` containers. 1981-09-01 onward.
+**NOAA Coral Reef Watch CoralTemp v3.1** (`coraltemp_v3.1_YYYYMMDD.nc`), one file per day
+in `./data/`, mounted at `/opt/data/`. 1985-01-01 onward, ~10 MB each, ~153 GB for the
+full archive.
 
-Each file is a **regional subset** cut with `cdo -sellonlatbox,-180,-90,0,90` and reduced
-to the single `anom` variable — daily SST anomaly in °C, encoded as `short` counts of
-0.01 with `_FillValue = -999` over land. The box is **lon 180.125–269.875°E, lat
-0.125–89.875°N**, 360×360 cells at 0.25°: the North Pacific and the Alaskan/Arctic
-sector, ~96,000 valid ocean cells per day out of 129,600.
+Global 7200×3600 grid at **0.05°**. The variable taken is `analysed_sst` — `short` counts
+of 0.01 °C with `_FillValue = -32768`. (`sea_ice_fraction` is also in the file and is not
+ingested.) **There is no anomaly in the product**; it is derived, see below.
 
-Files for the most recent ~2 weeks are named `*_preliminary.nc`; NCEI replaces them with
-final versions later. `config.scan()` prefers the final file when both exist for a date,
-and `status.is_current()` compares recorded size+mtime so a superseded preliminary file is
-correctly seen as stale and re-ingested.
+**The climatology is a second archive**: 366 files in `./climatology/`, mounted read-only
+at `/opt/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
+mapping rule to invent. Baseline 1991–2020. 1.6 GB, static, and **kept forever**: image
+rendering reads it straight off disk.
 
-**The repo is named `enso`, but this box is clipped at the equator.** Niño 3.4 (5°S–5°N)
-is only half covered and Niño 3/4/1+2 are largely outside it, so real ENSO indices are
-*not* computable from the current archive — this is a North Pacific / PDO / marine-heatwave
-domain as it stands. `domain.yml` carries a `nino34` region marked `partial: true` to keep
-that visible rather than silently wrong. Widening means re-subsetting with a bigger
-`sellonlatbox` and updating `domain.yml`'s `subset` block — **no schema change and no
-re-ingest of existing days**, by design (see below).
+#### Two orientation conventions, both of which fail silently
+
+`shared/fields.py` is the only place either is applied. Both produce output that looks
+entirely plausible when wrong, which is why `check_orientation()` raises rather than warns.
+
+1. **Longitude.** Source files run −179.975…179.975. This project indexes on **0–360**
+   (`domain.yml`'s `lon0: 0.025`), applied as a roll of half the grid,
+   `gx_project = (gx_file + 3600) % 7200`. The reason is that the Pacific box straddles
+   the antimeridian: on the native grid it is two wrapping `gx` ranges and every
+   `WHERE gx BETWEEN` in the codebase would have to know. Get the roll wrong and the map
+   draws the Pacific over the Atlantic, convincingly.
+
+2. **Latitude.** The daily files are **south-up** (`lat[0] = −89.975`). The climatology
+   files are **north-up** and must be flipped. Subtracting them unflipped yields an
+   anomaly field spanning about ±18 °C instead of ±5 — wrong in every cell, and it renders
+   as a believable map. The diagnostic that catches it: correctly oriented, climatology
+   valid cells are a strict *subset* of daily valid cells (13.31 M of 17.19 M globally);
+   flipped, the overlap collapses to 9.17 M.
+
+#### The domain: a Pacific box, not the globe
+
+**60°S–65°N, 100°E–290°E** — `gy` 600..3099 (2500 rows), `gx` 2000..5799 (3800 cols).
+
+- **7,477,923 ocean cells/day**, of which **7,240,513 (96.8%) have a climatology**.
+- 100°E rather than 120°E because CoralTemp is a coral-reef product and 120 clips the
+  Coral Triangle and the Java/Banda seas.
+- 65°N/60°S captures the Blob, the PDO domain, the Bering Sea, and the ACC at Pacific
+  longitudes. Cutting the poles is also what lifts climatology coverage from 77.4%
+  (global) to 96.8%.
+- **All four Niño boxes are inside it** — 1+2, 3, 3.4, 4. The old OISST box was clipped at
+  the equator and could not compute any of them; the repo is finally named for what it does.
+
+Widening it needs no re-ingest: `gy`/`gx` index the *global* grid, so only `domain.yml`'s
+`subset` block changes.
+
+#### The third state: ocean with no anomaly
+
+About **3.2% of the box's ocean has SST but no climatology** — the seasonal ice fringe,
+which the source flags explicitly (`mask` = 4). Those cells are neither land nor
+zero-anomaly, and all three have to look different:
+
+- land → **transparent** (the dark basemap shows through)
+- no climatology → **flat grey** (`render.NO_CLIM_RGBA`, surfaced as `/domain`'s `noClimColor`)
+- everything else → the variable's colour scale
+
+Transparent would read as land; any scale colour would read as a real near-zero anomaly.
 
 ### `shared/` — the contract between `api` and `process`
 
-Both containers mount `./shared` at `/app/shared`. Two modules:
+Both containers mount `./shared` at `/app/shared`. Five modules:
 
-- **`domain.py` + `domain.yml`** — grid geometry, variable metadata (scale factor, fill
-  value, colormap bounds), and named region boxes. Describes **two** grids and the
-  distinction matters: `global` is the full 1440×720 OISST grid, `subset` is the box the
-  files on disk actually cover.
+- **`domain.py` + `domain.yml`** — grid geometry, variable metadata, named region boxes.
+  Describes **two** grids and the distinction matters: `global` is the full 7200×3600
+  CoralTemp grid that `gy`/`gx` index; `subset` is the Pacific box actually ingested.
+- **`fields.py`** — NetCDF reading, and the single home of both orientation rules above.
+- **`render.py`** — field array → Web-Mercator WebP. **Takes arrays, never a DB client.**
+- **`periods.py`** — daily/weekly/monthly buckets, shared by query and render.
 - **`ch.py`** — the ClickHouse client factory and the **single definition of the schema**
-  (`DDL`, applied idempotently by `ensure_schema()`). There is no `.sql` file; keeping the
-  DDL in one Python constant is what stops `api` and `process` drifting apart.
+  (`DDL`, applied idempotently by `ensure_schema()`). No `.sql` file; keeping the DDL in
+  one Python constant is what stops `api` and `process` drifting apart.
 
 ### ClickHouse (`db-ch`, database `enso`)
 
-**`sst_anom`** — one row per (date, ocean cell).
+**`sst_daily`** — one row per (date, ocean cell). ~113.7 B rows, ~85 GB.
 
 ```sql
 date      Date    CODEC(DoubleDelta, ZSTD(3))
-gy        UInt16  -- global OISST row index, 0..719
-gx        UInt16  -- global OISST column index, 0..1439
-anom_raw  Int16   -- raw source counts, 0.01 degC
-anom      Float32 ALIAS anom_raw * 0.01
-lat       Float32 ALIAS -89.875 + gy * 0.25
-lon       Float32 ALIAS 0.125 + gx * 0.25
-PROJECTION by_date (SELECT date, gy, gx, anom_raw ORDER BY (date, gy, gx))
+gy        UInt16  -- global row index, 0..3599
+gx        UInt16  -- global column index, 0..7199 (0-360 convention)
+sst_raw   Int16   -- raw source counts, 0.01 degC
+has_clim  UInt8   -- does this cell have a climatology for this date's MMDD?
+sst       Float32 ALIAS sst_raw * 0.01
+lat       Float32 ALIAS -89.975 + gy * 0.05
+lon       Float32 ALIAS 0.025 + gx * 0.05
 ENGINE = MergeTree PARTITION BY toYear(date) ORDER BY (gy, gx, date)
 ```
 
-Three decisions worth not undoing:
+**`sst_clim`** — the 1991–2020 daily climatology, one row per (mmdd, ocean cell).
+2.68 B rows, **2.18 GiB**. `ORDER BY (gy, gx, mmdd)`.
 
-1. **`gy`/`gx` index the global grid, not the subset.** A cell's identity therefore does
-   not depend on the current `sellonlatbox`. Widen the subset later and old rows stay
-   valid; the only thing that changes is `domain.yml`'s `subset` block. Converting
-   lat/lon ↔ indices goes through `shared.domain.global_grid()` — never hand-roll it.
-2. **`anom_raw` is the source's own Int16, with an ALIAS doing the ×0.01.** Lossless,
-   2 bytes, and compresses far better than Float32. ALIAS columns cost no storage, so
-   queries just say `anom` / `lat` / `lon` and read naturally.
-3. **`ORDER BY (gy, gx, date)` with a `by_date` projection**, not two tables. A point
-   timeseries (~16k rows out of ~1.6e9) is the query that is unaffordable any other way,
-   so it owns the primary key; whole-day map reads want the opposite order and get the
-   projection, which ClickHouse maintains on insert and selects automatically.
+**`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The entire precomputation layer.
 
-**`ingest_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one row per day
-carrying `status`, `filename`, `n_rows`, `file_mtime`, `file_size`. Reads use `FINAL`
-(the table is tiny). Statuses: `pending_ingest → ingesting → success_ingest`, plus
-`failed_ingest`. This is the same state-machine idea as the reference project's
-`SalishSeaCast_status`, minus the download/compute/image stages that do not exist here yet.
+**`ingest_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one row per day.
 
-**Re-ingesting a day is deliberately expensive.** `sst_anom` is a plain MergeTree, so
-`ingest.delete_day()` issues `ALTER TABLE ... DELETE`, a mutation that rewrites the
-affected parts of that day's *year* partition. That is fine because it only happens when
-a preliminary file is superseded — roughly the last two weeks of the archive. Do not
-"optimise" this into `ReplacingMergeTree`: dedup would then require `FINAL` on a
-1.6-billion-row table for every read.
+Four decisions worth not undoing:
+
+1. **There are no projections anywhere, and this is the central design decision.** The
+   OISST schema carried a `by_date` projection so whole-day map reads did not scan a table
+   ordered for point timeseries. Measured, that projection was **1.47 of 2.22 bytes per
+   row — 66% of total storage**. At CoralTemp's volume it would cost ~150 GB.
+
+   It is gone because **images are no longer rendered from the database**: the daily
+   NetCDF is still on disk when `process` renders that day's frames. ClickHouse now serves
+   only what it is ordered for. The cost, stated plainly: re-rendering a historical bucket
+   without its NetCDF is a partition scan, so pre-rendered images are the durable artifact
+   and a mass re-render means re-downloading the range. `/image` 404s rather than hangs.
+
+2. **`gy`/`gx` index the global grid, not the subset**, so a cell's identity does not
+   depend on the current box. Conversions go through `shared.domain.global_grid()` — never
+   hand-roll them.
+
+3. **`sst_raw` is the source's own Int16, with an ALIAS doing the ×0.01.** Lossless,
+   2 bytes, compresses far better than Float32. ALIAS columns cost no storage.
+
+4. **`has_clim` is per (cell, date), not per cell.** The ice edge moves through the year,
+   so it cannot be a static property. It is what makes the region identity below exact.
+
+#### Anomaly is derived, and how depends on the query shape
+
+`anom = sst - climatology(mmdd)`. There is no anomaly column.
+
+- **A point** joins `sst_daily` to `sst_clim` on `(gy, gx, mmdd)`. For one cell that is
+  ~15 k rows against 366, both primary-key reads. Trivial.
+- **A box never joins**, because the means commute:
+
+  ```
+  mean(sst - clim) == mean(sst) - mean(clim)
+  ```
+
+  over the same cells with the same cos(lat) weights. So the daily side stays a plain
+  aggregation and the climatology side collapses to one value per MMDD — precomputed in
+  `region_clim` for named regions, computed on the fly for an arbitrary box. Joining
+  instead would put box_cells × 366 rows on the right of a hash join — 461 M for the PDO
+  box — to produce 366 numbers.
+
+  **The identity's precondition is `has_clim = 1` on the daily side.** Both sides must
+  average the same cells; without the filter the two drift apart wherever the ice edge
+  sits, which is exactly where a marine-heatwave question gets asked. Verified equal to
+  three decimals against a direct cell-wise `avg(sst - clim)`.
+
+**Region timeseries are queried live, not precomputed.** Named regions are 0.6–14.6 B rows
+over the archive (Niño 3.4 is 3.04 B; the PDO box, the largest, 14.55 B), and
+`ORDER BY (gy, gx, date)` makes a box a set of contiguous key ranges — one per `gy` — not a
+scan. A `region_daily` rollup would be 8 × 15,211 = 122 k rows and can be added later as a
+pure cache without touching the big table, so it is deliberately absent until measurement
+says otherwise.
 
 ### Process pipeline (`process/`)
 
-Entry point `process/OISST/cli.py` (`python -m OISST.cli`). Modules:
-- `config.py` — filename parsing, `scan()` (final beats preliminary per date)
-- `ingest.py` — NetCDF → ClickHouse; `read_day()` reads **raw shorts**
-  (`set_auto_maskandscale(False)`) rather than netCDF4's masked floats
+Entry point `process/CRW/cli.py` (`python -m CRW.cli`). Modules:
+- `config.py` — filename parsing, `scan()`
+- `download.py` — NOAA CRW fetching
+- `ingest.py` — NetCDF → ClickHouse
+- `climatology.py` — the 366-file load and `region_clim`
+- `imaging.py` — day/week/month × sst/anom rendering, and the retention window
 - `status.py` — the `ingest_status` table
 
-Inserts are **batched across days** (`--batch`, default 30). ~96k rows/day means
-per-file inserts would create ~16k tiny parts on a full load; ClickHouse merges are much
-happier with fewer, larger ones.
+Inserts are batched across days (`--batch`, default **5** — a day is ~7.5 M rows now, not
+OISST's 96 k, so the old default of 30 was a 225 M-row insert).
 
-**There is no `download` command yet** — the archive in `./data` is loaded as-is (a
-deliberate scoping call). When NCEI fetching is added it becomes a step ahead of `ingest`
-with the same per-date status rows advancing through `pending_download → ... → success_ingest`.
+#### Downloading, and revisions in place
+
+```
+.../5km/v3.1_op/nc/v1.0/daily/sst/{YYYY}/coraltemp_v3.1_{YYYYMMDD}.nc
+```
+
+**CRW has no preliminary/final filename pair.** `v3.1_op` is the operational near-real-time
+stream and a date's file is **revised in place** at a URL that never changes. Since `run`
+deletes the local NetCDF after ingesting, the only way to notice is to keep what the server
+reported — `Content-Length` and `Last-Modified` — in `ingest_status` and HEAD the URL again
+later. That is `--recheck-days` (default 30). This replaces the OISST `is_preliminary`
+mechanism entirely.
+
+Downloads stream to a `.part` file and rename on completion; `DAILY_RE` does not match
+`.part`, so an interrupted transfer can never be picked up as a complete file.
+
+#### `run`, and why it is a range
+
+With no `--date`, `run` processes **every day from the last ingested through yesterday**,
+not just yesterday. One code path then covers normal daily operation, a missed cron run,
+and a bulk download that has outrun the ingest. A 404 on yesterday exits 0, not failure —
+CRW publishes at ~1 day latency and not at a fixed hour, so a cron retry must be a
+no-op-or-succeed.
+
+Per date: `download → ingest → render 6 images → prune retention window`.
+
+#### The retention window
+
+A weekly frame is the mean over seven days, but `run` deletes each `.nc` after ingesting
+it — so days N−6…N−1 are gone by the time day N is processed. **`imaging.retention_floor()`
+keeps the files the open week and month still need** (at most ~37 files, ~380 MB) and
+prunes only what has fallen out of both. Losing that window does not corrupt anything, but
+it freezes weekly and monthly frames at whatever was last rendered.
 
 ### API (`api/`)
 
-FastAPI in `SERVER.py`. Reads live from ClickHouse; NetCDF files are the ingest service's
-business, not the API's.
+FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is not.**
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | liveness + ClickHouse reachability |
-| `GET /domain` | grid extent, image bounds, variable metadata, colour stops, region list — the frontend's bootstrap call |
-| `GET /coverage` | ingested date range and row count |
-| `GET /variables` | variable list |
-| `POST /timeseries` | `{lat, lon, start?, end?, period?}` → full record at the nearest cell |
+| `GET /domain` | grid extent, image bounds, variable metadata, per-variable colour stops, `noClimColor`, region list |
+| `GET /coverage` | ingested date range, row count, climatology completeness |
+| `GET /variables` | variable list, with `derived` on `anom` |
+| `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
-| `GET /region/{key}` | same, for a named `domain.yml` region |
-| `POST /monthlyRanking` | `{lat, lon, top?}` → every complete calendar month at that cell, ranked within its month-of-year |
-| `GET /image/{date}.webp` | one day (or week/month) as a Web-Mercator WebP |
+| `GET /region/{key}` | same, for a named `domain.yml` region, using `region_clim` |
+| `POST /monthlyRanking` | every complete calendar month at a cell, ranked within its month-of-year |
+| `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
 
-**`period` — `daily` (default) / `weekly` / `monthly`** — is accepted by every timeseries
-endpoint and by `/image`, and its buckets are defined once in `api/modules/periods.py`:
-weeks start on **Monday** (`toMonday`), months are calendar months, and a bucket is always
-labelled by its **first day**. Both the query side (`bucket_sql()`, a GROUP BY expression)
-and the render side (`span()`, a date range) come from that module, which is what makes a
-chart point and the map frame for the same date cover exactly the same days. The frontend
-mirrors the same arithmetic in `front/app/utils/periods.ts` — **change one and change the
-other.** Buckets at the edges of the archive are simply short.
+**`variable` — `sst` (default) / `anom`** — is accepted by every endpoint above.
 
-**`/monthlyRanking` is always monthly, whatever the caller's `period`.** It returns
-one row per (calendar month, year) at a cell — mean daily anomaly, the standard
-deviation of that month's daily values, the day count, and the year's rank among all
-years for that month. Two decisions:
+**`period` — `daily` (default) / `weekly` / `monthly`** — buckets are defined once in
+`shared/periods.py`: weeks start on **Monday** (`toMonday`), months are calendar months, and
+a bucket is always labelled by its **first day**. The frontend mirrors the same arithmetic
+in `front/app/utils/periods.ts` — **change one and change the other.**
 
-- **Every month is ranked, including the archive's truncated edge months, and those
-  carry `partial: true`.** A part-month does compete on short data — at 45.125°N,
-  200.125°E, August 2026 lands at rank 2 on 24 days — but the month in progress is the
-  one people most want to look at, so it is starred rather than hidden (an earlier
-  version trimmed it away with `_full_months()`; that is gone). `_partial_months()`
-  flags at most two: the month the record starts in and the month it ends in. A month
-  missing an *interior* day is **not** partial — 1986-03-18 is absent from OISST itself,
-  so March 1986 has 30 days and is as complete as it will ever be. The response's `span`
-  is now the full month range, and `through` carries the last day with data.
-- **`sd` is day-to-day spread at one cell**, so it is far wider than the same statistic
-  on an area mean — spatial averaging cancels daily noise a single cell keeps. Bars
-  two to three times the width of a published regional plot's are expected, not a bug.
-
-It reads only the ~16k rows for one cell, so all twelve months come back from a single
-query in milliseconds — no precomputed table, no new schema.
-
-**Area means are cos(latitude)-weighted** (`sum(anom*cos(lat)) / sum(cos(lat))`). At 60°N a
-0.25° cell covers half the area of one at the equator, so a plain `avg()` over-weights the
-poleward end of any box tall enough to matter — which every box here is.
+**Area means are cos(latitude)-weighted** (`sum(v*cos(lat)) / sum(cos(lat))`). At 60°N a
+0.05° cell covers half the area of one at the equator, so a plain `avg()` over-weights the
+poleward end of any box tall enough to matter.
 
 **Out-of-domain points** raise `OutsideDomainError`, rendered as a **400 carrying both a
 plain-string `detail` and a structured `error` object** (`code: "outside_domain"`,
 `requested`, `domain`). `detail` stays a sentence so callers that just print it keep
 working; `error.code` is what lets the frontend show this as an informational empty state
-rather than a red failure (`stores/main.ts`'s `selectPoint` catch).
+rather than a red failure.
 
-### Map imagery (`api/modules/render.py`)
+**`/monthlyRanking` is always monthly, whatever the caller's `period`**, and it ranks
+`anom` by default because ranking years by absolute SST is a different question. Every
+month is ranked including the archive's truncated edge months, which carry `partial: true`
+— the month in progress is the one people most want to look at, so it is starred rather
+than hidden. A month missing an *interior* day is **not** partial: it is as complete as it
+will ever be.
 
-There is **no tile pyramid**. At 360×360 cells the whole domain is one modest WebP, served
-as a Mapbox `image` source with corner coordinates from `/domain`'s `imageBounds`. A
-pyramid can be added behind the same URL shape later if zoom demands it.
+### Map imagery (`shared/render.py`)
+
+There is **no tile pyramid**. The Pacific box is one WebP, served as a Mapbox `image`
+source with corner coordinates from `/domain`'s `imageBounds`.
+
+**`imageBounds` longitudes are unwrapped**: the box's east edge is reported as **290, not
+−70**. Mapbox accepts that and places the quad correctly across the antimeridian — verified
+in Chromium, where `project([290,0])` and `project([-70,0])` return the same pixel.
+Normalising east into −180…180 would make west > east and collapse the image source to
+nothing. This is *not* the same question as the 0–360 storage convention; the box straddles
+the antimeridian either way.
 
 The source grid is linear in longitude but **not** in Mercator y, so `to_mercator()`
-resamples the rows onto an evenly spaced Mercator axis. Handing Mapbox the raw array
-instead would stretch the field increasingly toward the pole — in a domain reaching 90°N
-that is a gross error, not a rounding one. Two consequences:
-- **Web Mercator cannot represent beyond ~85.05°N**, so the top ~5° of the domain is
-  clipped out of the rendered image. `render.bounds()` reports what actually made it in.
-- Linear blending propagates NaN from either neighbour, which would erode a pixel of ocean
-  along every coastline; `to_mercator()` falls back to whichever side is real.
+resamples the rows onto an evenly spaced Mercator axis. Linear blending propagates NaN from
+either neighbour, which would erode a pixel of ocean along every coastline, so it falls
+back to whichever side is real. The no-climatology mask is resampled **nearest-neighbour**
+instead — it is categorical, and a blended edge has no sensible threshold.
 
-Land (`_FillValue`) renders **fully transparent**, not white — the dark basemap shows
-through. Images are **lossy WebP at quality 90**, which is a deliberate call and was
-measured, not assumed. Against the lossless encode of the same field: mean error
-**0.015 °C**, 99.6% of ocean pixels within 0.1 °C, ~6 pixels in 800k past 1 °C — on a
-±3 °C scale, and indistinguishable side by side. It buys **5× on the wire** (~78 KB vs
-~270 KB) and **10× on encode** (0.06 s vs 2.9 s); the encode speed is not a luxury,
-because a partial bucket is never cached and re-encodes on every request.
+Images are **lossy WebP at quality 90**, `method=4`. Measured on the OISST field against a
+lossless encode of the same data: mean error 0.015 °C, 99.6% of ocean pixels within 0.1 °C.
+It buys ~5× on the wire and ~10× on encode. **The alpha channel is bit-exact at every
+quality** — libwebp always codes alpha losslessly — so the land mask does not bleed.
+Exact values are the timeseries endpoints' job; this raster is for looking at.
 
-Two things that make this safe, and one caveat:
-- **The alpha channel is bit-exact at every quality** — libwebp always codes alpha
-  losslessly. The land mask does not bleed, which was the obvious worry and is not real.
-- **Error concentrates in the ~1% of pixels forming the coastal ring** (worst ~1.2 °C),
-  for the same reason `to_mercator()` guards that edge. Interior error is far lower.
-- **Exact values are the timeseries endpoints' job.** This raster is for looking at; if
-  a caller ever needs to read numbers back out of the pixels, this is the wrong source
-  and lossless would have to come back.
+`DEFAULT_WIDTH` is **2048**, and `front/app/composables/useApi.ts`'s `IMAGE_WIDTH` mirrors
+it. The cache is keyed by (variable, period, bucket start, width), so **a width mismatch is
+a 404 and a blank map, not a slower render** — there is no NetCDF left to render a
+historical bucket from.
 
-`method=4`, not 6: at this size 6 costs 13× the time for under 2% fewer bytes. Note that in
-*lossless* mode libwebp's `quality` means compression effort rather than fidelity, so
-Pillow's default of 80 leaves ~32% on the table — relevant if lossless is ever restored.
+Renders are cached under `OISST_IMAGE_DIR` as
+`{variable}/{period}/YYYY/{bucket-start}_w{width}.webp`.
 
-Renders are cached under `OISST_IMAGE_DIR`
-(`./data/images/anom/{period}/YYYY/{bucket-start}_w{width}.webp`); `?nocache=true` forces a
-re-render. A **partial** bucket — a week or month still filling up at the head of the
-archive — is rendered but deliberately *not* cached, or it would freeze at a mean over the
-handful of days that happened to be ingested first.
-
-`prerender.py` writes its cache files itself rather than going through that guard, because
-the guard cannot distinguish a bucket still filling up from one with an **interior** gap:
-OISST has no 1986-03-18, so that week and that month are complete-as-they-will-ever-be yet
-look partial to `render()` and would re-encode on every request forever. The script instead
-renders only *closed* buckets (span's last day ≤ the archive's last day) and caches them
-unconditionally. It also runs its pool under `multiprocessing`'s **`spawn`** context: a
-forked worker inherits the parent's open ClickHouse socket, and several workers reading each
-other's responses off it surfaces as urllib3 `BadStatusLine` on binary garbage, not as
-anything that looks like a connection-sharing bug.
-
-**Colour range lives in `domain.yml`** (`vmin`/`vmax`, currently ±3 °C with `RdBu_r`).
-Daily values reach about ±5 at the extremes, but saturating at ±3 is what makes an ordinary
-day readable rather than uniformly pale. Change it there and both the rendered images and the
-frontend legend follow.
+**Colour ranges live in `domain.yml`**: `sst` is **sequential** (`turbo`, −2…32) and `anom`
+**diverging** (`RdBu_r`, ±3). That distinction is not cosmetic — an absolute temperature has
+no meaningful midpoint, so a diverging map would invent one at 15 °C and read as a signed
+field.
 
 ### Frontend (`front/`)
 
@@ -287,9 +360,9 @@ same stack as the ocean-acidification dashboard.
 ```
 app/app.vue                        header + coverage badge; awaits store.loadMetadata()
 app/pages/index.vue                map + point chart rail on the left, ranks dock on the right
-app/components/AnomalyMap.vue      MapboxGL + the anomaly image source
-app/components/TimeControl.vue     period toggle + date stepper (±1 bucket, ±1 year)
-app/components/ColorLegend.vue     gradient built from /domain's colorStops
+app/components/AnomalyMap.vue      MapboxGL + the field image source
+app/components/TimeControl.vue     variable + period toggles, date stepper, playback
+app/components/ColorLegend.vue     gradient from the active variable's colorStops
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
 app/components/SideDock.vue        resizable right-hand dock (drag handle, remembered width)
@@ -304,7 +377,19 @@ app/stores/main.ts                 Pinia store
 
 **The chart rail is point-only, and the map click is the only selection.** There was a
 `Point | Region mean` tab pair here; the region side is gone from the UI, though
-`/region/{key}` and `/regionTimeseries` still exist and still take `period`.
+`/region/{key}` and `/regionTimeseries` still exist and now take `variable` too. The Niño
+indices are the obvious thing to surface there next.
+
+**`store.variable` (`sst` | `anom`) works exactly like `store.period`**: it drives the
+chart request and the image URL together, so the map and the chart can never show
+different fields. It opens on `sst` — the stored variable, defined on every ocean cell —
+while `anom` is undefined over the ice fringe and needs the full 366-key climatology, so
+the Anomaly button stays **disabled until `/coverage` reports `climatology.complete`**. A
+partly-loaded climatology would blank the missing dates rather than fail, which is worse.
+
+The monthly ranking **refetches on a variable change** but not on a period change: ranking
+years by absolute SST is a different question from ranking by anomaly, whereas the ranking
+is period-independent by construction.
 
 **The monthly-ranking browser lives in a dock beside the map**, not over it. It needs
 full page height — one month of ~45 years is already taller than the chart rail — but it
@@ -351,7 +436,7 @@ browser for chart maths.
   local state; only clicking a *row* emits `select`.
 
 Three encodings, three separate jobs, deliberately not overlapping: **dot colour** is the
-anomaly on `domain.yml`'s diverging scale — the same colour that cell has on the map;
+value on the active variable's scale — the same colour that cell has on the map;
 **label weight and ink** mark the top N (never hue, which already means anomaly); **amber**
 is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
 ringed in the detail and in every thumbnail, and the map's month name is amber in the rail.
@@ -373,8 +458,8 @@ coverage it wraps to the first bucket — and because each tick advances from wh
 playhead. Typing in the date field stops it, since otherwise the field is a moving target.
 Speed is a 1–10 fps slider read *per frame*, so it takes effect on the next one.
 
-Frames are **not** all preloaded: the daily archive is ~16.4k WebPs (~1.2 GB on the wire and
-~4 MB each once decoded), so what is held is a window of `AHEAD = 8` in front of the playhead,
+Frames are **not** all preloaded: the daily archive is ~15.2k WebPs per variable, so what is
+held is a window of `AHEAD = 8` in front of the playhead,
 warmed with `new Image()` + `decode()` and capped at `CACHE_MAX = 24`. `/image` sends
 `Cache-Control: public, max-age=86400`, so Mapbox's own fetch for the same URL then resolves
 out of the browser cache. The loop waits on frame readiness rather than firing on a bare
@@ -383,8 +468,8 @@ the previous frame — a fixed interval would render that as an unexplained stut
 per-frame timeout keeps one slow frame from freezing playback.
 
 **`store.selectedDate` is always a bucket start**, snapped through `store.setDate()` /
-`store.setPeriod()` — never assign it directly. `store.period` drives the chart request and
-the image URL together, so switching to Weekly or Monthly re-renders both.
+`store.setPeriod()` — never assign it directly. Both `store.period` and `store.variable`
+drive the chart request and the image URL together, so switching either re-renders both.
 
 **Clicking the chart sets the map date** (as in the ocean-acidification dashboard). The
 line is drawn with `showSymbol: false` + `large`, so there is nothing for ECharts' own
@@ -406,16 +491,22 @@ the compose network and must reach the API by service name (`API_INTERNAL_BASE_U
 to Mapbox — must use the published `NUXT_PUBLIC_API_BASE_URL` (`http://localhost:9021`).
 Getting this wrong surfaces as `ECONNREFUSED ::1:9021` from the Nitro server.
 
-**The map opens on lat 0–68°N, not the full domain.** In Mercator the 70–90°N strip is
-taller than everything below it, so fitting the whole box opens at a near-global zoom with
-the interesting mid-latitude Pacific reduced to a sliver (`INITIAL_NORTH` in
-`AnomalyMap.vue`). The raster still covers the full domain when the user zooms out.
+**The map opens on the whole box, in Mercator.** The old `INITIAL_NORTH = 68` clip existed
+because the OISST domain ran to 90°N and that strip dominated a Mercator fit; this box
+stops at 65°N and fits without a sliver, so the clip is gone. The projection is
+`mercator`, not `globe`: a globe hides half a single basin behind the limb at the opening
+zoom.
+
+**`imageBounds.east` is 290, not −70, and is passed to Mapbox as-is.** Normalising it into
+−180…180 would make west > east and collapse the image source — see the Map imagery
+section for the verification.
 
 Stepping days calls `ImageSource.updateImage()` rather than removing and re-adding the
 layer, so the basemap does not flash between frames.
 
-**Charts**: always ECharts, never a hand-rolled `<canvas>`. The point series is ~16k daily
+**Charts**: always ECharts, never a hand-rolled `<canvas>`. The point series is ~15k daily
 values; `dataZoom` is what makes that browsable.
+
 
 ## Gotchas
 
@@ -425,18 +516,19 @@ values; `dataZoom` is what makes that browsable.
 - **`domain.yml` changes need an API restart.** `shared.domain` caches the parsed YAML with
   `lru_cache`, and uvicorn's `--reload` only watches `.py` files, so a colour-range or
   region edit is invisible until the container is restarted. Cached images under
-  `./data/images` also survive it — delete them or pass `?nocache=true`.
+  `./data/images` also survive it — delete them or re-run `prerender.py --force`.
 - **`UID`/`GID` in `.env.dev`** are what stop `api` writing root-owned cache files into the
   bind-mounted `./data`. Set them to your own `id -u` / `id -g`.
 - **The `process` venv lives at `/opt/venv`, not `/app/.venv`** — compose bind-mounts
   `./process` over `/app`, which would hide anything installed under it.
-- Rendered images are **cached by (period, bucket start, width)**; a request with a different
-  `width` is a separate render and a separate file. The cache layout gained the `{period}`
-  level, so any images left directly under `./data/images/anom/YYYY/` are from the old layout
-  and are dead — `mv`ing those year directories into `./data/images/anom/daily/` reclaims them.
-- **The rendered format is WebP, and `.png` cache files are dead.** The cache is keyed by
-  extension as well as (period, bucket start, width), so any `*.png` left under
-  `./data/images` is never read again and can be deleted.
+- **`api` needs `netCDF4` too.** It renders the head of the archive (buckets still inside
+  the retention window) from file. Historical frames come from the image cache, never from
+  ClickHouse.
+- **Never truncate `sst_daily` without `ingest_status`.** Emptying one and not the other
+  makes every day look already-ingested, and `ingest_files` then issues an
+  `ALTER … DELETE` mutation per day against rows that do not exist — on a full archive that
+  is ~15 k synchronous no-op mutations and dwarfs the inserts they precede. `backfill
+  --fresh` does both together for exactly this reason.
 - **Nuxt UI's own icons default to the `lucide` collection**, and only `@iconify-json/mdi`
   is installed. A component reaching for one of its internal icons (`UModal`'s close button
   is the first that does) logs `Collection lucide is not found locally` and renders nothing.
@@ -456,25 +548,33 @@ values; `dataZoom` is what makes that browsable.
   500s under no real load, and a **map that silently keeps showing the previous frame** —
   Mapbox's `ImageSource` never retries a failed image and logs the error only to the
   browser console.
+- **`prerender.py` runs its pool under `multiprocessing`'s `spawn` context.** Workers each
+  open their own NetCDF handles and HDF5 is not fork-safe once a file has been touched in
+  the parent.
 
 ## Status / not yet built
 
-Verified working end to end: schema creation, ingest (round-trip checked cell-by-cell
-against the source NetCDF), the ingest status/skip/force logic, every API endpoint at all
-three periods (weekly/monthly means cross-checked against the mean of their own daily
-values), image rendering, and SSR of the frontend page. `/monthlyRanking` is checked against the
-partial-month and interior-gap edge cases, and both ranking ECharts options are rendered
-head-lessly (echarts SSR -> SVG) and asserted on: 540 marks across the twelve thumbnails
-(539 before the partial August 2026 row was let back in), one dot and one `rank. year`
-label per row in the detail, the partial row rendering as `2. 2026 *` with a `fill="none"`
-circle and a single faint mark in the rail, and the pitch clamped so 45 rows fit a 900px
-pane. That SSR check is cheap and worth reusing for chart maths, but it
-does **not** catch mount-order bugs — the grid first shipped blank because its canvas
-sits inside `<ClientOnly>`, so `container.value` was still null at `onMounted` and nothing
-ever observed it. Watch the template ref, not the mount.
+Verified working end to end on the CoralTemp pipeline:
 
-**Browser verification works here** — an earlier note in this file claimed it did not.
-Headless Chromium renders the Mapbox canvas fine under ANGLE/SwiftShader; launch it with
+- **Geometry and orientation.** Subset is 2500×3800; 7,477,923 ocean cells/day and
+  7,240,513 with climatology, matching the source exactly. Anomaly range −4.14…+6.34 for
+  a sample day (a latitude flip gives ±18).
+- **Ingest round-trip.** Eight cells checked against the source NetCDF, **including three
+  straddling the antimeridian** — 180.025°E and −179.975°E resolve to the same cell,
+  179.975°E to its western neighbour. Land correctly absent from the table.
+- **Point anomaly.** API `sst` and `anom` match a direct NetCDF computation to the cent
+  across eight days.
+- **The region identity.** `/region/nino34?variable=anom` equals a direct cell-wise
+  `avg(sst - clim)` over the same box to three decimals, on 201,392 cells.
+- **Imagery.** Land transparent, ice-fringe grey, ocean coloured — checked by pixel, not by
+  eye. `bounds()` returns west 100 / east 290. `/image` 404s with an explanatory message
+  for a bucket with neither cache nor NetCDF.
+- **Browser** (Chromium, per the recipe below): the Pacific raster draws across the
+  antimeridian, SST/Anomaly and Daily/Weekly/Monthly toggles render, a map click populates
+  the chart and the ranks dock, no console errors.
+
+**Browser verification works here.** Headless Chromium renders the Mapbox canvas fine under
+ANGLE/SwiftShader; launch it with
 `args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']`. Note the
 host's default node is 18 and Playwright needs 20+, so run it under
 `$HOME/.nvm/versions/node/v22.23.1/bin`. Playwright is not a dependency of this repo —
@@ -487,28 +587,12 @@ the browsers already in `~/.cache/ms-playwright`, pass `executablePath` at that 
 colour-count assertion on it fails even when the map is drawn correctly. Take a Playwright
 screenshot and look at that instead.
 
-The style loads, `map.on('load')` fires, and a synthetic click on `canvas.mapboxgl-canvas`
-selects a cell — the only way to drive the rest of the UI, since every panel keys off the
-selected point. Verified end to end in Chromium this way: the Mapbox raster overlay, the point
-chart, and the monthly-ranking browser (opening, twelve named thumbnails drawn, the open
-month sized to the pane with no overflow, picking March from the rail, tooltip contents,
-and click-a-row moving the map — a March row set 2017-03-01).
+Chart maths can be rendered head-lessly with echarts' SSR mode and asserted on, which is
+much cheaper than driving a browser. That check does **not** catch mount-order bugs — the
+ranking grid first shipped blank because its canvas sits inside `<ClientOnly>`, so
+`container.value` was still null at `onMounted` and nothing ever observed it. Watch the
+template ref, not the mount.
 
-The dock is verified in Chromium too: opening it leaves the map canvas 1080px of a 1600px
-window and still clickable, a second map click re-titles the panel and redraws it without
-closing anything, the drag handle resizes 520 -> 783 and clamps at 420, the width survives
-a close/reopen, closing gives the map its full width back, and a click on a detail row
-still moves the map (2026-08-24 -> 2001-08-01). No console errors at any point.
-
-The period toggle is verified too: Daily -> Weekly -> Monthly each refetches the map image
-at the right bucket start (`2026-08-24` daily and weekly, `2026-08-01` monthly) and the
-monthly frame is visibly smoother than the daily one.
-
-Playback is verified in Chromium as well: the fps slider clamps at 1 and 10, play advances
-~5 frames in 3 s at 5 fps, stop leaves the date fixed, the end of coverage wraps back to
-1981-09, and successive map screenshots differ — i.e. the raster really is updating rather
-than sitting stale behind a moving date.
-
-Not built yet: NCEI downloader, region-aggregate tables (`region_daily`), climatology /
-marine-heatwave analytics, tile pyramid, production compose files, PostHog analytics,
-tests.
+Not built yet: the full-archive backfill and prerender pass (in progress), the region-query
+benchmark that decides whether `region_daily` is needed, a cron entry for `run`, production
+compose files, PostHog analytics, tests.
