@@ -7,7 +7,7 @@ rejects a second query on a session that is already busy:
     session. Please use a separate client instance per thread/process.
 
 Every endpoint here is a sync `def`, so FastAPI runs it in the thread pool and
-two overlapping requests — a slow monthly PNG render and the chart's
+two overlapping requests — a slow monthly image render and the chart's
 `/timeseries` POST, say — really do hit the client at the same time. Hence one
 client per thread rather than one per process: the pool is bounded (~40 threads)
 and each client is little more than a session id over a shared urllib3 pool.

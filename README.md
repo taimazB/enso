@@ -41,7 +41,7 @@ A full-archive ingest is ~16,400 days / ~1.6 billion rows and takes roughly 45 m
 ## Layout
 
 ```
-api/        FastAPI service — queries ClickHouse, renders map PNGs
+api/        FastAPI service — queries ClickHouse, renders map WebPs
 front/      Nuxt 4 frontend (everything under front/app/)
 process/    OISST.cli ingest pipeline
 shared/     grid geometry (domain.yml) + ClickHouse schema, mounted into api and process
@@ -62,7 +62,7 @@ curl -X POST localhost:9021/timeseries \
 
 curl localhost:9021/region/ne_pacific
 
-curl -o day.png localhost:9021/image/1981-09-15.png
+curl -o day.webp localhost:9021/image/1981-09-15.webp
 ```
 
 Full endpoint notes, schema rationale and gotchas: [CLAUDE.md](CLAUDE.md).

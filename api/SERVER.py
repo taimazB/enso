@@ -1,7 +1,7 @@
 """FastAPI service for the ENSO / North Pacific SST-anomaly dashboard.
 
 Reads live from ClickHouse; the NetCDF files are the ingest service's business,
-not this one's. Blocking work (queries, PNG rendering) runs in the default
+not this one's. Blocking work (queries, image rendering) runs in the default
 thread pool via FastAPI's sync endpoints rather than blocking the event loop.
 """
 
@@ -215,14 +215,14 @@ def monthly_ranking_endpoint(request: RankingRequest):
 # --- Map imagery ------------------------------------------------------------
 
 
-@app.get("/image/{date}.png")
+@app.get("/image/{date}.webp")
 def image(
     date: dt.date,
     width: int = Query(render.DEFAULT_WIDTH, ge=180, le=4320),
     nocache: bool = False,
     period: Period = "daily",
 ) -> Response:
-    """One bucket's anomaly field as a Web-Mercator PNG, for a Mapbox image source.
+    """One bucket's anomaly field as a Web-Mercator WebP, for a Mapbox image source.
 
     `period` widens the frame from a single day to the mean over the week or
     month containing `date`; any date inside a bucket renders (and caches) the
@@ -236,6 +236,6 @@ def image(
         raise HTTPException(404, f"no data ingested for {date} ({period})")
     return Response(
         content=payload,
-        media_type="image/png",
+        media_type="image/webp",
         headers={"Cache-Control": "public, max-age=86400"},
     )

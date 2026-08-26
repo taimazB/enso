@@ -53,6 +53,16 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev exec db-ch \
   clickhouse-client --database enso --query "SHOW TABLES"
 ```
 
+**Pre-render the image cache** (`api/prerender.py`, warms every bucket `/image` would
+render on demand):
+```bash
+docker compose -f docker-compose.dev.yml --env-file .env.dev exec api \
+  python prerender.py --workers 12          # --period/--start/--end/--width/--force/--dry-run
+```
+~19,300 buckets (16.4k days + 2.3k weeks + 540 months) at width 720 is ~7 min and ~1.2 GB.
+Only *closed* buckets are written, and the script writes the cache file itself rather than
+letting `render()` do it — see the note under Map imagery.
+
 **Frontend (outside Docker):**
 ```bash
 cd front && npm install && npm run dev
@@ -170,7 +180,7 @@ business, not the API's.
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region |
 | `POST /monthlyRanking` | `{lat, lon, top?}` → every complete calendar month at that cell, ranked within its month-of-year |
-| `GET /image/{date}.png` | one day (or week/month) as a Web-Mercator PNG |
+| `GET /image/{date}.webp` | one day (or week/month) as a Web-Mercator WebP |
 
 **`period` — `daily` (default) / `weekly` / `monthly`** — is accepted by every timeseries
 endpoint and by `/image`, and its buckets are defined once in `api/modules/periods.py`:
@@ -210,7 +220,7 @@ rather than a red failure (`stores/main.ts`'s `selectPoint` catch).
 
 ### Map imagery (`api/modules/render.py`)
 
-There is **no tile pyramid**. At 360×360 cells the whole domain is one modest PNG, served
+There is **no tile pyramid**. At 360×360 cells the whole domain is one modest WebP, served
 as a Mapbox `image` source with corner coordinates from `/domain`'s `imageBounds`. A
 pyramid can be added behind the same URL shape later if zoom demands it.
 
@@ -224,15 +234,45 @@ that is a gross error, not a rounding one. Two consequences:
   along every coastline; `to_mercator()` falls back to whichever side is real.
 
 Land (`_FillValue`) renders **fully transparent**, not white — the dark basemap shows
-through. Rendered PNGs are cached under `OISST_IMAGE_DIR`
-(`./data/images/anom/{period}/YYYY/{bucket-start}_w{width}.png`); `?nocache=true` forces a
+through. Images are **lossy WebP at quality 90**, which is a deliberate call and was
+measured, not assumed. Against the lossless encode of the same field: mean error
+**0.015 °C**, 99.6% of ocean pixels within 0.1 °C, ~6 pixels in 800k past 1 °C — on a
+±3 °C scale, and indistinguishable side by side. It buys **5× on the wire** (~78 KB vs
+~270 KB) and **10× on encode** (0.06 s vs 2.9 s); the encode speed is not a luxury,
+because a partial bucket is never cached and re-encodes on every request.
+
+Two things that make this safe, and one caveat:
+- **The alpha channel is bit-exact at every quality** — libwebp always codes alpha
+  losslessly. The land mask does not bleed, which was the obvious worry and is not real.
+- **Error concentrates in the ~1% of pixels forming the coastal ring** (worst ~1.2 °C),
+  for the same reason `to_mercator()` guards that edge. Interior error is far lower.
+- **Exact values are the timeseries endpoints' job.** This raster is for looking at; if
+  a caller ever needs to read numbers back out of the pixels, this is the wrong source
+  and lossless would have to come back.
+
+`method=4`, not 6: at this size 6 costs 13× the time for under 2% fewer bytes. Note that in
+*lossless* mode libwebp's `quality` means compression effort rather than fidelity, so
+Pillow's default of 80 leaves ~32% on the table — relevant if lossless is ever restored.
+
+Renders are cached under `OISST_IMAGE_DIR`
+(`./data/images/anom/{period}/YYYY/{bucket-start}_w{width}.webp`); `?nocache=true` forces a
 re-render. A **partial** bucket — a week or month still filling up at the head of the
 archive — is rendered but deliberately *not* cached, or it would freeze at a mean over the
 handful of days that happened to be ingested first.
 
+`prerender.py` writes its cache files itself rather than going through that guard, because
+the guard cannot distinguish a bucket still filling up from one with an **interior** gap:
+OISST has no 1986-03-18, so that week and that month are complete-as-they-will-ever-be yet
+look partial to `render()` and would re-encode on every request forever. The script instead
+renders only *closed* buckets (span's last day ≤ the archive's last day) and caches them
+unconditionally. It also runs its pool under `multiprocessing`'s **`spawn`** context: a
+forked worker inherits the parent's open ClickHouse socket, and several workers reading each
+other's responses off it surfaces as urllib3 `BadStatusLine` on binary garbage, not as
+anything that looks like a connection-sharing bug.
+
 **Colour range lives in `domain.yml`** (`vmin`/`vmax`, currently ±3 °C with `RdBu_r`).
 Daily values reach about ±5 at the extremes, but saturating at ±3 is what makes an ordinary
-day readable rather than uniformly pale. Change it there and both the rendered PNGs and the
+day readable rather than uniformly pale. Change it there and both the rendered images and the
 frontend legend follow.
 
 ### Frontend (`front/`)
@@ -337,7 +377,7 @@ values; `dataZoom` is what makes that browsable.
   running container — use `up -d --force-recreate <service>`, not `restart`.
 - **`domain.yml` changes need an API restart.** `shared.domain` caches the parsed YAML with
   `lru_cache`, and uvicorn's `--reload` only watches `.py` files, so a colour-range or
-  region edit is invisible until the container is restarted. Cached PNGs under
+  region edit is invisible until the container is restarted. Cached images under
   `./data/images` also survive it — delete them or pass `?nocache=true`.
 - **`UID`/`GID` in `.env.dev`** are what stop `api` writing root-owned cache files into the
   bind-mounted `./data`. Set them to your own `id -u` / `id -g`.
@@ -345,8 +385,11 @@ values; `dataZoom` is what makes that browsable.
   `./process` over `/app`, which would hide anything installed under it.
 - Rendered images are **cached by (period, bucket start, width)**; a request with a different
   `width` is a separate render and a separate file. The cache layout gained the `{period}`
-  level, so any PNGs left directly under `./data/images/anom/YYYY/` are from the old layout
+  level, so any images left directly under `./data/images/anom/YYYY/` are from the old layout
   and are dead — `mv`ing those year directories into `./data/images/anom/daily/` reclaims them.
+- **The rendered format is WebP, and `.png` cache files are dead.** The cache is keyed by
+  extension as well as (period, bucket start, width), so any `*.png` left under
+  `./data/images` is never read again and can be deleted.
 - **Nuxt UI's own icons default to the `lucide` collection**, and only `@iconify-json/mdi`
   is installed. A component reaching for one of its internal icons (`UModal`'s close button
   is the first that does) logs `Collection lucide is not found locally` and renders nothing.
@@ -367,7 +410,7 @@ values; `dataZoom` is what makes that browsable.
 Verified working end to end: schema creation, ingest (round-trip checked cell-by-cell
 against the source NetCDF), the ingest status/skip/force logic, every API endpoint at all
 three periods (weekly/monthly means cross-checked against the mean of their own daily
-values), PNG rendering, and SSR of the frontend page. `/monthlyRanking` is checked against the
+values), image rendering, and SSR of the frontend page. `/monthlyRanking` is checked against the
 whole-month and interior-gap edge cases, and both ranking ECharts options are rendered
 head-lessly (echarts SSR -> SVG) and asserted on: 539 marks across the twelve thumbnails,
 one dot and one `rank. year` label per row in the detail, and the pitch clamped so 45
@@ -380,7 +423,15 @@ ever observed it. Watch the template ref, not the mount.
 Headless Chromium renders the Mapbox canvas fine under ANGLE/SwiftShader; launch it with
 `args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']`. Note the
 host's default node is 18 and Playwright needs 20+, so run it under
-`$HOME/.nvm/versions/node/v22.23.1/bin`.
+`$HOME/.nvm/versions/node/v22.23.1/bin`. Playwright is not a dependency of this repo —
+`npm i playwright --no-save` into a scratch dir, and since a fresh install will not match
+the browsers already in `~/.cache/ms-playwright`, pass `executablePath` at that cache's
+`chromium-<build>/chrome-linux64/chrome` rather than downloading another one.
+
+**Do not read the map back off its own canvas.** Mapbox runs with
+`preserveDrawingBuffer: false`, so `drawImage(mapCanvas)` yields a blank frame and a
+colour-count assertion on it fails even when the map is drawn correctly. Take a Playwright
+screenshot and look at that instead.
 
 The style loads, `map.on('load')` fires, and a synthetic click on `canvas.mapboxgl-canvas`
 selects a cell — the only way to drive the rest of the UI, since every panel keys off the
@@ -389,7 +440,9 @@ chart, and the monthly-ranking modal (opening, twelve named thumbnails drawn, th
 month sized to the pane with no overflow, picking March from the rail, tooltip contents,
 and click-a-row moving the map — a March row set 2017-03-01).
 
-**Still unverified in a browser**: the period toggle's effect on the map and chart.
+The period toggle is verified too: Daily -> Weekly -> Monthly each refetches the map image
+at the right bucket start (`2026-08-24` daily and weekly, `2026-08-01` monthly) and the
+monthly frame is visibly smoother than the daily one.
 
 Not built yet: NCEI downloader, region-aggregate tables (`region_daily`), climatology /
 marine-heatwave analytics, tile pyramid, production compose files, PostHog analytics,

@@ -26,7 +26,7 @@ export function useApi() {
     },
     /** Always browser-facing: this URL is handed to Mapbox, not fetched here. */
     imageUrl(date: string, period: Period = 'daily', width = 720): string {
-      return `${publicBase}/image/${date}.png?width=${width}&period=${period}`
+      return `${publicBase}/image/${date}.webp?width=${width}&period=${period}`
     },
   }
 }

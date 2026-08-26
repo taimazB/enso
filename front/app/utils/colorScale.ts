@@ -18,7 +18,7 @@ function rgb(hex: string): [number, number, number] {
  * Build an interpolating lookup over `stops`, which must be sorted by value.
  *
  * Values outside the stops' range clamp to the end colours rather than
- * extrapolating — the map's PNGs saturate at vmin/vmax the same way, so a +5 °C
+ * extrapolating — the map's images saturate at vmin/vmax the same way, so a +5 °C
  * day reads as "off the top of the scale" in both views.
  */
 export function colorScale(stops: ColorStop[]): (value: number | null) => string {

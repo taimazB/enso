@@ -44,7 +44,7 @@ variables:
     # Symmetric diverging range for map rendering, in units above. Daily values
     # reach about +/-5 at the extremes, but saturating at +/-3 is what makes an
     # ordinary day readable rather than uniformly pale. Change here and both the
-    # rendered PNGs and the frontend legend follow.
+    # rendered images and the frontend legend follow.
     vmin: -3.0
     vmax: 3.0
     colormap: RdBu_r
