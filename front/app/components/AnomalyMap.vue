@@ -24,11 +24,19 @@ const token = useRuntimeConfig().public.mapboxToken
 const container = ref<HTMLElement | null>(null)
 let map: mapboxgl.Map | null = null
 let marker: mapboxgl.Marker | null = null
+let resize: ResizeObserver | null = null
 
 const SOURCE_ID = 'anom-image'
 const LAYER_ID = 'anom-layer'
 /** Northern edge of the opening view; see the `bounds` comment below. */
 const INITIAL_NORTH = 68
+
+/** Move (or create) the pin marking the selected cell. */
+function showMarker(lat: number, lon: number) {
+  if (!map) return
+  marker ??= new mapboxgl.Marker({ color: '#f8fafc' })
+  marker.setLngLat([lon, lat]).addTo(map)
+}
 
 /** Corner coordinates for a Mapbox image source: TL, TR, BR, BL. */
 function imageCoordinates(): [[number, number], [number, number], [number, number], [number, number]] {
@@ -78,6 +86,11 @@ onMounted(() => {
 
   map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'top-right')
 
+  // The ranks dock takes width from the map, and its drag handle takes it
+  // continuously — the canvas has to follow the container rather than the window.
+  resize = new ResizeObserver(() => map?.resize())
+  resize.observe(container.value)
+
   // The style may already be loaded by the time this runs (a warm style cache),
   // in which case 'load' has fired and would never fire again.
   if (map.isStyleLoaded()) addRaster()
@@ -86,9 +99,12 @@ onMounted(() => {
   map.on('click', (event) => {
     const { lat, lng } = event.lngLat
     store.selectPoint(Number(lat.toFixed(4)), Number(lng.toFixed(4)))
-    marker ??= new mapboxgl.Marker({ color: '#f8fafc' })
-    marker.setLngLat([lng, lat]).addTo(map!)
+    showMarker(lat, lng)
   })
+
+  // The store opens on a default cell, so the pin has to be there before the
+  // first click or the chart would be describing an unmarked point.
+  if (store.selectedPoint) showMarker(store.selectedPoint.lat, store.selectedPoint.lon)
 })
 
 // Swapping the URL in place keeps the layer and its paint properties, so
@@ -103,6 +119,8 @@ watch(() => [store.selectedDate, store.period], () => {
 })
 
 onBeforeUnmount(() => {
+  resize?.disconnect()
+  resize = null
   marker?.remove()
   map?.remove()
   map = null

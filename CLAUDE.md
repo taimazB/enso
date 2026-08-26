@@ -282,12 +282,13 @@ same stack as the ocean-acidification dashboard.
 
 ```
 app/app.vue                        header + coverage badge; awaits store.loadMetadata()
-app/pages/index.vue                map above, point chart rail below
+app/pages/index.vue                map + point chart rail on the left, ranks dock on the right
 app/components/AnomalyMap.vue      MapboxGL + the anomaly image source
 app/components/TimeControl.vue     period toggle + date stepper (±1 bucket, ±1 year)
 app/components/ColorLegend.vue     gradient built from /domain's colorStops
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
+app/components/SideDock.vue        resizable right-hand dock (drag handle, remembered width)
 app/composables/useApi.ts          axios wrapper
 app/composables/usePlayback.ts     play/stop loop + frame prefetch for the map animation
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
@@ -301,11 +302,26 @@ app/stores/main.ts                 Pinia store
 `Point | Region mean` tab pair here; the region side is gone from the UI, though
 `/region/{key}` and `/regionTimeseries` still exist and still take `period`.
 
-**The monthly-ranking browser lives in a fullscreen modal**, opened from the rail,
-because one month of ~45 years is already taller than the chart rail. It is
-**master–detail, not a grid**: a scrollable left rail of twelve thumbnails, and the
-selected month drawn full size beside it. Twelve panels at once was the first shape and
-was legible only by scrolling ~1800px, which is what killed it.
+**The monthly-ranking browser lives in a dock beside the map**, not over it. It needs
+full page height — one month of ~45 years is already taller than the chart rail — but it
+was a fullscreen modal first, and that made picking a cell cost close / click / reopen
+every time, which is unusable if you want to compare ten cells. `SideDock.vue` is a plain
+right-hand column: the map keeps its clicks, the store updates, and the panel follows.
+
+Its width is the user's, not a constant — the dock and the map want the same pixels, so
+there is a drag handle on its left edge (arrow keys too) and the width is remembered in
+`localStorage` under `enso.ranksDock.width`. The floor is **420px**, which is where the
+rail plus the panel's fixed 66px of rank labels stop leaving a readable plot; the ceiling
+leaves 380px for the map. `MonthlyRankingBrowser` is therefore sized by **container
+queries** (`@container` on its root, `@md`/`@lg` variants) rather than viewport
+breakpoints — the rail narrows, and the "warmest YYYY" captions and the panel's colour
+legend drop out, when the dock is dragged in. Its `ResizeObserver` redraw is debounced
+100ms because a drag fires it every frame and one redraw is twelve thumbnails plus a
+45-row panel.
+
+Inside the dock it is **master–detail, not a grid**: a scrollable left rail of twelve
+thumbnails, and the selected month drawn full size beside it. Twelve panels at once was
+the first shape and was legible only by scrolling ~1800px, which is what killed it.
 
 Both ECharts options are built by `utils/ranking.ts` rather than inside the SFC, for the
 same reason `periods.ts` exists: being pure functions of their inputs they can be rendered
@@ -458,9 +474,15 @@ screenshot and look at that instead.
 The style loads, `map.on('load')` fires, and a synthetic click on `canvas.mapboxgl-canvas`
 selects a cell — the only way to drive the rest of the UI, since every panel keys off the
 selected point. Verified end to end in Chromium this way: the Mapbox raster overlay, the point
-chart, and the monthly-ranking modal (opening, twelve named thumbnails drawn, the open
+chart, and the monthly-ranking browser (opening, twelve named thumbnails drawn, the open
 month sized to the pane with no overflow, picking March from the rail, tooltip contents,
 and click-a-row moving the map — a March row set 2017-03-01).
+
+The dock is verified in Chromium too: opening it leaves the map canvas 1080px of a 1600px
+window and still clickable, a second map click re-titles the panel and redraws it without
+closing anything, the drag handle resizes 520 -> 783 and clamps at 420, the width survives
+a close/reopen, closing gives the map its full width back, and a click on a detail row
+still moves the map (2026-08-24 -> 2001-08-01). No console errors at any point.
 
 The period toggle is verified too: Daily -> Weekly -> Monthly each refetches the map image
 at the right bucket start (`2026-08-24` daily and weekly, `2026-08-01` monthly) and the

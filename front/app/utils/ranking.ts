@@ -221,6 +221,9 @@ export function detailOption({
         // puts "-2.18" next to "-2.00". The round ticks between are the scale.
         showMinLabel: false,
         showMaxLabel: false,
+        // The panel is as wide as the dock the user left it at; at the narrow
+        // end the round ticks would otherwise run into each other.
+        hideOverlap: true,
         formatter: (v: number) => signed(v),
       },
       axisLine: { show: false },

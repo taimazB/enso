@@ -35,6 +35,13 @@ export interface Series {
   cell?: { lat: number, lon: number }
 }
 
+/**
+ * Cell the app opens on, so the chart and the ranks are populated before the
+ * first map click. North-east Pacific, well inside the subset box and in open
+ * water — a land cell would bootstrap into an empty series.
+ */
+const DEFAULT_POINT = { lat: 48, lon: -128 }
+
 export const useMainStore = defineStore('main', {
   state: () => ({
     domain: null as DomainMeta | null,
@@ -44,8 +51,12 @@ export const useMainStore = defineStore('main', {
      * the map frame and the chart's x-value refer to the same span of days.
      */
     selectedDate: null as string | null,
-    /** Averaging window for both the map imagery and the chart. */
-    period: 'daily' as Period,
+    /**
+     * Averaging window for both the map imagery and the chart. Opens on
+     * `weekly`: a single day of anomaly is noisy enough that the first frame
+     * reads as speckle, and the weekly mean shows the pattern the map is for.
+     */
+    period: 'weekly' as Period,
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
@@ -60,6 +71,16 @@ export const useMainStore = defineStore('main', {
     async loadMetadata() {
       if (this.domain && this.coverage) return
       const api = useApi()
+      // Started before the first await, not after: `useApi()` reaches for the
+      // Nuxt instance, which SSR only keeps for the synchronous part of a call
+      // chain. Awaiting first and selecting after loses it (NUXT_E1001) and the
+      // fetch never lands. The default cell needs nothing from /domain anyway,
+      // so it goes out alongside them.
+      const point = this.selectedPoint
+        ? null
+        // Non-fatal: a failure here costs the opening chart, not the whole page.
+        : this.selectPoint(DEFAULT_POINT.lat, DEFAULT_POINT.lon).catch(() => {})
+
       const [domain, coverage] = await Promise.all([
         api.get<DomainMeta>('/domain'),
         api.get<Coverage>('/coverage'),
@@ -67,6 +88,7 @@ export const useMainStore = defineStore('main', {
       this.domain = domain
       this.coverage = coverage
       if (!this.selectedDate && coverage.end) this.setDate(coverage.end)
+      await point
     },
 
     /** Set the map date, snapped to the current period's bucket. */

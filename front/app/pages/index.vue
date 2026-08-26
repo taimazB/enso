@@ -1,52 +1,67 @@
 <template>
-  <div class="flex h-full flex-col">
-    <div class="relative grow">
-      <AnomalyMap />
-      <ColorLegend class="absolute bottom-4 left-1/2 z-10 -translate-x-1/2" />
+  <!-- Map and the ranks dock sit side by side rather than one over the other:
+       reading a month's ranking is a per-cell question, so the map has to stay
+       clickable while the panel is open. It used to be a fullscreen modal, which
+       meant close / click / reopen for every cell. -->
+  <div class="flex h-full min-h-0">
+    <div class="flex min-w-0 grow flex-col">
+      <div class="relative grow">
+        <AnomalyMap />
+        <ColorLegend class="absolute bottom-4 left-1/2 z-10 -translate-x-1/2" />
+      </div>
+
+      <div class="relative h-[38%] shrink-0 border-t border-default p-3">
+        <TimeseriesChart
+          :series="store.pointSeries"
+          :loading="store.loadingPoint"
+          :empty-message="emptyPointMessage"
+          :title="pointTitle"
+          :selected-date="store.selectedDate"
+          @select="store.setDate($event)"
+        />
+
+        <UButton
+          class="absolute right-4 top-4 z-20"
+          icon="i-mdi-podium-gold"
+          size="xs"
+          :color="ranksOpen ? 'primary' : 'neutral'"
+          :variant="ranksOpen ? 'solid' : 'subtle'"
+          label="Monthly ranks"
+          :disabled="!store.monthlyRanking && !ranksOpen"
+          @click="ranksOpen = !ranksOpen"
+        />
+      </div>
     </div>
 
-    <div class="relative h-[38%] shrink-0 border-t border-default p-3">
-      <TimeseriesChart
-        :series="store.pointSeries"
+    <SideDock
+      v-if="ranksOpen"
+      title="Monthly ranks"
+      :subtitle="ranksSubtitle"
+      storage-key="enso.ranksDock.width"
+      @close="ranksOpen = false"
+    >
+      <!-- Clamped, because the detail panel wants every pixel of height it can
+           get; the whole caption is one click away for anyone who needs it. -->
+      <button
+        v-if="ranksDescription"
+        type="button"
+        class="mb-2 shrink-0 cursor-pointer text-left text-xs leading-snug text-muted hover:text-default"
+        :class="captionOpen ? '' : 'line-clamp-2'"
+        :title="captionOpen ? 'Show less' : 'Show more'"
+        @click="captionOpen = !captionOpen"
+      >
+        {{ ranksDescription }}
+      </button>
+
+      <MonthlyRankingBrowser
+        :ranking="store.monthlyRanking"
+        :stops="store.domain?.colorStops ?? []"
         :loading="store.loadingPoint"
         :empty-message="emptyPointMessage"
-        :title="pointTitle"
         :selected-date="store.selectedDate"
         @select="store.setDate($event)"
       />
-
-      <!-- Parked in a fullscreen modal for now: one month of ~45 years, plus a
-           rail of the other eleven, needs far more room than the chart rail has.
-           Easy to move once we know where it belongs. -->
-      <UModal
-        v-model:open="ranksOpen"
-        fullscreen
-        class="absolute right-4 top-4 z-20"
-        :title="ranksTitle"
-        :description="ranksDescription"
-        :ui="{ body: 'flex min-h-0 grow overflow-hidden' }"
-      >
-        <UButton
-          icon="i-mdi-podium-gold"
-          size="xs"
-          color="neutral"
-          variant="subtle"
-          label="Monthly ranks"
-          :disabled="!store.monthlyRanking"
-        />
-
-        <template #body>
-          <MonthlyRankingBrowser
-            :ranking="store.monthlyRanking"
-            :stops="store.domain?.colorStops ?? []"
-            :loading="store.loadingPoint"
-            :empty-message="emptyPointMessage"
-            :selected-date="store.selectedDate"
-            @select="store.setDate($event)"
-          />
-        </template>
-      </UModal>
-    </div>
+    </SideDock>
   </div>
 </template>
 
@@ -71,17 +86,15 @@ const emptyPointMessage = computed(
 )
 
 const ranksOpen = ref(false)
+const captionOpen = ref(false)
 
-const ranksTitle = computed(() => {
+const ranksSubtitle = computed(() => {
   const cell = store.monthlyRanking?.cell
-  if (!cell) return 'Monthly ranks'
+  if (!cell) return 'Click the map to pick a cell'
   const lon = ((cell.lon + 180) % 360) - 180
-  return `Monthly ranks · ${cell.lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`
+  return `${cell.lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`
 })
 
-// Carries the chart's caption as well as its span: the modal header is the only
-// part of the dialog that does not scroll, so this is where an explanation of the
-// encoding stays visible next to an 1800px figure.
 const ranksDescription = computed(() => {
   const span = store.monthlyRanking?.span
   if (!span) return ''
