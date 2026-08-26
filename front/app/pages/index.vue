@@ -55,7 +55,7 @@
 
       <MonthlyRankingBrowser
         :ranking="store.monthlyRanking"
-        :stops="store.domain?.colorStops ?? []"
+        :stops="store.domain?.colorStops?.[store.variable] ?? []"
         :loading="store.loadingPoint"
         :empty-message="emptyPointMessage"
         :selected-date="store.selectedDate"

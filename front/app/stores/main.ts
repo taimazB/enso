@@ -4,6 +4,9 @@ import type { Period } from '~/utils/periods'
 import type { MonthlyRanking } from '~/utils/ranking'
 import { bucketStart } from '~/utils/periods'
 
+/** The two things the map and chart can show. `anom` is derived, not stored. */
+export type VariableName = 'sst' | 'anom'
+
 export interface DomainMeta {
   subset: { name: string, lat: [number, number], lon: [number, number], shape: [number, number], resolution: number }
   imageBounds: { west: number, south: number, east: number, north: number }
@@ -15,8 +18,13 @@ export interface DomainMeta {
     vmin: number
     vmax: number
     colormap: string
+    derived: boolean
   }>
-  colorStops: Array<{ value: number, color: string }>
+  /** Keyed by variable: sst's scale is sequential, anom's diverging. */
+  colorStops: Record<VariableName, Array<{ value: number, color: string }>>
+  defaultVariable: VariableName
+  /** Ocean with SST but no climatology — the seasonal ice fringe. */
+  noClimColor: string
   regions: Array<{ key: string, label: string, lat: [number, number], lon: [number, number], partial: boolean }>
 }
 
@@ -25,12 +33,15 @@ export interface Coverage {
   days: number
   start: string | null
   end: string | null
+  /** Anomaly is unavailable until all 366 climatology keys are loaded. */
+  climatology: { keys: number, complete: boolean } | null
 }
 
 export interface Series {
   dates: string[]
   values: Array<number | null>
   period?: Period
+  variable?: VariableName
   label?: string | null
   cell?: { lat: number, lon: number }
 }
@@ -57,6 +68,13 @@ export const useMainStore = defineStore('main', {
      * reads as speckle, and the weekly mean shows the pattern the map is for.
      */
     period: 'weekly' as Period,
+    /**
+     * Field shown on the map and charted. Opens on `sst`, not `anom`: SST is
+     * the stored variable and is defined everywhere in the box, while the
+     * anomaly is undefined over the ~3% ice fringe and needs the climatology
+     * to be fully loaded.
+     */
+    variable: 'sst' as VariableName,
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
@@ -107,12 +125,30 @@ export const useMainStore = defineStore('main', {
       }
     },
 
+    /**
+     * Switch the field shown. Drives the chart request and the image URL
+     * together, exactly as `period` does, so the map and the chart never show
+     * different variables. The date is untouched — a variable change is not a
+     * change of when.
+     */
+    setVariable(variable: VariableName) {
+      if (variable === this.variable) return
+      this.variable = variable
+      if (this.selectedPoint) {
+        const { lat, lon } = this.selectedPoint
+        return this.selectPoint(lat, lon)
+      }
+    },
+
     async selectPoint(lat: number, lon: number) {
       // The ranking is period-independent, so a period toggle — which re-enters
-      // here with the same cell — must not refetch it and flash the grid.
+      // here with the same cell — must not refetch it and flash the grid. It is
+      // NOT variable-independent, though: ranking years by SST rather than by
+      // anomaly is a different question, so a variable change must refetch.
       const sameCell = this.selectedPoint?.lat === lat
         && this.selectedPoint?.lon === lon
         && this.monthlyRanking !== null
+        && this.monthlyRanking.variable === this.variable
 
       this.selectedPoint = { lat, lon }
       this.outsideDomain = null
@@ -120,10 +156,10 @@ export const useMainStore = defineStore('main', {
       try {
         const api = useApi()
         const [series, ranking] = await Promise.all([
-          api.post<Series>('/timeseries', { lat, lon, period: this.period }),
+          api.post<Series>('/timeseries', { lat, lon, period: this.period, variable: this.variable }),
           sameCell
             ? Promise.resolve(this.monthlyRanking!)
-            : api.post<MonthlyRanking>('/monthlyRanking', { lat, lon }),
+            : api.post<MonthlyRanking>('/monthlyRanking', { lat, lon, variable: this.variable }),
         ])
         this.pointSeries = series
         this.monthlyRanking = ranking

@@ -47,6 +47,9 @@ export interface RankingRow {
 
 export interface MonthlyRanking {
   cell: { gy: number, lat: number, lon: number }
+  /** Which field the years are ranked by — 'sst' or 'anom'. */
+  variable?: 'sst' | 'anom'
+  units?: string
   /** Every month ranked, edge months included — first of the first to last of the last. */
   span: { start: string, end: string } | null
   /** Last day with data, which is where a trailing partial month has got to. */

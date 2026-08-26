@@ -26,10 +26,8 @@ let map: mapboxgl.Map | null = null
 let marker: mapboxgl.Marker | null = null
 let resize: ResizeObserver | null = null
 
-const SOURCE_ID = 'anom-image'
-const LAYER_ID = 'anom-layer'
-/** Northern edge of the opening view; see the `bounds` comment below. */
-const INITIAL_NORTH = 68
+const SOURCE_ID = 'field-image'
+const LAYER_ID = 'field-layer'
 
 /** Move (or create) the pin marking the selected cell. */
 function showMarker(lat: number, lon: number) {
@@ -38,7 +36,15 @@ function showMarker(lat: number, lon: number) {
   marker.setLngLat([lon, lat]).addTo(map)
 }
 
-/** Corner coordinates for a Mapbox image source: TL, TR, BR, BL. */
+/**
+ * Corner coordinates for a Mapbox image source: TL, TR, BR, BL.
+ *
+ * `imageBounds.east` is **unwrapped** — the Pacific box ends at 290, not -70.
+ * Mapbox accepts that and places the quad correctly across the antimeridian
+ * (verified: `project([290,0])` and `project([-70,0])` return the same pixel).
+ * Normalising it into -180..180 here would make west > east and collapse the
+ * image to nothing.
+ */
 function imageCoordinates(): [[number, number], [number, number], [number, number], [number, number]] {
   const b = store.domain!.imageBounds
   return [
@@ -50,7 +56,9 @@ function imageCoordinates(): [[number, number], [number, number], [number, numbe
 }
 
 function currentUrl(): string | null {
-  return store.selectedDate ? api.imageUrl(store.selectedDate, store.period) : null
+  return store.selectedDate
+    ? api.imageUrl(store.selectedDate, store.period, store.variable)
+    : null
 }
 
 function addRaster() {
@@ -75,13 +83,14 @@ onMounted(() => {
   map = new mapboxgl.Map({
     container: container.value,
     style: 'mapbox://styles/mapbox/dark-v11',
-    // Fitting the whole domain would open at a near-global zoom: in Mercator the
-    // 70-90N strip alone is taller than everything below it, so the interesting
-    // mid-latitude Pacific ends up a sliver. Open on the signal instead — the
-    // raster still covers the full domain once the user zooms out.
-    bounds: [[b.west, b.south], [b.east, Math.min(b.north, INITIAL_NORTH)]],
+    // The whole box, no clipping. The old INITIAL_NORTH workaround existed
+    // because the OISST domain ran to 90N and the 70-90 strip dominated a
+    // Mercator fit; this box stops at 65N, so it fits without a sliver.
+    bounds: [[b.west, b.south], [b.east, b.north]],
     fitBoundsOptions: { padding: 20 },
-    projection: { name: 'globe' },
+    // Mercator, not globe: the domain is one basin rather than the whole
+    // planet, and a globe hides half of it behind the limb at the opening zoom.
+    projection: { name: 'mercator' },
   })
 
   map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'top-right')
@@ -110,7 +119,7 @@ onMounted(() => {
 // Swapping the URL in place keeps the layer and its paint properties, so
 // stepping through days — or switching to a weekly/monthly mean — does not
 // flash the basemap between frames.
-watch(() => [store.selectedDate, store.period], () => {
+watch(() => [store.selectedDate, store.period, store.variable], () => {
   const url = currentUrl()
   if (!map || !url) return
   const source = map.getSource(SOURCE_ID) as mapboxgl.ImageSource | undefined

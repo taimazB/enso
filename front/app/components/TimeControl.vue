@@ -1,5 +1,27 @@
 <template>
   <div class="flex items-center gap-2 rounded-lg border border-default bg-elevated/90 px-2 py-1 shadow-lg backdrop-blur">
+    <!--
+      UFieldGroup, not UButtonGroup: Nuxt UI v4 renamed it and the old name
+      resolves to an empty comment node instead of erroring, so the control
+      simply vanishes from the DOM.
+    -->
+    <UFieldGroup size="xs">
+      <UButton
+        v-for="item in VARIABLES"
+        :key="item.value"
+        :label="item.label"
+        :color="store.variable === item.value ? 'primary' : 'neutral'"
+        :variant="store.variable === item.value ? 'solid' : 'subtle'"
+        :disabled="item.value === 'anom' && !climatologyReady"
+        :title="item.value === 'anom' && !climatologyReady
+          ? 'Anomaly needs the full 366-day climatology, which is still loading'
+          : item.title"
+        @click="store.setVariable(item.value)"
+      />
+    </UFieldGroup>
+
+    <div class="h-5 w-px bg-accented" />
+
     <UFieldGroup size="xs">
       <UButton
         v-for="item in PERIODS"
@@ -101,10 +123,24 @@ import { useMainStore } from '~/stores/main'
 import { PERIODS, bucketLabel, bucketStart, bucketsPerYear, shiftBuckets } from '~/utils/periods'
 import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
 
-// Note: the period toggle above is a UFieldGroup, not a UButtonGroup — Nuxt UI
-// v4 renamed that component, and the old name silently renders nothing.
-
 const store = useMainStore()
+
+/**
+ * SST first: it is the stored variable and is defined on every ocean cell,
+ * while the anomaly is undefined over the ice fringe and depends on the
+ * climatology being fully loaded.
+ */
+const VARIABLES = [
+  { value: 'sst' as const, label: 'SST', title: 'Sea surface temperature' },
+  { value: 'anom' as const, label: 'Anomaly', title: 'Difference from the 1991-2020 daily climatology' },
+]
+
+/**
+ * The anomaly is derived per day-of-year, so a partly-loaded climatology would
+ * silently blank whichever dates are missing rather than fail — better to
+ * disable the toggle than to serve holes.
+ */
+const climatologyReady = computed(() => store.coverage?.climatology?.complete !== false)
 const { playing, fps, canPlay, toggle, stop } = usePlayback()
 
 const dateInput = computed({
