@@ -37,12 +37,20 @@ export interface RankingRow {
   n: number
   /** 1 = warmest year on record for this calendar month. */
   rank: number
+  /**
+   * Truncated by the edge of the archive — the month still filling up, or the
+   * one the record starts mid-way through. Ranked with the rest, but starred:
+   * its mean is over a part-month and its rank will move as the days land.
+   */
+  partial?: boolean
 }
 
 export interface MonthlyRanking {
   cell: { gy: number, lat: number, lon: number }
-  /** The complete-month window ranked — narrower than coverage, which ends mid-month. */
+  /** Every month ranked, edge months included — first of the first to last of the last. */
   span: { start: string, end: string } | null
+  /** Last day with data, which is where a trailing partial month has got to. */
+  through?: string | null
   /** How many ranks count as "top" — drives the emphasis, not the row count. */
   top: number
   /** Keyed by month number as a string, '1'..'12', each already in rank order. */
@@ -66,8 +74,8 @@ const ZERO_LINE = { color: '#94a3b8', type: 'dashed' as const, width: 1 }
 // All px. The panel is sized to the pane it is given: `detailPitch()` spends the
 // available height on the rows, so one month normally needs no scrolling at all —
 // which is the whole reason for showing one month at a time rather than twelve.
-/** Room for a "23. 2026" y-label. */
-const LABEL_W = 66
+/** Room for a "23. 2026 *" y-label — the star on an edge month costs a few px. */
+const LABEL_W = 74
 const TOP_PAD = 10
 const AXIS_H = 34
 const RIGHT_PAD = 18
@@ -93,6 +101,25 @@ export function detailHeightFor(rowCount: number, pitch: number): number {
 
 function signed(value: number): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}`
+}
+
+/** Days in a 1-based calendar month — day 0 of the next one. */
+export function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate()
+}
+
+/**
+ * The starred rows of a month, if any — at most the archive's two edge months.
+ *
+ * The star is the whole point of showing them: a part-month mean competes with
+ * whole ones (August 2026 lands at rank 2 on 24 days at 45.125°N), so the row is
+ * there to be read, with the caveat attached rather than the row removed.
+ */
+export function partialNote(rows: RankingRow[], month: number): string | null {
+  const r = rows.find(row => row.partial)
+  if (!r) return null
+  return `* ${MONTHS[month - 1]} ${r.year} is incomplete — ranked on ${r.n} `
+    + `of ${daysInMonth(r.year, month)} days, so its place will move.`
 }
 
 // --- Shared x-domain ---------------------------------------------------------
@@ -154,9 +181,16 @@ export function thumbOption({ rows, stops, domain, selectedYear }: ThumbOptionIn
       data: rows.map((r, i) => ({
         value: [r.mean, i],
         symbolSize: selectedYear != null && r.year === selectedYear ? 6 : 3.5,
-        itemStyle: selectedYear != null && r.year === selectedYear
-          ? { color: scale(r.mean), borderColor: ACCENT, borderWidth: 1.5 }
-          : { color: scale(r.mean) },
+        itemStyle: {
+          color: scale(r.mean),
+          // No labels here to carry a star, so a truncated month's dot is drawn
+          // faint instead — the rail is scanned for the spine's shape, and this
+          // says "provisional" without changing where the dot sits.
+          opacity: r.partial ? 0.45 : 1,
+          ...(selectedYear != null && r.year === selectedYear
+            ? { borderColor: ACCENT, borderWidth: 1.5 }
+            : {}),
+        },
       })),
       markLine: {
         silent: true,
@@ -199,13 +233,20 @@ export function detailOption({
       trigger: 'item',
       appendToBody: true,
       formatter: (raw: TooltipComponentFormatterCallbackParams) => {
-        const [, mean, , , year, sd, n, rank] = (raw as unknown as ItemParams).value
-        return [
-          `<b>${MONTHS[month - 1]} ${year}</b>`,
+        const [, mean, , , year, sd, n, rank, partial] = (raw as unknown as ItemParams).value
+        const lines = [
+          `<b>${MONTHS[month - 1]} ${year}${partial ? ' *' : ''}</b>`,
           `mean&nbsp;&nbsp;<b>${signed(mean!)} °C</b>`,
           `sd&nbsp;&nbsp;${sd!.toFixed(2)} °C over ${n} days`,
           `rank&nbsp;&nbsp;${rank} of ${rows.length}`,
-        ].join('<br/>')
+        ]
+        if (partial) {
+          lines.push(
+            `<span style="opacity:0.75">incomplete — ${n} of `
+            + `${daysInMonth(year!, month)} days</span>`,
+          )
+        }
+        return lines.join('<br/>')
       },
     },
     grid: { left: LABEL_W, top: TOP_PAD, right: RIGHT_PAD, height: panelH },
@@ -234,7 +275,7 @@ export function detailOption({
       type: 'category',
       // Rank 1 belongs at the top; a category axis counts up from the bottom.
       inverse: true,
-      data: rows.map(r => `${r.rank}. ${r.year}`),
+      data: rows.map(r => `${r.rank}. ${r.year}${r.partial ? ' *' : ''}`),
       axisLine: { show: false },
       axisTick: { show: false },
       splitLine: { show: false },
@@ -264,6 +305,7 @@ export function detailOption({
       encode: { x: [0, 1, 2], y: 3 },
       data: rows.map((r, i) => [
         r.mean - (r.sd ?? 0), r.mean, r.mean + (r.sd ?? 0), i, r.year, r.sd ?? 0, r.n, r.rank,
+        r.partial ? 1 : 0,
       ]),
       markLine: {
         silent: true,
@@ -278,6 +320,7 @@ export function detailOption({
         const mean = api.value(1) as number
         const rank = api.value(7) as number
         const isSelected = selectedYear != null && (api.value(4) as number) === selectedYear
+        const isPartial = (api.value(8) as number) === 1
         const [cx, cy] = api.coord([mean, cat]) as number[]
         const loX = (api.coord([api.value(0) as number, cat]) as number[])[0]!
         const hiX = (api.coord([api.value(2) as number, cat]) as number[])[0]!
@@ -303,8 +346,12 @@ export function detailOption({
               type: 'circle',
               shape: { cx, cy, r: dotR },
               style: {
-                fill: stroke,
-                stroke: isSelected ? ACCENT : RING,
+                // An open dot for a part-month: the same colour and position, so
+                // it still reads on the scale, but visibly not yet a datum on the
+                // same footing as the closed months around it. The `*` on its
+                // label says why.
+                fill: isPartial ? 'transparent' : stroke,
+                stroke: isSelected ? ACCENT : (isPartial ? stroke : RING),
                 lineWidth: isSelected ? 2 : 1.5,
               },
             },

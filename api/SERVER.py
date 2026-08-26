@@ -203,8 +203,10 @@ def monthly_ranking_endpoint(request: RankingRequest):
     against each other is a different question, and letting the period toggle
     change what this means would make it unreadable.
 
-    Only *complete* months are ranked -- the archive's trailing partial month is
-    excluded rather than competing on a fortnight's worth of days.
+    Every month is ranked, the archive's truncated edge months included: the
+    month in progress is the one most worth looking at, so it is shown with
+    `partial: true` on its rows -- the frontend stars it and says how many days
+    it stands on -- rather than left out.
     """
     try:
         return monthly_ranking(request.lat, request.lon, request.top)

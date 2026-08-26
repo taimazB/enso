@@ -41,7 +41,7 @@
                 :style="mapMonth === i + 1 ? { color: ACCENT } : undefined"
               >{{ MONTHS[i] }}</span>
               <span v-if="rows.length" class="ml-auto hidden text-[10px] tabular-nums text-dimmed @lg:inline">
-                warmest {{ rows[0]!.year }}
+                warmest {{ rows[0]!.year }}<template v-if="rows[0]!.partial">&nbsp;*</template>
               </span>
             </div>
             <div :ref="el => setThumb(i, el as HTMLElement | null)" class="h-14 w-full" />
@@ -59,6 +59,9 @@
             </span>
             <ColorLegend class="ml-auto hidden @lg:block" />
           </div>
+          <!-- The archive's edge months are ranked with the rest rather than
+               hidden, so this is where the star is cashed in. -->
+          <p v-if="note" class="mb-1 shrink-0 text-[11px] text-dimmed">{{ note }}</p>
           <!-- Only the plot scrolls, and `detailPitch()` is spent out of this
                element's height — so measuring it must not include the heading. -->
           <div ref="pane" class="min-h-0 grow overflow-y-auto">
@@ -81,6 +84,7 @@ import {
   detailOption,
   detailPitch,
   monthsOf,
+  partialNote,
   thumbOption,
   xDomainOf,
 } from '~/utils/ranking'
@@ -124,6 +128,8 @@ const activeRows = computed(() => months.value[activeMonth.value - 1] ?? [])
  * a shared domain leaves January using a third of the pane.
  */
 const detailDomain = computed(() => xDomainOf([activeRows.value]))
+/** Spells out the `*` on a truncated edge month, when the open month has one. */
+const note = computed(() => partialNote(activeRows.value, activeMonth.value))
 
 // --- Rail --------------------------------------------------------------------
 

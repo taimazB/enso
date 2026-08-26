@@ -196,11 +196,15 @@ one row per (calendar month, year) at a cell — mean daily anomaly, the standar
 deviation of that month's daily values, the day count, and the year's rank among all
 years for that month. Two decisions:
 
-- **Only complete months are ranked.** `_full_months()` trims to whole calendar months
-  at both ends of the archive, because a trailing part-month otherwise competes on a
-  fortnight's data — at 45.125°N, 200.125°E, August 2026 lands at rank 2 on 24 days.
-  A month missing an *interior* day still counts: 1986-03-18 is absent from OISST
-  itself, so March 1986 legitimately has 30 days.
+- **Every month is ranked, including the archive's truncated edge months, and those
+  carry `partial: true`.** A part-month does compete on short data — at 45.125°N,
+  200.125°E, August 2026 lands at rank 2 on 24 days — but the month in progress is the
+  one people most want to look at, so it is starred rather than hidden (an earlier
+  version trimmed it away with `_full_months()`; that is gone). `_partial_months()`
+  flags at most two: the month the record starts in and the month it ends in. A month
+  missing an *interior* day is **not** partial — 1986-03-18 is absent from OISST itself,
+  so March 1986 has 30 days and is as complete as it will ever be. The response's `span`
+  is now the full month range, and `through` carries the last day with data.
 - **`sd` is day-to-day spread at one cell**, so it is far wider than the same statistic
   on an area mean — spatial averaging cancels daily noise a single cell keeps. Bars
   two to three times the width of a published regional plot's are expected, not a bug.
@@ -352,6 +356,16 @@ anomaly on `domain.yml`'s diverging scale — the same colour that cell has on t
 is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
 ringed in the detail and in every thumbnail, and the map's month name is amber in the rail.
 
+**A `partial` month is starred, not hidden.** The API ranks the archive's edge months
+with the rest, and the browser marks them in three places: the detail's row label reads
+`15. 2026 *`, its dot is drawn **open** (no fill, its own colour as the stroke) so it
+reads on the same scale without looking like a settled datum, and the rail's dot for it
+is faint (`opacity 0.45`) since there is no label out there to carry a star. The star is
+cashed in by `partialNote()` — one dimmed line above the plot, "August 2026 is incomplete
+— ranked on 24 of 31 days" — which sits *outside* the scroll pane, so it costs the pitch
+a row's worth of height and nothing else. The rail's "warmest YYYY" caption gets the star
+only when the partial month is actually rank 1.
+
 **Playback (`usePlayback.ts`) is a paced loop over `store.setDate()`, not a second
 clock.** The play button steps the map one bucket at a time until stopped — past the end of
 coverage it wraps to the first bucket — and because each tick advances from whatever
@@ -449,10 +463,12 @@ Verified working end to end: schema creation, ingest (round-trip checked cell-by
 against the source NetCDF), the ingest status/skip/force logic, every API endpoint at all
 three periods (weekly/monthly means cross-checked against the mean of their own daily
 values), image rendering, and SSR of the frontend page. `/monthlyRanking` is checked against the
-whole-month and interior-gap edge cases, and both ranking ECharts options are rendered
-head-lessly (echarts SSR -> SVG) and asserted on: 539 marks across the twelve thumbnails,
-one dot and one `rank. year` label per row in the detail, and the pitch clamped so 45
-rows fit a 900px pane. That SSR check is cheap and worth reusing for chart maths, but it
+partial-month and interior-gap edge cases, and both ranking ECharts options are rendered
+head-lessly (echarts SSR -> SVG) and asserted on: 540 marks across the twelve thumbnails
+(539 before the partial August 2026 row was let back in), one dot and one `rank. year`
+label per row in the detail, the partial row rendering as `2. 2026 *` with a `fill="none"`
+circle and a single faint mark in the rail, and the pitch clamped so 45 rows fit a 900px
+pane. That SSR check is cheap and worth reusing for chart maths, but it
 does **not** catch mount-order bugs — the grid first shipped blank because its canvas
 sits inside `<ClientOnly>`, so `container.value` was still null at `onMounted` and nothing
 ever observed it. Watch the template ref, not the mount.

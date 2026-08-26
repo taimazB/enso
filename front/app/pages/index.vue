@@ -99,10 +99,12 @@ const ranksDescription = computed(() => {
   const span = store.monthlyRanking?.span
   if (!span) return ''
   const top = store.monthlyRanking?.top ?? 10
-  // Whole months only, so this stops short of /coverage's end date.
-  return `Every complete month from ${span.start.slice(0, 7)} to ${span.end.slice(0, 7)}, `
+  // Edge months included, hence the star — the month in progress is ranked
+  // alongside the rest rather than waiting for its last day.
+  return `Every month from ${span.start.slice(0, 7)} to ${span.end.slice(0, 7)}, `
     + `ranked within its calendar month, warmest first. Pick a month on the left; bars are `
-    + `±1 SD of that month's daily values and the top ${top} are bold. Click a row to move `
-    + `the map to it.`
+    + `±1 SD of that month's daily values and the top ${top} are bold. A * marks a month `
+    + `truncated by the edge of the archive, drawn as an open dot — its mean is over a `
+    + `part-month. Click a row to move the map to it.`
 })
 </script>

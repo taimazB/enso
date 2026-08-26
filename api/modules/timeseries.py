@@ -163,38 +163,48 @@ def coverage() -> dict:
     return {"rows": int(row[0]), "start": str(row[1]), "end": str(row[2]), "days": int(days)}
 
 
-def _full_months() -> tuple[dt.date, dt.date] | None:
-    """The span of calendar months the archive covers *completely*.
+def _month_end(day: dt.date) -> dt.date:
+    """Last day of `day`'s month -- day 32 always lands in the next one."""
+    return (day.replace(day=1) + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
 
-    A month at either edge of the archive is only half-collected, and its mean
-    would otherwise be ranked against whole-month means as though it were one --
-    August 2026, on 24 days, lands at rank 2 at some cells. Trimming to whole
-    months is what makes the ranking honest.
 
-    A month missing an *interior* day still counts: 1986-03-18 is absent from
-    OISST itself, so March 1986 has 30 days. That is a source gap, not a partial
-    month, and dropping the month over it would lose a real observation.
-    """
+def _archive_edges() -> tuple[dt.date, dt.date] | None:
+    """First and last day present in `sst_anom`, or None on an empty table."""
     lo, hi = client().query(
         f"SELECT min(date), max(date) FROM {DATABASE}.sst_anom"
     ).result_rows[0]
-    if lo is None:
-        return None
+    return None if lo is None else (lo, hi)
 
-    # Day 32 of any month lands in the next one -- the same trick periods.span()
-    # uses to find a month's last day without a calendar table.
-    first = lo if lo.day == 1 else (lo.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
-    hi_month_end = (hi.replace(day=1) + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
-    last = hi_month_end if hi == hi_month_end else hi.replace(day=1) - dt.timedelta(days=1)
-    return (first, last) if first <= last else None
+
+def _partial_months(lo: dt.date, hi: dt.date) -> set[tuple[int, int]]:
+    """The (year, month) pairs the archive covers only partly, at either edge.
+
+    At most two: the month the record starts in and the month it ends in. Both
+    are still *ranked* -- the month in progress is the one people most want to
+    look at, and hiding it made the browser stop a month short of today for no
+    gain -- but they are flagged so the chart can star them and say why.
+
+    A month missing an *interior* day is **not** partial: 1986-03-18 is absent
+    from OISST itself, so March 1986 has 30 days and is as complete as it will
+    ever be. Only a truncated edge month is marked, because only that one is
+    still going to change.
+    """
+    partial = set()
+    if lo.day != 1:
+        partial.add((lo.year, lo.month))
+    if hi != _month_end(hi):
+        partial.add((hi.year, hi.month))
+    return partial
 
 
 def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
-    """Every complete calendar month at the nearest cell, ranked within its month-of-year.
+    """Every calendar month at the nearest cell, ranked within its month-of-year.
 
     One row per (month-of-year, year): the mean daily anomaly, the standard
     deviation of the daily values inside that month, and the year's rank among
-    all years for that month, warmest first.
+    all years for that month, warmest first. The archive's edge months are
+    ranked alongside the rest and flagged `partial`, so the month in progress is
+    visible with the caveat attached rather than missing.
 
     `sd` is day-to-day spread at a single cell, so it is much wider than the same
     statistic on an area mean -- spatial averaging cancels daily noise that one
@@ -216,10 +226,11 @@ def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
     grid = global_grid()
     gy, gx = int(grid.gy(lat)), int(grid.gx(lon))
     months: dict[str, list[dict]] = {str(m): [] for m in range(1, 13)}
-    span = _full_months()
+    edges = _archive_edges()
 
-    if span is not None:
-        first, last = span
+    if edges is not None:
+        lo, hi = edges
+        partial = _partial_months(lo, hi)
         rows = client().query(
             f"""
             SELECT toMonth(date) AS month,
@@ -232,11 +243,10 @@ def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
                    ) AS rank
             FROM {DATABASE}.sst_anom
             WHERE gy = %(gy)s AND gx = %(gx)s
-              AND date >= %(first)s AND date <= %(last)s
             GROUP BY month, year
             ORDER BY month, rank
             """,
-            parameters={"gy": gy, "gx": gx, "first": first, "last": last},
+            parameters={"gy": gy, "gx": gx},
         ).result_rows
 
         for month, year, mean_anom, sd, n, rank in rows:
@@ -246,6 +256,9 @@ def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
                 "sd": None if sd is None else round(float(sd), 3),
                 "n": int(n),
                 "rank": int(rank),
+                # Truncated by the edge of the archive, so its mean is over a
+                # part-month and its rank will move as the rest lands.
+                "partial": (int(year), int(month)) in partial,
             })
 
     return {
@@ -258,9 +271,15 @@ def monthly_ranking(lat: float, lon: float, top: int = 10) -> dict:
             "lat": float(grid.lat(gy)),
             "lon": float(grid.lon(gx)),
         },
-        # The complete-month window actually ranked, which is narrower than
-        # /coverage: the archive's trailing partial month is excluded.
-        "span": None if span is None else {"start": str(span[0]), "end": str(span[1])},
+        # Every month the archive touches, edge months included; the two that
+        # may be truncated carry `partial` on their rows.
+        "span": None if edges is None else {
+            "start": str(edges[0].replace(day=1)),
+            "end": str(_month_end(edges[1])),
+        },
+        # The last day with data, so a caller can say how far the partial month
+        # has actually got without re-reading /coverage.
+        "through": None if edges is None else str(edges[1]),
         "top": top,
         "months": months,
     }

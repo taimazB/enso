@@ -34,7 +34,7 @@ const INITIAL_NORTH = 68
 /** Move (or create) the pin marking the selected cell. */
 function showMarker(lat: number, lon: number) {
   if (!map) return
-  marker ??= new mapboxgl.Marker({ color: '#f8fafc' })
+  marker ??= new mapboxgl.Marker({ color: '#05df72' })
   marker.setLngLat([lon, lat]).addTo(map)
 }
 
