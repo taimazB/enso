@@ -5,3 +5,7 @@ numpy>=2.0
 matplotlib>=3.9
 pillow>=11.0
 PyYAML>=6.0
+# The API renders the head of the archive (buckets whose NetCDF is still inside
+# the retention window) directly from file — see modules/render.py. Historical
+# frames come from the image cache, never from ClickHouse.
+netCDF4>=1.7.0
