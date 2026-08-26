@@ -289,6 +289,7 @@ app/components/ColorLegend.vue     gradient built from /domain's colorStops
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
 app/composables/useApi.ts          axios wrapper
+app/composables/usePlayback.ts     play/stop loop + frame prefetch for the map animation
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
 app/utils/ranking.ts               ranking layout + both ECharts options (pure -> testable headlessly)
 app/utils/colorScale.ts            domain.yml's colour stops evaluated at a single value
@@ -334,6 +335,22 @@ anomaly on `domain.yml`'s diverging scale — the same colour that cell has on t
 **label weight and ink** mark the top N (never hue, which already means anomaly); **amber**
 is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
 ringed in the detail and in every thumbnail, and the map's month name is amber in the rail.
+
+**Playback (`usePlayback.ts`) is a paced loop over `store.setDate()`, not a second
+clock.** The play button steps the map one bucket at a time until stopped — past the end of
+coverage it wraps to the first bucket — and because each tick advances from whatever
+`store.selectedDate` currently is, stepping or clicking the chart mid-run just relocates the
+playhead. Typing in the date field stops it, since otherwise the field is a moving target.
+Speed is a 1–10 fps slider read *per frame*, so it takes effect on the next one.
+
+Frames are **not** all preloaded: the daily archive is ~16.4k WebPs (~1.2 GB on the wire and
+~4 MB each once decoded), so what is held is a window of `AHEAD = 8` in front of the playhead,
+warmed with `new Image()` + `decode()` and capped at `CACHE_MAX = 24`. `/image` sends
+`Cache-Control: public, max-age=86400`, so Mapbox's own fetch for the same URL then resolves
+out of the browser cache. The loop waits on frame readiness rather than firing on a bare
+`setInterval`, because a Mapbox `ImageSource` never retries a failed image and silently keeps
+the previous frame — a fixed interval would render that as an unexplained stutter. A 3 s
+per-frame timeout keeps one slow frame from freezing playback.
 
 **`store.selectedDate` is always a bucket start**, snapped through `store.setDate()` /
 `store.setPeriod()` — never assign it directly. `store.period` drives the chart request and
@@ -396,6 +413,11 @@ values; `dataZoom` is what makes that browsable.
   `app/app.config.ts` remaps them; add an entry there rather than installing lucide.
 - **Nuxt UI v4 renamed `UButtonGroup` to `UFieldGroup`**, and the old name resolves to an
   empty comment node instead of erroring — the control simply vanishes from the DOM.
+- **A prefetched image must set `crossOrigin = 'anonymous'`.** Mapbox fetches an image
+  source in CORS mode, while a bare `new Image()` sends no `Origin` — and the API's
+  `CORSMiddleware` only answers with `Access-Control-Allow-Origin` when it sees one. Warming
+  the cache without it parks a header-less response that Mapbox's own fetch then reuses and
+  the browser blocks, so every prefetched frame fails and the map freezes on one image.
 - **The API's ClickHouse client is per-*thread*, not per-process**
   (`modules/clickhouse_helpers.py`). Every endpoint is a sync `def`, so FastAPI runs it in
   the thread pool, and a client's session refuses a second concurrent query with
@@ -443,6 +465,11 @@ and click-a-row moving the map — a March row set 2017-03-01).
 The period toggle is verified too: Daily -> Weekly -> Monthly each refetches the map image
 at the right bucket start (`2026-08-24` daily and weekly, `2026-08-01` monthly) and the
 monthly frame is visibly smoother than the daily one.
+
+Playback is verified in Chromium as well: the fps slider clamps at 1 and 10, play advances
+~5 frames in 3 s at 5 fps, stop leaves the date fixed, the end of coverage wraps back to
+1981-09, and successive map screenshots differ — i.e. the raster really is updating rather
+than sitting stale behind a moving date.
 
 Not built yet: NCEI downloader, region-aggregate tables (`region_daily`), climatology /
 marine-heatwave analytics, tile pyramid, production compose files, PostHog analytics,

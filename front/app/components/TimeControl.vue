@@ -60,6 +60,35 @@
       />
     </div>
 
+    <div class="h-5 w-px bg-accented" />
+
+    <!-- Playback runs until stopped: the playhead is just repeated store.setDate(),
+         so stepping or clicking the chart mid-run relocates it rather than fighting
+         it, and the end of coverage wraps round to the start. Typing in the date
+         field does stop it — otherwise the value being typed into is a moving
+         target. -->
+    <div class="flex items-center gap-2">
+      <UButton
+        :icon="playing ? 'i-mdi-pause' : 'i-mdi-play'"
+        :color="playing ? 'primary' : 'neutral'"
+        :variant="playing ? 'solid' : 'ghost'"
+        size="xs"
+        :disabled="!canPlay"
+        :title="playing ? 'Stop' : 'Play'"
+        @click="toggle()"
+      />
+      <USlider
+        v-model="fps"
+        :min="MIN_FPS"
+        :max="MAX_FPS"
+        :step="1"
+        size="xs"
+        class="w-20"
+        :aria-label="`Animation speed, ${fps} frames per second`"
+      />
+      <span class="w-12 shrink-0 text-xs tabular-nums text-muted">{{ fps }} fps</span>
+    </div>
+
     <!-- The input still picks a day; this is what that day's bucket covers. -->
     <span v-if="store.period !== 'daily' && store.selectedDate" class="pr-1 text-xs text-muted">
       {{ bucketLabel(store.selectedDate, store.period) }}
@@ -70,15 +99,17 @@
 <script setup lang="ts">
 import { useMainStore } from '~/stores/main'
 import { PERIODS, bucketLabel, bucketStart, bucketsPerYear, shiftBuckets } from '~/utils/periods'
+import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
 
 // Note: the period toggle above is a UFieldGroup, not a UButtonGroup — Nuxt UI
 // v4 renamed that component, and the old name silently renders nothing.
 
 const store = useMainStore()
+const { playing, fps, canPlay, toggle, stop } = usePlayback()
 
 const dateInput = computed({
   get: () => store.selectedDate ?? '',
-  set: (value: string) => { if (value) store.setDate(clamp(value)) },
+  set: (value: string) => { if (value) { stop(); store.setDate(clamp(value)) } },
 })
 
 // Compared bucket-wise: in a weekly or monthly view the first and last buckets
