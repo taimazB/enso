@@ -19,6 +19,23 @@ export interface DomainMeta {
     vmax: number
     colormap: string
     derived: boolean
+    /**
+     * How `/image` packs this variable's value into the WebP's RGB channels.
+     * The images carry data, not colour — Mapbox applies the ramp itself — so
+     * these go straight into the raster layer's paint properties. The API
+     * computes them; nothing here re-derives the arithmetic.
+     */
+    encoding: {
+      /** `raster-color-mix`: [r, g, b, offset], verbatim. */
+      mix: [number, number, number, number]
+      /** What the packing can represent, sentinel code included. */
+      range: [number, number]
+      scale: number
+      /** Reserved code for ocean with no value on this variable, or null. */
+      sentinel: number | null
+      /** `raster-color-range`: the span the 256-entry ramp is tabulated over. */
+      colorRange: [number, number]
+    }
   }>
   /** Keyed by variable: sst's scale is sequential, anom's diverging. */
   colorStops: Record<VariableName, Array<{ value: number, color: string }>>

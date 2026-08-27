@@ -67,6 +67,19 @@ variables:
     vmin: -2.0
     vmax: 32.0
     colormap: turbo
+    # How the value is packed into the WebP the map consumes. The image carries
+    # DATA, not colour: Mapbox does the colouring with `raster-color`, so the
+    # palette and the displayed range are client-side settings and changing
+    # either costs nothing. See shared/render.py.
+    #
+    # Two channels, high byte first: value = (G*256 + B) * scale + offset. One
+    # byte would be 0.134 degC across the display range, which is visibly
+    # posterized when the map is zoomed in; two carry the source's own 0.01 degC
+    # exactly, at 2.33x the bytes.
+    encoding:
+      channels: [G, B]
+      scale: 0.01
+      offset: -5.0
   anom:
     long_name: Daily sea surface temperature anomaly
     short_name: SST anomaly
@@ -88,6 +101,18 @@ variables:
     # rather than transparent, which would read as land, or as a scale colour,
     # which would read as zero.
     derived: true
+    # One byte at 0.1 degC, so byte 1..255 spans -12.7..+12.7 and byte 0 is the
+    # no-climatology sentinel. Measured over 60 days spread across the archive
+    # plus the strong ENSO peaks, the anomaly reaches -10.22..+14.05 degC, so
+    # this range CLIPS about 4 cells a day out of 7.5 million — all of them
+    # already saturated at the +/-3 display range, hence invisible. Values are
+    # CLAMPED, never wrapped: a uint8 overflow would flip a hot cell to the
+    # coldest colour on the scale.
+    encoding:
+      channels: [R]
+      scale: 0.1
+      offset: -12.8
+      sentinel: 0
 
 # Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
 # degrees_east (0-360) / degrees_north, and all of them fit inside `subset`.

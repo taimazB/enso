@@ -117,6 +117,27 @@ def domain() -> dict:
                 "colormap": v.colormap,
                 # `anom` is computed as sst - climatology, not stored.
                 "derived": v.derived,
+                # How /image packs this variable's value into the WebP, ready to
+                # hand to Mapbox: `mix` is `raster-color-mix` verbatim and
+                # `range` is what the encoding can represent. Computed here, not
+                # in the frontend, so the packing and the unpacking cannot
+                # drift — the images outlive the NetCDF they were made from.
+                "encoding": {
+                    "mix": v.encoding.mix(),
+                    "range": list(v.encoding.value_range()),
+                    "scale": v.encoding.scale,
+                    "sentinel": v.encoding.sentinel,
+                    # `raster-color-range`: the span the 256-entry colour ramp
+                    # is tabulated over. A variable with a sentinel has to
+                    # tabulate its whole encoding range so code 0 lands in a
+                    # slot of its own; one without spends all 256 entries on the
+                    # display range instead, which is where they are useful.
+                    "colorRange": (
+                        list(v.encoding.value_range())
+                        if v.encoding.sentinel is not None
+                        else [v.vmin, v.vmax]
+                    ),
+                },
             }
             for name, v in variables().items()
         },

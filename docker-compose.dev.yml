@@ -36,16 +36,15 @@ services:
       - ./api:/app
       - ./shared:/app/shared
       - ./data:/opt/data
-      - ./climatology:/opt/climatology:ro
     ports:
       - "${API_PORT:-4000}:4000"
     env_file:
       - .env.dev
     environment:
       - HDF5_USE_FILE_LOCKING=FALSE
-      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
       - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
-      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/climatology}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
       # ClickHouse: local docker-compose instance (db-ch service) by default
       - CH_HOST=${CH_HOST:-db-ch}
       - CH_PORT=${CH_PORT:-8123}
@@ -95,9 +94,9 @@ services:
       - .env.dev
     environment:
       - HDF5_USE_FILE_LOCKING=FALSE
-      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
       - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
-      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/climatology}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
       # Override any host-IP values from .env.dev with the compose service name
       - CH_HOST=db-ch
       - CH_PORT=8123
@@ -108,7 +107,6 @@ services:
       - ./process:/app
       - ./shared:/app/shared
       - ./data:/opt/data
-      - ./climatology:/opt/climatology:ro
     depends_on:
       db-ch:
         condition: service_healthy

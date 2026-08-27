@@ -9,6 +9,14 @@ image source stretches the field increasingly toward the pole.
 the NetCDF while it is still on disk (see `shared/fields.py`), which is what let
 the `by_date` projection — 66% of storage — be dropped from the schema. Nothing
 here reads ClickHouse.
+
+**The images carry data, not colour.** `encode()` packs the value into the RGB
+channels and the land mask into alpha; Mapbox applies the colour ramp itself
+with `raster-color`. The reason is that the daily NetCDF is pruned to a
+retention window, so once a bucket's file is gone the cached image is the only
+surviving copy of that field — and a pre-coloured cache would have today's
+colormap and today's vmin/vmax welded into it for good. Value-encoded, the
+palette and the displayed range stay client-side settings.
 """
 
 from __future__ import annotations
@@ -125,6 +133,10 @@ def colorize(
     `sst` is sequential and `anom` diverging — see domain.yml for why that
     distinction is not cosmetic. `no_clim`, when given, paints ocean cells that
     have no climatology in a flat grey after colouring.
+
+    **Not on the serving path.** `encode()` ships data and the browser colours
+    it; this exists so a field can be eyeballed or diffed against a reference
+    without a browser, and to build the legend stops below.
     """
     var = variable(variable_name)
     cmap = matplotlib.colormaps[var.colormap].with_extremes(bad=(0, 0, 0, 0))
@@ -135,27 +147,99 @@ def colorize(
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def _bleed(codes: np.ndarray, known: np.ndarray, passes: int = 8) -> np.ndarray:
+    """Fill unknown cells (land) with nearby known values.
+
+    Land cannot be left at 0. Mapbox filters the texture, so a coastal texel
+    that blends an ocean value against a land 0 decodes to the bottom of the
+    scale — a wrong-coloured fringe along every coastline. Land is cut by the
+    **alpha** channel, which is exact; the value channels just need to carry
+    something harmless underneath it.
+
+    Bleeding operates on the integer code, never on the packed channels: with a
+    two-channel value, averaging the low byte across a 255->0 wrap would land
+    the result a full 256 counts away.
+    """
+    if known.all():
+        return codes
+    codes = np.where(known, codes, int(np.median(codes[known]))).astype("int64")
+    for _ in range(passes):
+        if known.all():
+            break
+        acc = np.zeros(codes.shape, "int64")
+        cnt = np.zeros(codes.shape, "uint8")
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            acc += np.roll(np.where(known, codes, 0), (dy, dx), (0, 1))
+            cnt += np.roll(known, (dy, dx), (0, 1))
+        grow = (~known) & (cnt > 0)
+        codes = np.where(grow, acc // np.maximum(cnt, 1), codes)
+        known = known | grow
+    return codes
+
+
 def encode(
     field: np.ndarray,
     width: int = DEFAULT_WIDTH,
     variable_name: str = "sst",
     no_clim: np.ndarray | None = None,
 ) -> bytes:
-    """WebP bytes for a field array on the subset grid."""
+    """Value-encoded WebP bytes for a field array on the subset grid.
+
+    The image carries the **data**, not a picture of it: the value goes into the
+    RGB channels per the variable's `encoding`, land goes into alpha, and Mapbox
+    applies the colour ramp itself via `raster-color`. That is what keeps the
+    palette and the displayed range client-side settings — which matters here
+    because the NetCDF archive is pruned to a retention window, so a re-render
+    of history is not available to fall back on. A pre-coloured cache would weld
+    today's colour choices into the only surviving copy of the data.
+
+    **Lossless, necessarily.** Lossy WebP is YUV 4:2:0 — it subsamples chroma
+    and quantises, which is harmless for a picture and ruinous for packed data.
+    Measured on this field at q90: mean error 0.074 degC but a maximum of
+    1.613 degC, i.e. visible blotches. Lossless costs 2.3-2.7x the bytes and
+    actually *decodes* slightly cheaper (no inverse DCT, no YUV conversion).
+    """
+    var = variable(variable_name)
+    enc = var.encoding
     merc = to_mercator(field, width)
-    merc_no_clim = None if no_clim is None else _nearest_mercator_mask(no_clim, width)
+    has_value = np.isfinite(merc)
+
+    # Ocean without a value on this variable — the ice fringe, which has SST but
+    # no climatology. Opaque like any other ocean cell, but flagged so the ramp
+    # can paint it a flat grey; transparent would read as land and a scale
+    # colour would read as a real anomaly near zero.
+    sentinel_cells = (
+        np.zeros_like(has_value)
+        if no_clim is None
+        else _nearest_mercator_mask(no_clim, width)
+    )
+    ocean = has_value | sentinel_cells
+
+    # CLAMP, never wrap. An out-of-range value that overflows the code would
+    # reappear at the opposite end of the scale — a record-warm cell drawn as
+    # the coldest colour on the map.
+    codes = np.round((np.nan_to_num(merc, nan=0.0) - enc.offset) / enc.scale)
+    codes = np.clip(codes, enc.low_code, enc.depth - 1).astype("int64")
+    if enc.sentinel is not None:
+        codes = np.where(sentinel_cells, enc.sentinel, codes)
+    codes = _bleed(codes, ocean)
+
+    rgba = np.zeros((*merc.shape, 4), dtype="uint8")
+    index = {"R": 0, "G": 1, "B": 2}
+    n = len(enc.channels)
+    for i, channel in enumerate(enc.channels):
+        shift = 8 * (n - 1 - i)
+        rgba[..., index[channel.upper()]] = ((codes >> shift) & 0xFF).astype("uint8")
+    if n == 1:
+        # Mirror the single channel across RGB: libwebp's subtract-green
+        # transform then codes two of the three planes as zero, for free.
+        rgba[..., 1] = rgba[..., 2] = rgba[..., 0]
+    rgba[..., 3] = np.where(ocean, 255, 0).astype("uint8")
+
     buffer = io.BytesIO()
-    # Lossy q90, not lossless. Measured on OISST against a lossless encode of
-    # the same field: mean error 0.015 degC, 99.6% of ocean pixels within
-    # 0.1 degC. It buys ~5x on the wire and ~10x on encode.
-    #
-    # The alpha channel survives exactly — libwebp always codes alpha
-    # losslessly — so the land mask is bit-identical and does not bleed.
-    #
-    # `method=4` because 6 costs many times the time for under 2% fewer bytes.
-    # Exact values are the timeseries endpoints' job; this raster is to look at.
-    colorize(merc, variable_name, merc_no_clim).save(
-        buffer, format="WEBP", quality=90, method=4
+    # `method=4`: 6 buys under 2% for ~2.5x the encode time.
+    Image.fromarray(rgba, mode="RGBA").save(
+        buffer, format="WEBP", lossless=True, method=4
     )
     return buffer.getvalue()
 

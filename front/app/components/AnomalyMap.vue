@@ -15,7 +15,7 @@
 <script setup lang="ts">
 import mapboxgl from 'mapbox-gl'
 import 'mapbox-gl/dist/mapbox-gl.css'
-import { useMainStore } from '~/stores/main'
+import { useMainStore, type VariableName } from '~/stores/main'
 
 const store = useMainStore()
 const api = useApi()
@@ -61,6 +61,49 @@ function currentUrl(): string | null {
     : null
 }
 
+/**
+ * Paint properties that turn a value-encoded WebP into a coloured map.
+ *
+ * `/image` ships DATA — the value packed into the RGB channels, land in alpha —
+ * and Mapbox colours it here with `raster-color`. That is what keeps the
+ * palette and the displayed range client-side: the daily NetCDF is pruned to a
+ * retention window, so the cached image is eventually the only copy of that
+ * field, and a pre-coloured one would have today's colormap baked in for good.
+ *
+ * `raster-resampling: nearest` is deliberate and load-bearing for `sst`, which
+ * packs its value across two channels as `G*256 + B`. Linear filtering blends
+ * the two channels independently, so a texel pair straddling a low-byte wrap
+ * would decode ~2.56 degC away from either neighbour. Measured, nearest and
+ * linear come out identical on the decode (median error 0.156 vs 0.159 degC,
+ * both just texel quantisation) — and nearest is visibly cleaner at
+ * single-pixel islands, which linear renders as coloured speckle.
+ */
+function rasterPaint(name: VariableName): Record<string, unknown> {
+  const enc = store.domain!.variables[name]!.encoding
+  const stops = store.domain!.colorStops[name]
+
+  const ramp: Array<unknown> = ['interpolate', ['linear'], ['raster-value']]
+  if (enc.sentinel !== null) {
+    // Code 0 is ocean that has no value on this variable — the ice fringe with
+    // no climatology. Flat grey: transparent would read as land, and any colour
+    // on a diverging scale would read as a real anomaly near zero. It sits one
+    // whole encoding step below the first real code, so the ramp cannot blend
+    // the two.
+    ramp.push(enc.range[0], store.domain!.noClimColor)
+    ramp.push(enc.range[0] + enc.scale, stops[0]!.color)
+  }
+  for (const stop of stops) ramp.push(stop.value, stop.color)
+
+  return {
+    'raster-opacity': 0.85,
+    'raster-fade-duration': 0,
+    'raster-resampling': 'nearest',
+    'raster-color-mix': enc.mix,
+    'raster-color-range': enc.colorRange,
+    'raster-color': ramp,
+  }
+}
+
 function addRaster() {
   const url = currentUrl()
   if (!map || !url || map.getSource(SOURCE_ID)) return
@@ -70,8 +113,17 @@ function addRaster() {
     id: LAYER_ID,
     type: 'raster',
     source: SOURCE_ID,
-    paint: { 'raster-opacity': 0.85, 'raster-fade-duration': 0 },
+    paint: rasterPaint(store.variable),
   })
+}
+
+/** The ramp, mix and range all change with the variable, not just the URL. */
+function applyPaint() {
+  if (!map || !map.getLayer(LAYER_ID)) return
+  const paint = rasterPaint(store.variable)
+  for (const [key, value] of Object.entries(paint)) {
+    map.setPaintProperty(LAYER_ID, key as never, value as never)
+  }
 }
 
 onMounted(() => {
@@ -123,7 +175,13 @@ watch(() => [store.selectedDate, store.period, store.variable], () => {
   const url = currentUrl()
   if (!map || !url) return
   const source = map.getSource(SOURCE_ID) as mapboxgl.ImageSource | undefined
-  if (source) source.updateImage({ url, coordinates: imageCoordinates() })
+  if (source) {
+    // Repaint before swapping the image: the two encodings pack their value
+    // differently, so a frame drawn with the previous variable's mix would
+    // decode to nonsense for the one flicker it is on screen.
+    applyPaint()
+    source.updateImage({ url, coordinates: imageCoordinates() })
+  }
   else if (map.isStyleLoaded()) addRaster()
 })
 

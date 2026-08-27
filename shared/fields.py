@@ -34,8 +34,12 @@ from .domain import global_grid, subset, variable
 
 log = logging.getLogger(__name__)
 
-NC_DIR = Path(os.environ.get("OISST_NC_DIR", "/opt/data"))
-CLIM_DIR = Path(os.environ.get("CRW_CLIM_DIR", "/opt/climatology"))
+# Both archives live under the one ./data bind mount: the daily files in
+# `sst/`, the 366 climatology files in `climatology/`. They are separate
+# directories because they have opposite lifetimes — the dailies are pruned to
+# a retention window, the climatology is kept forever.
+NC_DIR = Path(os.environ.get("OISST_NC_DIR", "/opt/data/sst"))
+CLIM_DIR = Path(os.environ.get("CRW_CLIM_DIR", "/opt/data/climatology"))
 
 # coraltemp_v3.1_19850101.nc
 DAILY_RE = re.compile(r"^coraltemp_v3\.1_(?P<date>\d{8})\.nc$")

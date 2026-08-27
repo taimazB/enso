@@ -79,15 +79,15 @@ cd front && npm install && npm run dev
 ### Data Source
 
 **NOAA Coral Reef Watch CoralTemp v3.1** (`coraltemp_v3.1_YYYYMMDD.nc`), one file per day
-in `./data/`, mounted at `/opt/data/`. 1985-01-01 onward, ~10 MB each, ~153 GB for the
+in `./data/sst/`, mounted at `/opt/data/sst/`. 1985-01-01 onward, ~10 MB each, ~153 GB for the
 full archive.
 
 Global 7200×3600 grid at **0.05°**. The variable taken is `analysed_sst` — `short` counts
 of 0.01 °C with `_FillValue = -32768`. (`sea_ice_fraction` is also in the file and is not
 ingested.) **There is no anomaly in the product**; it is derived, see below.
 
-**The climatology is a second archive**: 366 files in `./climatology/`, mounted read-only
-at `/opt/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
+**The climatology is a second archive**: 366 files in `./data/climatology/`, mounted at
+`/opt/data/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
 mapping rule to invent. Baseline 1991–2020. 1.6 GB, static, and **kept forever**: image
 rendering reads it straight off disk.
 
@@ -333,11 +333,57 @@ either neighbour, which would erode a pixel of ocean along every coastline, so i
 back to whichever side is real. The no-climatology mask is resampled **nearest-neighbour**
 instead — it is categorical, and a blended edge has no sensible threshold.
 
-Images are **lossy WebP at quality 90**, `method=4`. Measured on the OISST field against a
-lossless encode of the same data: mean error 0.015 °C, 99.6% of ocean pixels within 0.1 °C.
-It buys ~5× on the wire and ~10× on encode. **The alpha channel is bit-exact at every
-quality** — libwebp always codes alpha losslessly — so the land mask does not bleed.
-Exact values are the timeseries endpoints' job; this raster is for looking at.
+#### The images carry data, not colour
+
+`/image` ships the **value packed into the RGB channels**, with land in alpha, and the
+browser applies the colour ramp with Mapbox's `raster-color`. `shared/render.py`'s
+`encode()` is the packer; `domain.yml`'s per-variable `encoding` block is the contract, and
+`/domain` hands the frontend a ready-made `raster-color-mix` so the packing arithmetic is
+written **once, in Python**, and never re-derived in TypeScript.
+
+The reason is the retention window. The daily NetCDF is pruned, so a bucket's cached image
+eventually becomes the only surviving copy of that field — and a pre-coloured cache would
+have today's colormap and today's vmin/vmax welded into it permanently. Re-ranging the
+anomaly from ±3 to ±4 would mean re-downloading the range. Value-encoded, the palette and
+the displayed range are client-side settings for good.
+
+| variable | channels | step | range | notes |
+|---|---|---|---|---|
+| `sst` | `G`,`B` → `G*256+B` | 0.01 °C | −5…650 | the source's own precision, lossless |
+| `anom` | `R` | 0.1 °C | −12.8…+12.7 | code 0 = no climatology |
+
+**Lossless WebP, necessarily** — lossy is YUV 4:2:0 and destroys packed data: measured at
+q90 on a real frame, mean error 0.074 °C but **maximum 1.613 °C**, i.e. visible blotches.
+It costs 2.3–2.7× the bytes (sst 1.14 MB, anom 0.50 MB at width 2048) and **decodes
+slightly cheaper** than lossy — 41.8 ms vs 39.7 ms measured, no inverse DCT or YUV
+conversion. Colouring is free: pan frame time is 16.6 ms with `raster-color` against
+16.7 ms pre-coloured, both at the vsync ceiling under software rendering.
+
+Three details that are load-bearing, all of which fail quietly:
+
+- **`raster-resampling: nearest`, set in `AnomalyMap.vue`.** `sst` spans two channels, and
+  linear filtering blends them *independently* — a texel pair straddling a low-byte wrap
+  would decode ~2.56 °C away from either neighbour. Measured, nearest and linear are
+  identical on the decode (median error 0.156 vs 0.159 °C, both just texel quantisation),
+  and nearest is visibly cleaner at single-pixel islands, which linear renders as coloured
+  speckle. So it costs nothing and removes the whole failure class.
+- **Land is filled with nearby ocean values, not left at 0** (`_bleed()`). Mapbox filters
+  the texture; a coastal texel blending ocean against a land 0 decodes to the bottom of the
+  scale, giving a wrong-coloured fringe along every coastline. Land is cut by **alpha**,
+  which is exact. Bleeding runs on the integer code, never the packed channels — averaging
+  a low byte across a 255→0 wrap lands 256 counts out.
+- **Values are clamped, never wrapped.** A uint8 overflow would redraw a record-warm cell as
+  the coldest colour on the map. `anom`'s ±12.7 clips about **4 cells a day out of 7.5
+  million** — measured over 60 days spanning the archive and the strong ENSO peaks, where
+  the anomaly reaches −10.22…+14.05 °C — and every one of them is already saturated at the
+  ±3 display range.
+
+`raster-color` tabulates its ramp at **256 uniformly spaced steps over `raster-color-range`**,
+so `/domain` sends a different range per variable: `anom` tabulates its whole encoding range
+(−12.8…12.7), which puts the sentinel in a slot of its own and lands exactly one code per
+step; `sst` has no sentinel and spends all 256 entries on the −2…32 display range.
+
+Exact values remain the timeseries endpoints' job; this raster is for looking at.
 
 `DEFAULT_WIDTH` is **2048**, and `front/app/composables/useApi.ts`'s `IMAGE_WIDTH` mirrors
 it. The cache is keyed by (variable, period, bucket start, width), so **a width mismatch is
@@ -350,7 +396,8 @@ Renders are cached under `OISST_IMAGE_DIR` as
 **Colour ranges live in `domain.yml`**: `sst` is **sequential** (`turbo`, −2…32) and `anom`
 **diverging** (`RdBu_r`, ±3). That distinction is not cosmetic — an absolute temperature has
 no meaningful midpoint, so a diverging map would invent one at 15 °C and read as a signed
-field.
+field. Since the images carry data rather than colour, changing either range or colormap now
+only needs an API restart — **the image cache is not invalidated by a palette change.**
 
 ### Frontend (`front/`)
 
@@ -515,8 +562,9 @@ values; `dataZoom` is what makes that browsable.
   running container — use `up -d --force-recreate <service>`, not `restart`.
 - **`domain.yml` changes need an API restart.** `shared.domain` caches the parsed YAML with
   `lru_cache`, and uvicorn's `--reload` only watches `.py` files, so a colour-range or
-  region edit is invisible until the container is restarted. Cached images under
-  `./data/images` also survive it — delete them or re-run `prerender.py --force`.
+  region edit is invisible until the container is restarted. A **colour** change needs
+  nothing more — the cached images carry data, not colour, so the palette is applied in the
+  browser. Only a change to the grid or the encoding invalidates `./data/images`.
 - **`UID`/`GID` in `.env.dev`** are what stop `api` writing root-owned cache files into the
   bind-mounted `./data`. Set them to your own `id -u` / `id -g`.
 - **The `process` venv lives at `/opt/venv`, not `/app/.venv`** — compose bind-mounts

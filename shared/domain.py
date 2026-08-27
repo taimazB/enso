@@ -108,8 +108,59 @@ class Variable:
     vmin: float
     vmax: float
     colormap: str
+    encoding: Encoding
     # `anom` is computed as `sst - climatology(mmdd)` rather than stored.
     derived: bool = False
+
+
+@dataclass(frozen=True)
+class Encoding:
+    """How a variable's value is packed into the bytes of a rendered image.
+
+    The images the map consumes carry **data, not colour** — Mapbox colours them
+    with `raster-color`, which reads a scalar out of the RGB channels via
+    `raster-color-mix` and looks it up in a ramp. So the packing here and the
+    mix vector the frontend sends must agree exactly, and `mix()` is the one
+    place that arithmetic is done: the API ships the result in `/domain` rather
+    than the TypeScript re-deriving it.
+
+    `channels` are listed **high byte first**, so ``[G, B]`` means
+    ``value = (G * 256 + B) * scale + offset``.
+    """
+
+    channels: tuple[str, ...]
+    scale: float
+    offset: float
+    # A reserved code, always 0, for a cell that is ocean but has no value on
+    # this variable — the ice fringe with no climatology. Real data starts at 1.
+    sentinel: int | None = None
+
+    @property
+    def depth(self) -> int:
+        """Number of distinct codes, e.g. 256 for one channel, 65536 for two."""
+        return 256 ** len(self.channels)
+
+    @property
+    def low_code(self) -> int:
+        return 1 if self.sentinel is not None else 0
+
+    def mix(self) -> list[float]:
+        """`raster-color-mix`: ``[r, g, b, offset]``.
+
+        Mapbox computes ``mix.r*src.r + mix.g*src.g + mix.b*src.b + mix.a`` with
+        each channel arriving normalised to 0..1, so a channel holding byte
+        ``n`` arrives as ``n/255`` and its weight carries the 255 back.
+        """
+        out = [0.0, 0.0, 0.0, self.offset]
+        idx = {"R": 0, "G": 1, "B": 2}
+        for i, channel in enumerate(self.channels):
+            place = 256 ** (len(self.channels) - 1 - i)
+            out[idx[channel.upper()]] = 255.0 * place * self.scale
+        return out
+
+    def value_range(self) -> tuple[float, float]:
+        """The span this encoding can represent, sentinel code included."""
+        return self.offset, self.offset + self.scale * (self.depth - 1)
 
 
 @dataclass(frozen=True)
@@ -140,7 +191,13 @@ def subset() -> Subset:
 
 @functools.lru_cache(maxsize=1)
 def variables() -> dict[str, Variable]:
-    return {name: Variable(name=name, **cfg) for name, cfg in _raw()["variables"].items()}
+    out = {}
+    for name, cfg in _raw()["variables"].items():
+        cfg = dict(cfg)
+        enc = dict(cfg.pop("encoding"))
+        enc["channels"] = tuple(enc["channels"])
+        out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
+    return out
 
 
 def variable(name: str) -> Variable:

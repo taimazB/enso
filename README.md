@@ -4,13 +4,13 @@ Daily sea-surface temperature and anomaly for the Pacific basin, from **NOAA Cor
 Watch CoralTemp v3.1**, ingested into ClickHouse and served as an interactive map plus
 point and region timeseries.
 
-**0.05° resolution, 1985-01-01 onward**, one NetCDF per day in `./data/`. The ingested box
+**0.05° resolution, 1985-01-01 onward**, one NetCDF per day in `./data/sst/`. The ingested box
 is **60°S–65°N, 100°E–290°E** — 7.5 million ocean cells per day. That covers the Coral
 Triangle, the full tropical Pacific, the Blob and PDO domains, the Bering Sea, and the
 Antarctic Circumpolar Current at Pacific longitudes.
 
 **Anomaly is derived, not shipped.** CoralTemp provides SST only; the anomaly is computed
-against a separate 366-file **1991–2020 daily climatology** in `./climatology/`, one per
+against a separate 366-file **1991–2020 daily climatology** in `./data/climatology/`, one per
 day-of-year including 29 February. All four Niño indices (1+2, 3, 3.4, 4) fall inside the
 domain.
 
@@ -76,8 +76,9 @@ front/       Nuxt 4 frontend (everything under front/app/)
 process/     CRW.cli download / ingest / render pipeline
 shared/      grid geometry, NetCDF reading, rendering, schema — mounted into api and process
 clickhouse/  local ClickHouse volumes and user config
-data/        the NetCDF archive + rendered images (untracked)
-climatology/ the 366-file 1991-2020 daily climatology (untracked)
+data/sst/          the daily NetCDF archive, pruned to a retention window (untracked)
+data/climatology/  the 366-file 1991-2020 daily climatology, kept forever (untracked)
+data/images/       the rendered image cache (untracked)
 ```
 
 ## API
