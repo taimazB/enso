@@ -41,7 +41,7 @@
                 :style="mapMonth === i + 1 ? { color: ACCENT } : undefined"
               >{{ MONTHS[i] }}</span>
               <span v-if="rows.length" class="ml-auto hidden text-[10px] tabular-nums text-dimmed @lg:inline">
-                warmest {{ rows[0]!.year }}<template v-if="rows[0]!.partial">&nbsp;*</template>
+                {{ rankOrder }} {{ rows[0]!.year }}<template v-if="rows[0]!.partial">&nbsp;*</template>
               </span>
             </div>
             <div :ref="el => setThumb(i, el as HTMLElement | null)" class="h-14 w-full" />
@@ -55,7 +55,7 @@
           <div class="mb-1 flex shrink-0 items-center gap-3">
             <h3 class="text-base font-semibold text-highlighted">{{ MONTHS[activeMonth - 1] }}</h3>
             <span class="truncate text-xs text-muted">
-              {{ activeRows.length }} years ranked, warmest first
+              {{ activeRows.length }} years ranked, {{ rankOrder }} first
             </span>
             <ColorLegend class="ml-auto hidden @lg:block" />
           </div>
@@ -97,6 +97,18 @@ const props = defineProps<{
   emptyMessage?: string
   /** Bucket on the map. Its year is ringed amber, and its month opens first. */
   selectedDate?: string | null
+  /** Unit suffix for the detail tooltip and x-axis; '' where there is none. */
+  unit?: string
+  /**
+   * Whether the ranked value is a mean over an ordinal class (`mhw`). Drops the
+   * signed '+', which only means something on a scale centred at zero.
+   */
+  categorical?: boolean
+  /**
+   * What rank 1 means — 'warmest' for a temperature, 'most severe' for the
+   * heatwave category, which is not a temperature at all.
+   */
+  rankOrder?: string
 }>()
 
 const emit = defineEmits<{ select: [date: string] }>()
@@ -151,7 +163,13 @@ function renderThumbs() {
     thumbs[i] ??= echarts.init(el, null, { renderer: 'canvas' })
     thumbs[i]!.resize()
     thumbs[i]!.setOption(
-      thumbOption({ rows, stops: props.stops, domain: railDomain.value, selectedYear: selectedYear.value }),
+      thumbOption({
+        rows,
+        stops: props.stops,
+        domain: railDomain.value,
+        selectedYear: selectedYear.value,
+        categorical: props.categorical,
+      }),
       { notMerge: true },
     )
   })
@@ -192,6 +210,8 @@ function renderDetail() {
       pitch: pitch.value,
       topN: topN.value,
       selectedYear: selectedYear.value,
+      unit: props.unit,
+      categorical: props.categorical,
     }),
     { notMerge: true },
   )

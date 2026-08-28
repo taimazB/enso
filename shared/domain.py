@@ -96,6 +96,15 @@ class Subset:
 
 
 @dataclass(frozen=True)
+class Category:
+    """One class of a categorical variable: its code, colour and name."""
+
+    value: int
+    color: str
+    label: str
+
+
+@dataclass(frozen=True)
 class Variable:
     name: str
     long_name: str
@@ -107,10 +116,25 @@ class Variable:
     fill_value: int
     vmin: float
     vmax: float
-    colormap: str
     encoding: Encoding
+    # Exactly one of these two carries the palette. `colormap` names a
+    # matplotlib colormap sampled server-side; `colors` lists the classes of a
+    # categorical variable explicitly, because `mhw`'s five are NOAA's own and
+    # are recognised on sight — sampling some sequential map at five points
+    # would throw that away.
+    colormap: str | None = None
+    colors: tuple[Category, ...] = ()
     # `anom` is computed as `sst - climatology(mmdd)` rather than stored.
     derived: bool = False
+    # An ordinal class rather than a measurement. Three things follow, and each
+    # of them is silently wrong if this is not honoured:
+    #
+    #   * the Mercator resample must be nearest, not bilinear — blending a Cat 2
+    #     against a Cat 4 invents a Cat 3 along every edge;
+    #   * the colour ramp must be a step, not an interpolation;
+    #   * the displayed range is not user-adjustable, and the ramp is tabulated
+    #     over the whole encoding range so entry k is exactly code k.
+    categorical: bool = False
     # How far the *user* may move the displayed colour range, as opposed to
     # `vmin`/`vmax`, which are only where it opens. The frontend re-ranges the
     # map client-side — the images carry data, not colour — and this is what
@@ -131,6 +155,22 @@ class Variable:
         if self.limits is None:
             return low, high
         return max(self.limits[0], low), min(self.limits[1], high)
+
+    def color_range(self) -> tuple[float, float]:
+        """`raster-color-range`: the span the 256-entry ramp is tabulated over.
+
+        A variable whose *codes* have to land one-per-ramp-entry must tabulate
+        its whole encoding range. Two do, for different reasons: `anom`'s
+        sentinel needs a slot of its own, and `mhw`'s categories need code k to
+        be entry k — tabulate its five classes over 1..5 instead and code 2 lands
+        at entry 63.75, where a Cat 2 can pick up Cat 1's colour.
+
+        Everything else spends all 256 entries on the display range, which is
+        where they are actually useful.
+        """
+        if self.encoding.sentinel is not None or self.categorical:
+            return self.encoding.value_range()
+        return self.vmin, self.vmax
 
 
 @dataclass(frozen=True)
@@ -218,6 +258,7 @@ def variables() -> dict[str, Variable]:
         enc["channels"] = tuple(enc["channels"])
         if cfg.get("limits") is not None:
             cfg["limits"] = tuple(cfg["limits"])
+        cfg["colors"] = tuple(Category(**c) for c in cfg.get("colors", ()))
         out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
     return out
 

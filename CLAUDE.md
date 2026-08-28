@@ -44,12 +44,19 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
   python -m CRW.cli <command>
 
 python -m CRW.cli init                                    # tables + climatology + region means
-python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested
-python -m CRW.cli backfill [--start|--end] [--reverse] [--fresh] [--delete-nc]
+python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested, per archive
+python -m CRW.cli backfill [--start|--end] [--product sst|mhw] [--reverse] [--fresh] [--delete-nc]
 python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
-python -m CRW.cli status                                  # per-status day/row counts
+python -m CRW.cli status                                  # per-status day/row counts, per archive
 ```
+
+**There are two daily archives and every command covers both by default.** CoralTemp SST
+and the Marine Heatwave category are separate products with separate URLs, separate
+directories, separate tables and separate status bookkeeping — `--product` narrows
+`backfill` to one, and `--fresh` then truncates only that one's tables. `run` walks both
+per date and treats each independently, because MHW is published about 90 minutes after
+CoralTemp and a run landing between the two sees a date as SST-ingested and MHW-pending.
 
 `init` is not just DDL — it loads all 366 climatology files (2.68 B rows, ~20 min) and
 then builds `region_clim`. It is idempotent and resumable: an interrupted load skips the
@@ -70,8 +77,18 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm --no-deps 
 must still be on disk. Run it before `backfill --delete-nc` and before the daily retention
 prune has eaten the range. Afterwards the source for those frames is gone.
 
-`render` and `run` are the same code path — both go through `imaging.bucket_mean()`, so
-a change to how a week is averaged cannot apply to one and not the other. `run` renders
+**This now applies to `./data/MHW/` as well, and that is a live trap rather than a
+theoretical one.** `imaging.prune()` walks both archives, so a single `CRW.cli run` without
+`--keep-nc` deletes the whole MHW archive back to the open week — and if the MHW render
+pass has not been done, every historical MHW frame becomes unrecoverable without
+re-downloading 9.7 GB. **Order is: backfill MHW → `render --variable mhw` → only then let
+`run` prune.** Until that render has finished, pass `--keep-nc`.
+
+`render` and `run` are the same code path — both go through `shared.buckets.bucket_field()`,
+so a change to how a week is reduced cannot apply to one and not the other. **The API's
+on-demand render goes through it too**: that used to be a second copy in
+`api/modules/render.py`, and it would have kept averaging the MHW category, which is
+reduced by max. `run` renders
 the date it just ingested; `render` walks history in a `spawn` pool. It touches neither
 ClickHouse nor the network (hence `--no-deps`), so it is safe to run against a
 half-finished backfill — though the two contend for the same `./data` mount, ingest being
@@ -97,6 +114,38 @@ full archive.
 Global 7200×3600 grid at **0.05°**. The variable taken is `analysed_sst` — `short` counts
 of 0.01 °C with `_FillValue = -32768`. (`sea_ice_fraction` is also in the file and is not
 ingested.) **There is no anomaly in the product**; it is derived, see below.
+
+#### The second daily product: Marine Heatwave category
+
+**NOAA CRW Marine Heatwave v1.0.1** (`noaa-crw_mhw_v1.0.1_category_YYYYMMDD.nc`), one file
+per day in `./data/MHW/`, mounted at `/opt/data/MHW/`. Same 1985-01-01 onward, ~640 KB
+each, 9.7 GB for the full archive.
+
+**A different product suite, not a sibling of `sst/` under the CoralTemp tree** — there is
+no `mhw/` beside it. It is derived from CoralTemp v3.1 but versioned and published
+separately, at `.../crw/data/marine_heatwave/v1.0.1/category/nc/{YYYY}/`.
+
+**Both products publish at roughly one day's latency, and MHW lands about 90 minutes after
+CoralTemp** — measured by HEAD, 2026-08-27 carried `Last-Modified` 14:52 UTC for SST and
+15:20 UTC for MHW. So the gap is intra-day, not a day: a `run` scheduled in that window
+sees SST published and MHW not. That is why the two are tracked and processed
+independently rather than paired, and why the catch-up watermark is the earlier of the
+two.
+
+The variable is `heatwave_category` — `int8`, `_FillValue = -127`. Same 7200×3600 grid,
+**same latitude orientation as the dailies** (`lat[0] = -89.975`, so no flip), same
+longitude roll. Verified: the box's land mask matches `sst_daily` exactly at 7,477,923
+ocean cells. (NOAA's own browse PNGs for this product *are* north-up — a trap if the
+palette is ever re-derived from one.)
+
+Four states, and only one of them is drawn:
+
+| code | meaning | stored? | drawn? |
+|---|---|---|---|
+| -127 | land | no | transparent |
+| -1 | ice | no | transparent |
+| 0 | ocean, no heatwave | no | transparent |
+| 1..5 | Moderate / Strong / Severe / Extreme / Beyond extreme | yes | NOAA's palette |
 
 **The climatology is a second archive**: 366 files in `./data/climatology/`, mounted at
 `/opt/data/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
@@ -152,7 +201,7 @@ Transparent would read as land; any scale colour would read as a real near-zero 
 
 ### `shared/` — the contract between `api` and `process`
 
-Both containers mount `./shared` at `/app/shared`. Five modules:
+Both containers mount `./shared` at `/app/shared`. Six modules:
 
 - **`domain.py` + `domain.yml`** — grid geometry, variable metadata, named region boxes.
   Describes **two** grids and the distinction matters: `global` is the full 7200×3600
@@ -160,6 +209,11 @@ Both containers mount `./shared` at `/app/shared`. Five modules:
 - **`fields.py`** — NetCDF reading, and the single home of both orientation rules above.
 - **`render.py`** — field array → Web-Mercator WebP. **Takes arrays, never a DB client.**
 - **`periods.py`** — daily/weekly/monthly buckets, shared by query and render.
+- **`buckets.py`** — **the single definition of what a bucket's field is.** Reads the days
+  on disk and reduces them: mean for `sst`/`anom`, **max for `mhw`**. It lives here rather
+  than in `process` because `api/modules/render.py` renders the retention window's buckets
+  on demand and had grown a second copy of it — the exact drift retiring `api/prerender.py`
+  was meant to end.
 - **`ch.py`** — the ClickHouse client factory and the **single definition of the schema**
   (`DDL`, applied idempotently by `ensure_schema()`). No `.sql` file; keeping the DDL in
   one Python constant is what stops `api` and `process` drifting apart.
@@ -183,9 +237,42 @@ ENGINE = MergeTree PARTITION BY toYear(date) ORDER BY (gy, gx, date)
 **`sst_clim`** — the 1991–2020 daily climatology, one row per (mmdd, ocean cell).
 2.68 B rows, **2.18 GiB**. `ORDER BY (gy, gx, mmdd)`.
 
+**`mhw_daily`** — one row per (date, cell) **that is actually in a heatwave**. ~24.2 B rows.
+
+```sql
+date  Date    CODEC(DoubleDelta, ZSTD(3))
+gy    UInt16
+gx    UInt16
+cat   UInt8   -- 1..5, the source's own ordinal class; no scale factor to undo
+lat   Float32 ALIAS -89.975 + gy * 0.05
+lon   Float32 ALIAS 0.025 + gx * 0.05
+ENGINE = MergeTree PARTITION BY toYear(date) ORDER BY (gy, gx, date)
+```
+
+**Only `cat >= 1` is stored, and that is what makes it affordable.** Measured over 40
+random days spanning the archive, the box averages **1,592,012** heatwave cells a day
+against 7,477,923 ocean cells — so ~24.2 B rows rather than ~113.7 B.
+
+**The cost is that absence is ambiguous.** A missing (date, cell) is heatwave-free ocean,
+ice, land, *or a date that was never ingested*, and the table cannot say which. Two
+consequences, both load-bearing:
+
+1. Every query reads `mhw_daily` as the **right side of a LEFT JOIN against `sst_daily`**,
+   which holds exactly the ocean cells for a date. That join supplies the zeros and
+   excludes the land, and both tables share `ORDER BY (gy, gx, date)`, so at a point it is
+   a primary-key read on both sides. A *box* deliberately does not join — see
+   `_region_mhw_daily`.
+2. A partly-ingested archive reports a confident **category 0** for every date it has not
+   reached, not a gap — so `/coverage` carries `mhw.complete` and the frontend refuses to
+   offer the variable until it is true. This is the same shape as `climatology.complete`
+   gating `anom`, but sharper: there is no value that could signal the difference.
+
 **`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The entire precomputation layer.
 
-**`ingest_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one row per day.
+**`ingest_status`** / **`mhw_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one
+row per day, one table per archive. Two tables rather than one with a `product` column
+because the sorting key is `date` and a product would have to join it, which cannot be
+altered in place — and because the two archives genuinely progress independently.
 
 Four decisions worth not undoing:
 
@@ -243,11 +330,11 @@ says otherwise.
 ### Process pipeline (`process/`)
 
 Entry point `process/CRW/cli.py` (`python -m CRW.cli`). Modules:
-- `config.py` — filename parsing, `scan()`
-- `download.py` — NOAA CRW fetching
-- `ingest.py` — NetCDF → ClickHouse
+- `config.py` — filename parsing, `scan()` / `scan_mhw()`
+- `download.py` — NOAA CRW fetching; a `Product` value per archive (`SST`, `MHW`)
+- `ingest.py` — NetCDF → ClickHouse; a `Target` per archive (`SST_TARGET`, `MHW_TARGET`)
 - `climatology.py` — the 366-file load and `region_clim`
-- `imaging.py` — day/week/month × sst/anom rendering, and the retention window
+- `imaging.py` — day/week/month × sst/anom/mhw rendering, and the retention window
 - `status.py` — the `ingest_status` table
 
 Inserts are batched across days (`--batch`, default **5** — a day is ~7.5 M rows now, not
@@ -277,14 +364,22 @@ and a bulk download that has outrun the ingest. A 404 on yesterday exits 0, not 
 CRW publishes at ~1 day latency and not at a fixed hour, so a cron retry must be a
 no-op-or-succeed.
 
-Per date: `download → ingest → render 6 images → prune retention window`.
+Per date: `download+ingest SST → download+ingest MHW → render 9 images → prune both
+retention windows`. The two products are handled **independently** — one being unpublished
+is not a failure of the other, and the date's frames are rendered for whatever landed. The
+catch-up watermark is the **earlier** of the two archives' last ingested day, so a date
+that is SST-done but MHW-pending — which happens whenever a run lands in the ~90 minutes
+between the two publications — is picked up on the next run rather than stranded behind
+the SST watermark.
 
 #### The retention window
 
 A weekly frame is the mean over seven days, but `run` deletes each `.nc` after ingesting
 it — so days N−6…N−1 are gone by the time day N is processed. **`imaging.retention_floor()`
 keeps the files the open week and month still need** (at most ~37 files, ~380 MB) and
-prunes only what has fallen out of both. Losing that window does not corrupt anything, but
+prunes only what has fallen out of both. `prune()` walks **both** archives: an MHW weekly
+frame is a max over the same span of days and needs its own files kept for exactly as long,
+and at ~640 KB a file the second window costs ~24 MB. Losing that window does not corrupt anything, but
 it freezes weekly and monthly frames at whatever was last rendered.
 
 ### API (`api/`)
@@ -295,7 +390,7 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 |---|---|
 | `GET /health` | liveness + ClickHouse reachability |
 | `GET /domain` | grid extent, image bounds, variable metadata, per-variable colour stops and `encoding` (mix, ranges, `limits`), `noClimColor`, region list |
-| `GET /coverage` | ingested date range, row count, climatology completeness |
+| `GET /coverage` | ingested date range, row count, climatology completeness, MHW archive range and completeness |
 | `GET /variables` | variable list, with `derived` on `anom` |
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
@@ -303,7 +398,24 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `POST /monthlyRanking` | every complete calendar month at a cell, ranked within its month-of-year |
 | `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
 
-**`variable` — `sst` (default) / `anom`** — is accepted by every endpoint above.
+**`variable` — `sst` (default) / `anom` / `mhw`** — is accepted by every endpoint above.
+
+**How `mhw` is bucketed differs by query shape, and each difference is deliberate:**
+
+- **A point and the map take the MAX** over the bucket. A category is an ordinal class and
+  its mean is not one — a cell at Cat 1 for two days of seven averages to 0.29, which is no
+  category at all. The max answers what the frame is read for (*how bad did it get this
+  week*), keeps every period on the same 1..5 scale so one legend serves all three, and
+  keeps the invariant the whole period mechanism exists for: a chart point and the map
+  frame carrying the same date agree.
+- **A box takes the MEAN of daily area means.** Over a box the daily value is already a
+  cos(lat)-weighted area mean — continuous, and no longer a category — so there is nothing
+  ordinal left for a max to preserve, and a max of daily area means would be a spike
+  detector for each week's worst day.
+- **`/monthlyRanking` takes the MEAN**, and it is the one place `mhw` is deliberately
+  averaged at a point. It ranks years against each other, and a max would put most of the
+  archive on Cat 1 and rank nothing; the mean daily category over a month is a
+  severity-days index that separates one bad week from a whole month at Cat 1.
 
 **`period` — `daily` (default) / `weekly` / `monthly`** — buckets are defined once in
 `shared/periods.py`: weeks start on **Monday** (`toMonday`), months are calendar months, and
@@ -363,6 +475,7 @@ the displayed range are client-side settings for good.
 |---|---|---|---|---|
 | `sst` | `G`,`B` → `G*256+B` | 0.01 °C | −5…650 | the source's own precision, lossless |
 | `anom` | `R` | 0.1 °C | −12.8…+12.7 | code 0 = no climatology |
+| `mhw` | `R` | 1 category | 0…255 | code == value; 0 and land both alpha 0 |
 
 **Lossless WebP, necessarily** — lossy is YUV 4:2:0 and destroys packed data: measured at
 q90 on a real frame, mean error 0.074 °C but **maximum 1.613 °C**, i.e. visible blotches.
@@ -391,9 +504,47 @@ Three details that are load-bearing, all of which fail quietly:
   ±3 display range.
 
 `raster-color` tabulates its ramp at **256 uniformly spaced steps over `raster-color-range`**,
-so `/domain` sends a different range per variable: `anom` tabulates its whole encoding range
-(−12.8…12.7), which puts the sentinel in a slot of its own and lands exactly one code per
-step; `sst` has no sentinel and spends all 256 entries on the −2…32 display range.
+so `/domain` sends a different range per variable — `Variable.color_range()` owns the
+decision and `store.colorRangeFor` mirrors it. A variable whose *codes* must land one per
+ramp entry tabulates its whole encoding range: `anom` (−12.8…12.7) so its sentinel gets a
+slot of its own, and `mhw` (0…255) so that entry k is code k. Tabulating mhw's five classes
+over 1…5 instead would put code 2 at entry 63.75, where a **Cat 2 picks up Cat 1's colour**.
+`sst` has neither constraint and spends all 256 entries on the −2…32 display range.
+
+#### `mhw` is categorical, and three things follow
+
+None of them fails loudly if it is skipped, which is why `domain.yml` declares
+`categorical: true` and everything reads that flag rather than testing the name:
+
+1. **The Mercator resample is nearest, not bilinear** (`to_mercator(..., nearest=True)`).
+   Blending a Cat 2 against a Cat 4 invents a Cat 3 along every edge. Measured on
+   2023-10-01 at width 2048: bilinear mis-categorises 3,072 cells (0.28% of shared ocean),
+   but the bigger cost is that it **invents 42,088 heatwave pixels** — 3.9% more than exist
+   — by blending a real category against the NaN of heatwave-free ocean and letting the
+   NaN-fallback make the result opaque.
+2. **The ramp is a `step`, not an `interpolate`** (`categoricalRamp` in `AnomalyMap.vue`),
+   and the chart's `visualMap` is `piecewise` for the same reason. There is no colour
+   between two classes because there is no value between them.
+3. **The displayed range is not the user's.** The stops *are* the classes, so `ColorLegend`
+   shows a named key instead of a gradient and a slider, `setScale` refuses a categorical
+   variable outright (a stale `localStorage` entry must not be honoured), and `stopsFor`
+   skips the re-spreading — which is currently the identity, and is skipped explicitly so
+   it stays correct when a class is added.
+
+**The palette is NOAA's own, measured rather than guessed.** Extracted from NOAA's plain
+PNG for 2023-10-01 by matching every pixel against that date's NetCDF: all five categories
+matched **100%**, as did the three non-heatwave classes (land `#969696`, ice `#ffffff`,
+no-heatwave `#b3f2ff`) — which this project draws transparent instead. `domain.yml` lists
+them as `colors` rather than naming a colormap; matplotlib has no say, because the point of
+these five is that people already recognise them from NOAA's maps.
+
+| cat | | colour |
+|---|---|---|
+| 1 | Moderate | `#ffff80` |
+| 2 | Strong | `#ffb333` |
+| 3 | Severe | `#ff8000` |
+| 4 | Extreme | `#cc4d00` |
+| 5 | Beyond extreme | `#991a00` |
 
 Exact values remain the timeseries endpoints' job; this raster is for looking at.
 
@@ -453,12 +604,40 @@ app/stores/main.ts                 Pinia store
 `/region/{key}` and `/regionTimeseries` still exist and now take `variable` too. The Niño
 indices are the obvious thing to surface there next.
 
-**`store.variable` (`sst` | `anom`) works exactly like `store.period`**: it drives the
+**`store.variable` (`sst` | `anom` | `mhw`) works exactly like `store.period`**: it drives the
 chart request and the image URL together, so the map and the chart can never show
-different fields. It opens on `sst` — the stored variable, defined on every ocean cell —
-while `anom` is undefined over the ice fringe and needs the full 366-key climatology, so
-the Anomaly button stays **disabled until `/coverage` reports `climatology.complete`**. A
-partly-loaded climatology would blank the missing dates rather than fail, which is worse.
+different fields. **It opens on `anom`** — how far from normal it is, is the question the
+dashboard exists for; absolute SST is the reference view you switch to, and it comes second
+in the toggle. `anom` is the derived one, though: it is undefined over the ice fringe and
+needs the full 366-key climatology, so the Anomaly button stays **disabled until
+`/coverage` reports `climatology.complete`**, and `loadMetadata()` falls back to `sst` when
+it is not. A partly-loaded climatology would blank the missing dates rather than fail,
+which is worse — and opening on a variable whose own toggle is disabled is worse still.
+
+**`mhw` is gated the same way, for a sharper reason.** `store.variableReady()` holds both
+rules in one place: `anom` needs `climatology.complete`, `mhw` needs `mhw.complete`, and
+`sst` — the stored field the other two are built from — is always available, which is what
+makes it the fallback. The MHW case is sharper because its table is *sparse*: a
+half-backfilled archive does not blank the missing dates, it reports a confident **category
+0** for them, and a monthly ranking then ranks forty fabricated zeroes below one real
+month. No value could signal the difference, so the toggle is disabled and says why.
+
+Three more things `mhw` changes in the UI, all because it is a class rather than a
+measurement:
+
+- **`ColorLegend` shows a named key**, not a gradient with a range popover. The names are
+  the point — Cat 3 means Severe, which is what the map is being read for — and there is
+  nothing between two classes to re-range.
+- **Nothing prints a degree sign at it.** `store.activeUnitLabel` is `''` for `mhw`, and
+  the chart tooltip, the legend title, the y-axis name and the ranking rows all read it.
+  The tooltip names the class too: `3 (Severe)`, and `0 (no heatwave)` — which is the
+  common reading and needs saying rather than looking like a missing point.
+- **Below Cat 1 is drawn neutral, not clamped** (`NO_CLASS_COLOR`, shared by the chart's
+  piecewise `0` piece and `colorScale`'s `belowFirst`). A ranked month whose mean category
+  is 0.0 had no heatwave at all; painting it Cat 1's yellow says exactly the opposite.
+  Continuous variables keep clamping, which is right for them — an SST of −4 is simply off
+  the bottom, and the map saturates it the same way. The ranking's copy follows too:
+  rank 1 is "most severe", not "warmest".
 
 The monthly ranking **refetches on a variable change** but not on a period change: ranking
 years by absolute SST is a different question from ranking by anomaly, whereas the ranking
@@ -610,21 +789,43 @@ the compose network and must reach the API by service name (`API_INTERNAL_BASE_U
 to Mapbox — must use the published `NUXT_PUBLIC_API_BASE_URL` (`http://localhost:9021`).
 Getting this wrong surfaces as `ECONNREFUSED ::1:9021` from the Nitro server.
 
-**The map opens on the whole box, in Mercator.** The old `INITIAL_NORTH = 68` clip existed
-because the OISST domain ran to 90°N and that strip dominated a Mercator fit; this box
-stops at 65°N and fits without a sliver, so the clip is gone. The projection is
-`mercator`, not `globe`: a globe hides half a single basin behind the limb at the opening
-zoom.
+**The projection is the user's, and it opens on the globe.** A Globe/Flat pair sits at the
+map's top-left and the choice is remembered in `localStorage` under `enso.map.projection`.
+The two are framed differently and cannot share a view: Mercator fits the whole box
+(`fitBounds`; the old `INITIAL_NORTH = 68` clip is gone — that existed because the OISST
+domain ran to 90°N and dominated a Mercator fit, and this box stops at 65°N), while the
+globe takes a centre and a zoom — the North Pacific at `[-170, 25]`, zoom 1.7 — because no
+`fitBounds` frames a 190°-wide box on a sphere without putting half of it behind the limb.
+
+**The globe needs the field image twice.** Mercator draws world copies, so the single quad
+at 100…290 crosses the antimeridian and is drawn whole. The globe has none: measured in
+Chromium, that quad **clips dead at 180** and the entire eastern Pacific silently vanishes.
+`AnomalyMap.vue` therefore adds a second image source with the *same* URL at −260…−70 while
+the globe is on. Each source draws only the part of itself inside −180…180, so the two abut
+at the dateline, do not overlap, and no image has to be cropped. It is removed again in
+Mercator, where both quads land on the same ground and two layers at 0.85 opacity would
+double into a visibly darker box.
 
 **`imageBounds.east` is 290, not −70, and is passed to Mapbox as-is.** Normalising it into
 −180…180 would make west > east and collapse the image source — see the Map imagery
-section for the verification.
+section for the verification. (Confirmed again on the globe: west > east draws nothing at
+all.)
 
 Stepping days calls `ImageSource.updateImage()` rather than removing and re-adding the
 layer, so the basemap does not flash between frames.
 
 **Charts**: always ECharts, never a hand-rolled `<canvas>`. The point series is ~15k daily
 values; `dataZoom` is what makes that browsable.
+
+**The line is coloured on the active variable's scale**, by a continuous `visualMap` built
+from `store.activeStops` — the same stops the map and the ranking dots read, so a value has
+one colour everywhere and dragging the colour range recolours the chart with the map (and,
+like the map, fetches nothing). It was a hard-coded diverging ±3 ramp, which is right for
+`anom` and nonsense for `sst`, where every ocean temperature above 3 °C sat pinned red. Two
+things about it fail quietly: an explicit `series.lineStyle.color` **beats** the visualMap
+rather than losing to it, so the fallback colour is only set when there are no stops; and
+the y-axis needs `scale: true` plus a zero `markLine` drawn **only for `anom`** — either one
+alone drags a 25–30 °C SST record down against a 0–30 axis and draws it as a flat line.
 
 
 ## Gotchas
@@ -644,6 +845,11 @@ values; `dataZoom` is what makes that browsable.
 - **`api` needs `netCDF4` too.** It renders the head of the archive (buckets still inside
   the retention window) from file. Historical frames come from the image cache, never from
   ClickHouse.
+- **A missing `mhw_daily` row is not a zero, it is an unknown.** The table is sparse by
+  design, and the LEFT JOIN that restores its zeros cannot tell heatwave-free ocean from a
+  date that was never ingested. Anything new that reads it must either go through that join
+  *and* respect `/coverage`'s `mhw.complete`, or be honest that it is reporting zeros it
+  cannot vouch for.
 - **Never truncate `sst_daily` without `ingest_status`.** Emptying one and not the other
   makes every day look already-ingested, and `ingest_files` then issues an
   `ALTER … DELETE` mutation per day against rows that do not exist — on a full archive that
@@ -700,6 +906,33 @@ Verified working end to end on the CoralTemp pipeline:
   antimeridian, SST/Anomaly and Daily/Weekly/Monthly toggles render, a map click populates
   the chart and the ranks dock, no console errors.
 
+Verified on the Marine Heatwave addition:
+
+- **Ingest.** The per-category histogram in `mhw_daily` for 2023-10-01 matches the source
+  NetCDF exactly across all five categories (2,355,517 / 681,076 / 60,027 / 3,618 / 305).
+  Land is absent; the 16-day trial slice came to 49,284,004 rows, 3.08 M/day at that
+  archive-peak date.
+- **Point queries.** Eight cells checked against the NetCDF, the antimeridian pair
+  included — 180.025°E and −179.975°E resolve to the same cell. A heatwave-free ocean cell
+  returns **0**, not an absent row, which is the LEFT JOIN doing its job; a land cell
+  returns nothing.
+- **Weekly max.** At one cell over three weeks the weekly series is the max of its daily
+  values, not their mean.
+- **The region path.** `/region/nino34?variable=mhw` for 2023-10-01 gives 0.855, matching a
+  hand-written `sum(cat*cos)/sum(cos)` over the same box to three decimals.
+- **Imagery.** By pixel, not by eye: the rendered WebP is opaque *only* where a heatwave is
+  (1,087,645 px), alpha is strictly 0 or 255 with nothing in between, and the only codes
+  present are 1..5. Per-category proportions match the source. At 81 KB it is a sixth of
+  the SST frame.
+- **Nearest resampling, measured.** Bilinear would invent 42,088 heatwave pixels (3.9%
+  more than exist) and mis-categorise 3,072 more.
+- **Browser** (Chromium): the MHW toggle renders and switches, the map draws NOAA's palette
+  with land and heatwave-free ocean transparent, the legend is a named key, the chart's
+  y-axis is 0..5 with no unit, the ranks dock reads "most severe first" and draws
+  zero-mean months neutral rather than Cat 1 yellow. No console errors. Two apparent bugs
+  were checked and were not: the Gulf of Mexico and Hudson Bay really were at Cat 1 that
+  day and sit inside the box's 70°W edge.
+
 **Browser verification works here.** Headless Chromium renders the Mapbox canvas fine under
 ANGLE/SwiftShader; launch it with
 `args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']`. Note the
@@ -720,6 +953,10 @@ ranking grid first shipped blank because its canvas sits inside `<ClientOnly>`, 
 `container.value` was still null at `onMounted` and nothing ever observed it. Watch the
 template ref, not the mount.
 
-Not built yet: the full-archive backfill and render pass (in progress), the region-query
+Not built yet: the full-archive backfill and render pass for **both** products (in
+progress — MHW ingest runs at ~2.9 days/s, so ~90 min for the archive), the region-query
 benchmark that decides whether `region_daily` is needed, a cron entry for `run`, production
 compose files, PostHog analytics, tests.
+
+**Until the MHW backfill finishes, `/coverage` reports `mhw.complete: false` and the
+frontend's MHW toggle stays disabled** — deliberately, see the sparse-table note above.

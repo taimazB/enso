@@ -12,10 +12,8 @@
         :label="item.label"
         :color="store.variable === item.value ? 'primary' : 'neutral'"
         :variant="store.variable === item.value ? 'solid' : 'subtle'"
-        :disabled="item.value === 'anom' && !climatologyReady"
-        :title="item.value === 'anom' && !climatologyReady
-          ? 'Anomaly needs the full 366-day climatology, which is still loading'
-          : item.title"
+        :disabled="!store.variableReady(item.value)"
+        :title="store.variableReady(item.value) ? item.title : item.pending"
         @click="store.setVariable(item.value)"
       />
     </UFieldGroup>
@@ -125,22 +123,35 @@ import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
 
 const store = useMainStore()
 
-/**
- * SST first: it is the stored variable and is defined on every ocean cell,
- * while the anomaly is undefined over the ice fringe and depends on the
- * climatology being fully loaded.
- */
+// Anomaly first, and it is what the app opens on: the question this dashboard
+// exists for is "how far from normal is it", and absolute SST is the reference
+// view you switch to. MHW comes last because it is the narrowest question of the
+// three — not "how warm" but "is this officially a heatwave, and how bad" — and
+// it is the one most likely to be unavailable, being a separate archive.
+//
+// `pending` is the tooltip shown while a variable's precondition is unmet. Each
+// says what is missing rather than just greying out, because in both cases the
+// failure mode without the gate is silent wrong data, not an error — see
+// `variableReady` in the store.
 const VARIABLES = [
-  { value: 'sst' as const, label: 'SST', title: 'Sea surface temperature' },
-  { value: 'anom' as const, label: 'Anomaly', title: 'Difference from the 1991-2020 daily climatology' },
+  {
+    value: 'anom' as const,
+    label: 'Anomaly',
+    title: 'Difference from the 1991-2020 daily climatology',
+    pending: 'Anomaly needs the full 366-day climatology, which is still loading',
+  },
+  {
+    value: 'sst' as const,
+    label: 'SST',
+    title: 'Sea surface temperature',
+  },
+  {
+    value: 'mhw' as const,
+    label: 'MHW',
+    title: 'NOAA marine heatwave category, 1 (Moderate) to 5 (Beyond extreme)',
+    pending: 'Marine heatwave needs its own archive, which has not finished ingesting',
+  },
 ]
-
-/**
- * The anomaly is derived per day-of-year, so a partly-loaded climatology would
- * silently blank whichever dates are missing rather than fail — better to
- * disable the toggle than to serve holes.
- */
-const climatologyReady = computed(() => store.coverage?.climatology?.complete !== false)
 const { playing, fps, canPlay, toggle, stop } = usePlayback()
 
 const dateInput = computed({

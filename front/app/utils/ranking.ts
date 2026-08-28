@@ -18,7 +18,7 @@ import type {
   TooltipComponentFormatterCallbackParams,
 } from 'echarts'
 import type { ColorStop } from './colorScale'
-import { colorScale } from './colorScale'
+import { NO_CLASS_COLOR, colorScale } from './colorScale'
 
 /** The rectangle a cartesian grid occupies, which `params.coordSys` widens away. */
 interface GridRect { x: number, y: number, width: number, height: number }
@@ -47,8 +47,8 @@ export interface RankingRow {
 
 export interface MonthlyRanking {
   cell: { gy: number, lat: number, lon: number }
-  /** Which field the years are ranked by — 'sst' or 'anom'. */
-  variable?: 'sst' | 'anom'
+  /** Which field the years are ranked by. */
+  variable?: 'sst' | 'anom' | 'mhw'
   units?: string
   /** Every month ranked, edge months included — first of the first to last of the last. */
   span: { start: string, end: string } | null
@@ -158,6 +158,13 @@ export interface ThumbOptionInput {
   domain: XDomain
   /** Year on the map; ringed amber here too, so the rail shows where it sits every month. */
   selectedYear?: number | null
+  /**
+   * Whether the ranked value is a mean over an ordinal class. Below the first
+   * class it is drawn neutral rather than clamped: a mean heatwave category of
+   * 0.0 is "no heatwave all month", and painting it Cat 1's yellow says exactly
+   * the opposite of what happened.
+   */
+  categorical?: boolean
 }
 
 /**
@@ -168,8 +175,8 @@ export interface ThumbOptionInput {
  * is the shape (how far the diagonal leans, where it crosses zero) and the
  * colour, which is exactly what the rail is being scanned for.
  */
-export function thumbOption({ rows, stops, domain, selectedYear }: ThumbOptionInput): EChartsOption {
-  const scale = colorScale(stops)
+export function thumbOption({ rows, stops, domain, selectedYear, categorical }: ThumbOptionInput): EChartsOption {
+  const scale = colorScale(stops, categorical ? NO_CLASS_COLOR : undefined)
   return {
     animation: false,
     backgroundColor: 'transparent',
@@ -219,12 +226,30 @@ export interface DetailOptionInput {
   /** Ranks at or above which a row is emphasised. */
   topN: number
   selectedYear?: number | null
+  /**
+   * Unit suffix for the tooltip — '°C' for the temperature variables, '' for
+   * the marine-heatwave category, which has none. Passed in rather than assumed:
+   * this file is pure so it can be asserted on headlessly, and a hard-coded
+   * degree sign was printing "0.52 °C" at a variable measured in categories.
+   */
+  unit?: string
+  /**
+   * Whether the ranked value is a mean over an ordinal class. `/monthlyRanking`
+   * averages the daily category deliberately — a max would put half the archive
+   * on Cat 1 and rank nothing — so the number is a severity index rather than a
+   * category, and it is signed only when the underlying scale is.
+   */
+  categorical?: boolean
 }
 
 export function detailOption({
-  rows, month, stops, domain, pitch, topN, selectedYear,
+  rows, month, stops, domain, pitch, topN, selectedYear, unit = '\u00B0C', categorical = false,
 }: DetailOptionInput): EChartsOption {
-  const scale = colorScale(stops)
+  // A leading '+' only means something on a scale centred at zero. The anomaly
+  // is; a mean heatwave category, which cannot go below zero, is not.
+  const scale = colorScale(stops, categorical ? NO_CLASS_COLOR : undefined)
+  const value = (n: number) => (categorical ? n.toFixed(2) : signed(n))
+  const suffix = unit ? ` ${unit}` : ''
   const panelH = pitch * Math.max(1, rows.length)
   const labelSize = pitch >= 14 ? 11 : 9
   const dotR = Math.min(5, Math.max(3, pitch / 3.5))
@@ -239,8 +264,8 @@ export function detailOption({
         const [, mean, , , year, sd, n, rank, partial] = (raw as unknown as ItemParams).value
         const lines = [
           `<b>${MONTHS[month - 1]} ${year}${partial ? ' *' : ''}</b>`,
-          `mean&nbsp;&nbsp;<b>${signed(mean!)} °C</b>`,
-          `sd&nbsp;&nbsp;${sd!.toFixed(2)} °C over ${n} days`,
+          `mean&nbsp;&nbsp;<b>${value(mean!)}${suffix}</b>`,
+          `sd&nbsp;&nbsp;${sd!.toFixed(2)}${suffix} over ${n} days`,
           `rank&nbsp;&nbsp;${rank} of ${rows.length}`,
         ]
         if (partial) {
@@ -268,7 +293,7 @@ export function detailOption({
         // The panel is as wide as the dock the user left it at; at the narrow
         // end the round ticks would otherwise run into each other.
         hideOverlap: true,
-        formatter: (v: number) => signed(v),
+        formatter: (v: number) => value(v),
       },
       axisLine: { show: false },
       axisTick: { show: false },

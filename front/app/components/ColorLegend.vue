@@ -7,10 +7,32 @@
       <span class="text-[11px] font-medium text-muted">{{ title }}</span>
       <!-- Marks a range that is not domain.yml's, so a map read at ±1 is never
            mistaken for one read at the default ±3. -->
-      <span v-if="isCustom" class="text-[11px] text-primary">custom</span>
+      <span v-if="isCustom && !categorical" class="text-[11px] text-primary">custom</span>
     </div>
 
-    <UPopover :content="{ side: 'top', align: 'center' }">
+    <!--
+      A categorical scale is a key, not a ramp. Its five classes have names, and
+      the names are the point — "Cat 3" means Severe, which is what the map is
+      being read for. There is also nothing here to re-range: the classes are the
+      values, so the popover, the slider and the tick row are all absent rather
+      than disabled.
+    -->
+    <div v-if="categorical" class="flex w-48 flex-col gap-0.5">
+      <div
+        v-for="stop in stops"
+        :key="stop.value"
+        class="flex items-center gap-1.5 text-[11px] text-muted"
+      >
+        <span
+          class="h-2.5 w-4 shrink-0 rounded-sm"
+          :style="{ background: stop.color }"
+        />
+        <span class="tabular-nums text-default">{{ stop.value }}</span>
+        <span>{{ stop.label }}</span>
+      </div>
+    </div>
+
+    <UPopover v-else :content="{ side: 'top', align: 'center' }">
       <!--
         A real button, not the bar with a click handler: this is the only way to
         reach the range control, so it has to be focusable and it has to say what
@@ -123,6 +145,7 @@ const store = useMainStore()
  */
 const stops = computed(() => store.activeStops)
 const meta = computed(() => store.domain?.variables?.[store.variable])
+const categorical = computed(() => store.activeIsCategorical)
 
 const scale = computed(() => store.activeScale)
 const bounds = computed(() => store.scaleBoundsFor(store.variable))
@@ -138,7 +161,11 @@ const step = computed(() => store.scaleStepFor(store.variable))
 
 const title = computed(() => {
   const v = meta.value
-  return v ? `${v.shortName} (°${v.units === 'degC' ? 'C' : v.units})` : ''
+  if (!v) return ''
+  // The degree sign belongs to a temperature, not to a category. `mhw` reads
+  // "MHW (category)"; the old expression produced "(°category)".
+  const unit = store.unitLabelFor(store.variable) || v.units
+  return `${v.shortName} (${unit})`
 })
 
 /**

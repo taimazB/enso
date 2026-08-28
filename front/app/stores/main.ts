@@ -5,8 +5,12 @@ import type { Period } from '~/utils/periods'
 import type { MonthlyRanking } from '~/utils/ranking'
 import { bucketStart } from '~/utils/periods'
 
-/** The two things the map and chart can show. `anom` is derived, not stored. */
-export type VariableName = 'sst' | 'anom'
+/**
+ * The three things the map and chart can show. `anom` is derived rather than
+ * stored; `mhw` is stored in its own sparse table and is **categorical**, which
+ * changes how it is coloured, ranged and formatted throughout.
+ */
+export type VariableName = 'sst' | 'anom' | 'mhw'
 
 /** A variable's displayed range — what the colour ramp is spread over. */
 export interface ColorScaleRange { vmin: number, vmax: number }
@@ -21,8 +25,18 @@ export interface DomainMeta {
     precision: number
     vmin: number
     vmax: number
-    colormap: string
+    colormap: string | null
     derived: boolean
+    /**
+     * An ordinal class rather than a measurement. Three consequences, all
+     * handled by reading this rather than by testing `name === 'mhw'`: the map
+     * ramp is a `step` instead of an `interpolate`, the colour-range control is
+     * hidden (there is nothing between two classes to re-range), and nothing
+     * prints a unit suffix at it.
+     */
+    categorical: boolean
+    /** The classes, in NOAA's own colours. Empty for a continuous variable. */
+    categories: Array<{ value: number, color: string, label: string }>
     /**
      * How `/image` packs this variable's value into the WebP's RGB channels.
      * The images carry data, not colour — Mapbox applies the ramp itself — so
@@ -47,7 +61,10 @@ export interface DomainMeta {
       limits: [number, number]
     }
   }>
-  /** Keyed by variable: sst's scale is sequential, anom's diverging. */
+  /**
+   * Keyed by variable: sst's scale is sequential, anom's diverging, and mhw's
+   * five discrete classes.
+   */
   colorStops: Record<VariableName, ColorStop[]>
   defaultVariable: VariableName
   /** Ocean with SST but no climatology — the seasonal ice fringe. */
@@ -62,6 +79,20 @@ export interface Coverage {
   end: string | null
   /** Anomaly is unavailable until all 366 climatology keys are loaded. */
   climatology: { keys: number, complete: boolean } | null
+  /**
+   * The MHW archive, ingested separately. It is published about 90 minutes after
+   * CoralTemp, so it can trail by a day when a run lands between the two.
+   *
+   * `complete` gates the variable for a sharper reason than the climatology
+   * gates `anom`. `mhw_daily` is sparse — only category >= 1 has a row — so the
+   * API restores the zeros by joining against the SST table, and that join
+   * cannot tell "no heatwave here" from "this date was never ingested". A
+   * half-backfilled archive therefore reports a confident category 0 for every
+   * missing year rather than a gap, and a monthly ranking would rank forty
+   * fabricated zeroes against one real month. The API decides; nothing here
+   * second-guesses it.
+   */
+  mhw: { rows: number, days: number, start: string | null, end: string | null, complete: boolean } | null
 }
 
 export interface Series {
@@ -149,8 +180,17 @@ function stepFor(domain: DomainMeta | null, variable: VariableName): number {
  * Spread the server's evenly spaced colours over a new range. The colours are
  * untouched; only the value each one sits at moves. See `stopsFor`.
  */
-function rescaleStops(stops: ColorStop[], { vmin, vmax }: ColorScaleRange): ColorStop[] {
-  if (stops.length < 2) return stops
+function rescaleStops(
+  stops: ColorStop[],
+  { vmin, vmax }: ColorScaleRange,
+  categorical = false,
+): ColorStop[] {
+  // A categorical variable's stops ARE its classes — value 1 is Cat 1 — and its
+  // range is not adjustable, so there is nothing to spread. Re-labelling them
+  // would currently be the identity (five stops over 1..5 land back on 1..5),
+  // which is exactly why it must be skipped explicitly rather than left to
+  // coincidence: it stops being the identity the moment a class is added.
+  if (categorical || stops.length < 2) return stops
   const span = vmax - vmin
   return stops.map((stop, i) => ({
     color: stop.color,
@@ -174,12 +214,14 @@ export const useMainStore = defineStore('main', {
      */
     period: 'weekly' as Period,
     /**
-     * Field shown on the map and charted. Opens on `sst`, not `anom`: SST is
-     * the stored variable and is defined everywhere in the box, while the
-     * anomaly is undefined over the ~3% ice fringe and needs the climatology
-     * to be fully loaded.
+     * Field shown on the map and charted. Opens on `anom`, which is the
+     * question the dashboard is for — absolute SST is the reference view you
+     * switch to. The anomaly needs the full 366-key climatology, though, so
+     * `loadMetadata()` falls back to `sst` if /coverage says it is still
+     * loading: a partly-loaded climatology blanks the missing dates rather than
+     * failing, and the Anomaly button is disabled in that state anyway.
      */
-    variable: 'sst' as VariableName,
+    variable: 'anom' as VariableName,
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
@@ -221,12 +263,56 @@ export const useMainStore = defineStore('main', {
       rescaleStops(
         state.domain?.colorStops?.[variable] ?? [],
         resolveScale(state.domain, state.scales[variable], variable),
+        state.domain?.variables?.[variable]?.categorical,
       ),
 
     activeStops: state => rescaleStops(
       state.domain?.colorStops?.[state.variable] ?? [],
       resolveScale(state.domain, state.scales[state.variable], state.variable),
+      state.domain?.variables?.[state.variable]?.categorical,
     ),
+
+    /**
+     * Whether a variable can be offered at all, given what is loaded.
+     *
+     * Two of the three have a precondition, and neither fails loudly if it is
+     * ignored — which is exactly why the toggle is disabled rather than left to
+     * produce a plausible-looking wrong answer:
+     *
+     * - `anom` is derived per day-of-year, so a partly-loaded climatology
+     *   silently blanks whichever dates are missing.
+     * - `mhw` is stored sparsely and its zeros are restored by a join, so a
+     *   partly-loaded archive silently reports category 0 — a real value, and
+     *   the wrong one — for every date it has not reached.
+     *
+     * `sst` is the stored field the other two are built from and is always
+     * available, which is what makes it the fallback.
+     */
+    variableReady: state => (variable: VariableName): boolean => {
+      if (variable === 'anom') return state.coverage?.climatology?.complete !== false
+      if (variable === 'mhw') return state.coverage?.mhw?.complete === true
+      return true
+    },
+
+    /** Whether a variable is an ordinal class rather than a measurement. */
+    isCategorical: state => (variable: VariableName): boolean =>
+      state.domain?.variables?.[variable]?.categorical ?? false,
+
+    activeIsCategorical: state =>
+      state.domain?.variables?.[state.variable]?.categorical ?? false,
+
+    /**
+     * The unit suffix to print after a value, or '' where there is none.
+     *
+     * `mhw` is a category, not a measurement: "Cat 3 degC" is nonsense, and the
+     * chart tooltip, the legend title and the ranking rows all used to hard-code
+     * the degree sign.
+     */
+    unitLabelFor: state => (variable: VariableName): string =>
+      state.domain?.variables?.[variable]?.units === 'degC' ? '\u00B0C' : '',
+
+    activeUnitLabel: state =>
+      state.domain?.variables?.[state.variable]?.units === 'degC' ? '\u00B0C' : '',
 
     /**
      * `raster-color-range`: the span the 256-entry ramp is tabulated over.
@@ -239,9 +325,14 @@ export const useMainStore = defineStore('main', {
      * which is where they are useful, so `sst`'s does follow.
      */
     colorRangeFor: state => (variable: VariableName): [number, number] => {
-      const enc = state.domain?.variables?.[variable]?.encoding
+      const meta = state.domain?.variables?.[variable]
+      const enc = meta?.encoding
       if (!enc) return [0, 1]
-      if (enc.sentinel !== null) return enc.range
+      // A variable whose CODES have to land one per ramp entry tabulates its
+      // whole encoding range: `anom` so its sentinel gets a slot of its own, and
+      // `mhw` so that code k is entry k. Tabulating mhw's five classes over 1..5
+      // would put code 2 at entry 63.75, where a Cat 2 picks up Cat 1's colour.
+      if (enc.sentinel !== null || meta?.categorical) return enc.range
       const { vmin, vmax } = resolveScale(state.domain, state.scales[variable], variable)
       return [vmin, vmax]
     },
@@ -284,6 +375,13 @@ export const useMainStore = defineStore('main', {
       this.coverage = coverage
       if (!this.selectedDate && coverage.end) this.setDate(coverage.end)
       await point
+      // Only now is it known which variables are actually available. Nothing to
+      // do in the normal case; where a derived or separately-ingested variable
+      // is not ready this drops back to `sst` — the one that is always there,
+      // being the stored field the others are built from — and refetches the
+      // opening point on it. Opening on a variable whose own toggle is disabled
+      // is worse than opening on the reference view.
+      if (!this.variableReady(this.variable)) await this.setVariable('sst')
     },
 
     /**
@@ -295,8 +393,14 @@ export const useMainStore = defineStore('main', {
      * the number field and one dragged on the slider are constrained the same.
      */
     setScale(variable: VariableName, vmin: number, vmax: number) {
-      const enc = this.domain?.variables?.[variable]?.encoding
+      const meta = this.domain?.variables?.[variable]
+      const enc = meta?.encoding
       if (!enc || !Number.isFinite(vmin) || !Number.isFinite(vmax)) return
+      // A categorical scale is not the user's to move: its stops are its
+      // classes. The control is hidden for it, and this is the backstop — a
+      // stale localStorage entry from before a variable turned categorical
+      // reaches `loadScales` and must not be honoured.
+      if (meta?.categorical) return
 
       const bounds = scaleBounds(this.domain, variable)
       const step = rangeStep(enc)
@@ -371,7 +475,10 @@ export const useMainStore = defineStore('main', {
      * different variables. The date is untouched — a variable change is not a
      * change of when.
      */
-    setVariable(variable: VariableName) {
+    // Return type annotated rather than inferred: `loadMetadata` calls this, and
+    // an inferred one makes the two mutually recursive — TS then gives up on
+    // `this` inside `loadMetadata` and loses every state property.
+    setVariable(variable: VariableName): Promise<void> | void {
       if (variable === this.variable) return
       this.variable = variable
       if (this.selectedPoint) {

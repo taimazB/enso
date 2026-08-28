@@ -19,9 +19,8 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-import numpy as np
-from shared import fields
-from shared.periods import Period, span
+from shared.buckets import bucket_field
+from shared.periods import Period
 from shared.render import (  # noqa: F401 — re-exported for call sites
     DEFAULT_WIDTH,
     IMAGE_DIR,
@@ -56,43 +55,18 @@ __all__ = [
 def _render_from_netcdf(
     date: dt.date, period: Period, variable_name: str, width: int
 ) -> bytes | None:
-    """Render a bucket from whatever NetCDF is still on disk, or None."""
-    first, last = span(date, period)
-    total = count = None
-    missing_any = None
-    day = first
-    n_days = 0
+    """Render a bucket from whatever NetCDF is still on disk, or None.
 
-    while day <= last:
-        try:
-            raw = fields.read_daily_raw(day)
-        except (FileNotFoundError, OSError):
-            day += dt.timedelta(days=1)
-            continue
-        if variable_name == "sst":
-            value, no_clim = fields.as_celsius(raw), None
-        else:
-            clim = fields.read_clim_raw(fields.mmdd_of(day))
-            value = fields.anomaly(raw, clim)
-            no_clim = fields.no_clim_mask(raw, clim)
-        finite = np.isfinite(value)
-        if total is None:
-            total = np.zeros(value.shape, dtype="float64")
-            count = np.zeros(value.shape, dtype="int32")
-            missing_any = np.zeros(value.shape, dtype=bool)
-        total[finite] += value[finite]
-        count[finite] += 1
-        if no_clim is not None:
-            missing_any |= no_clim
-        n_days += 1
-        day += dt.timedelta(days=1)
-
-    if not n_days:
+    The reduction itself lives in `shared.buckets`, shared with `process`. This
+    used to be a second implementation of it, which is exactly the drift the
+    retirement of `api/prerender.py` was supposed to end — and it would have
+    quietly kept *averaging* the MHW category, which has to be reduced by max.
+    """
+    result = bucket_field(date, period, variable_name)
+    if result is None:
         return None
-    with np.errstate(invalid="ignore"):
-        mean = np.where(count > 0, total / np.maximum(count, 1), np.nan).astype("float32")
-    no_clim = (missing_any & (count == 0)) if variable_name == "anom" else None
-    return encode(mean, width, variable_name, no_clim=no_clim)
+    field, no_clim, _n_days = result
+    return encode(field, width, variable_name, no_clim=no_clim)
 
 
 def render(

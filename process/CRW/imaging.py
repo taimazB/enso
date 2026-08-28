@@ -11,14 +11,16 @@ Two entry points over one implementation:
 - `render_range()` walks the closed buckets of a date range across a process
   pool. This is the bulk form, for history that `run` has already passed.
 
-Both go through `bucket_mean()`, so a change to how a week is averaged cannot
-apply to one and not the other. They used to be separate implementations in
-separate services — this module and an `api/prerender.py` — which is exactly the
-drift this arrangement removes.
+Both go through `shared.buckets.bucket_field()`, so a change to how a week is
+reduced cannot apply to one and not the other. That function lives in `shared/`
+rather than here because `api/modules/render.py` needs it too — it renders the
+buckets still inside the retention window on demand — and it had drifted into a
+second copy there. Two definitions of "what is a week" is one too many, and the
+MHW variable made that concrete: it reduces a bucket by **max**, not mean.
 
 A date contributes to three buckets (its day, its Monday-anchored week, its
-calendar month) for each of two variables, so ingesting one day rewrites up to
-six images.
+calendar month) for each of three variables, so ingesting one day rewrites up to
+nine images.
 
 ### Why the retention window exists
 
@@ -28,6 +30,10 @@ week cannot be rendered unless those files are still present. `retain_window()`
 keeps exactly the files the open week and month still need (at most ~37 files,
 ~380 MB) and prunes the rest. Losing that window does not corrupt anything, but
 it does leave weekly and monthly frames frozen at whatever was last rendered.
+
+`prune()` walks **both** archives, for the same reason: the MHW weekly and
+monthly frames are a max over the same span of days and need their own files
+kept, and an MHW file is ~640 KB, so the second window is small.
 """
 
 from __future__ import annotations
@@ -38,81 +44,15 @@ import multiprocessing as mp
 import os
 import time
 
-import numpy as np
-from shared import fields
+from shared.buckets import bucket_field
 from shared.periods import PERIODS, Period, span, start_of
 from shared.render import DEFAULT_WIDTH, cache_path, encode, write_cache
 
-from .config import NC_DIR, scan
+from .config import MHW_DIR, NC_DIR, scan, scan_mhw
 
 log = logging.getLogger(__name__)
 
-VARIABLES: tuple[str, ...] = ("sst", "anom")
-
-
-def bucket_mean(
-    date: dt.date,
-    period: Period,
-    variable_name: str,
-    available: set[dt.date] | None = None,
-) -> tuple[np.ndarray, np.ndarray | None, int] | None:
-    """Mean field over a bucket, read from whatever NetCDF is on disk.
-
-    Returns `(field, no_clim_mask_or_None, n_days)`, or None if no day in the
-    bucket is available. `n_days` lets the caller see how much of the bucket the
-    mean actually rests on.
-
-    Cells are averaged where present: a cell that is ocean on some days of the
-    week and ice-masked on others still gets a mean over the days it had.
-    """
-    first, last = span(date, period)
-    day = first
-    total: np.ndarray | None = None
-    count: np.ndarray | None = None
-    missing_any: np.ndarray | None = None
-    n_days = 0
-
-    while day <= last:
-        if available is not None and day not in available:
-            day += dt.timedelta(days=1)
-            continue
-        try:
-            raw = fields.read_daily_raw(day)
-        except (FileNotFoundError, OSError):
-            day += dt.timedelta(days=1)
-            continue
-
-        if variable_name == "sst":
-            value = fields.as_celsius(raw)
-            no_clim = None
-        else:
-            clim = fields.read_clim_raw(fields.mmdd_of(day))
-            value = fields.anomaly(raw, clim)
-            no_clim = fields.no_clim_mask(raw, clim)
-
-        finite = np.isfinite(value)
-        if total is None:
-            total = np.zeros(value.shape, dtype="float64")
-            count = np.zeros(value.shape, dtype="int32")
-            missing_any = np.zeros(value.shape, dtype=bool)
-        total[finite] += value[finite]
-        count[finite] += 1
-        if no_clim is not None:
-            missing_any |= no_clim
-        n_days += 1
-        day += dt.timedelta(days=1)
-
-    if total is None or n_days == 0:
-        return None
-
-    with np.errstate(invalid="ignore"):
-        mean = np.where(count > 0, total / np.maximum(count, 1), np.nan).astype("float32")
-    # A cell with no anomaly on any contributing day stays "no climatology";
-    # one that had an anomaly on at least one day carries that day's mean.
-    no_clim = None
-    if variable_name == "anom":
-        no_clim = missing_any & (count == 0)
-    return mean, no_clim, n_days
+VARIABLES: tuple[str, ...] = ("sst", "anom", "mhw")
 
 
 def render_date(
@@ -122,17 +62,26 @@ def render_date(
     variables: tuple[str, ...] = VARIABLES,
     periods: tuple[Period, ...] = PERIODS,
     available: set[dt.date] | None = None,
+    available_mhw: set[dt.date] | None = None,
 ) -> int:
     """Rewrite every cached image the day at `date` contributes to.
 
     Writes the cache file unconditionally rather than through a completeness
     guard: the open week and month are *legitimately* short every day until they
     close, and must be overwritten daily as days land.
+
+    The two archives get **separate** availability sets. They are downloaded and
+    pruned independently — MHW is published about 90 minutes after CoralTemp — so a
+    date's SST file being on disk says nothing about its MHW file, and passing
+    one set for both would silently skip real frames.
     """
     written = 0
     for period in periods:
         for name in variables:
-            result = bucket_mean(date, period, name, available)
+            result = bucket_field(
+                date, period, name,
+                available_mhw if name == "mhw" else available,
+            )
             if result is None:
                 log.warning("no data for %s %s bucket at %s", name, period, date)
                 continue
@@ -155,14 +104,24 @@ def retention_floor(date: dt.date) -> dt.date:
     return min(start_of(date, "weekly"), start_of(date, "monthly"))
 
 
-def prune(date: dt.date, nc_dir=None, keep_after: dt.date | None = None) -> int:
-    """Delete daily NetCDF that has fallen out of `date`'s retention window."""
+def prune(
+    date: dt.date, nc_dir=None, keep_after: dt.date | None = None, mhw_dir=None
+) -> int:
+    """Delete daily NetCDF that has fallen out of `date`'s retention window.
+
+    Walks **both** archives. An MHW weekly or monthly frame is a max over the
+    same span of days as an SST one, so it needs its own files kept for exactly
+    as long; pruning only `sst/` would freeze the MHW week at whatever was last
+    rendered while the SST week kept updating. The second window is cheap — an
+    MHW file is ~640 KB against CoralTemp's ~10 MB.
+    """
     floor = keep_after or retention_floor(date)
     removed = 0
-    for nc in scan(nc_dir or NC_DIR):
-        if nc.date < floor:
-            nc.path.unlink(missing_ok=True)
-            removed += 1
+    for files in (scan(nc_dir or NC_DIR), scan_mhw(mhw_dir or MHW_DIR)):
+        for nc in files:
+            if nc.date < floor:
+                nc.path.unlink(missing_ok=True)
+                removed += 1
     if removed:
         log.info("pruned %d NetCDF file(s) older than %s", removed, floor)
     return removed
@@ -177,17 +136,32 @@ def prune(date: dt.date, nc_dir=None, keep_after: dt.date | None = None) -> int:
 # database-backed to NetCDF-backed rendering.
 
 
-def archive_range(nc_dir=None) -> tuple[dt.date, dt.date]:
-    """First and last date with a NetCDF on disk.
+def archive_range(
+    nc_dir=None, variables: tuple[str, ...] = VARIABLES, mhw_dir=None
+) -> tuple[dt.date, dt.date]:
+    """First and last date with a NetCDF on disk, over the archives `variables` need.
 
     Goes through `config.scan()` rather than globbing, so the one definition of
     what counts as a daily file — `.part` files excluded — serves both ingest
     and rendering.
+
+    `sst` and `anom` come from the CoralTemp archive and `mhw` from its own, so
+    rendering only `mhw` must not be bounded by whatever CoralTemp files happen
+    to be on disk — and rendering only `sst` must not be widened by MHW's extra
+    day. The span returned is the union over the archives actually needed; a
+    bucket with no file in it renders empty and is reported as such.
     """
-    dates = sorted(nc.date for nc in scan(nc_dir or NC_DIR))
+    dates: list[dt.date] = []
+    looked: list[str] = []
+    if any(v in ("sst", "anom") for v in variables):
+        dates += [nc.date for nc in scan(nc_dir or NC_DIR)]
+        looked.append(str(nc_dir or NC_DIR))
+    if "mhw" in variables:
+        dates += [nc.date for nc in scan_mhw(mhw_dir or MHW_DIR)]
+        looked.append(str(mhw_dir or MHW_DIR))
     if not dates:
-        raise ValueError(f"no CoralTemp files under {nc_dir or NC_DIR}")
-    return dates[0], dates[-1]
+        raise ValueError(f"no NetCDF files under {' or '.join(looked)}")
+    return min(dates), max(dates)
 
 
 def closed_buckets(period: Period, lo: dt.date, hi: dt.date) -> list[dt.date]:
@@ -216,7 +190,7 @@ def render_bucket(job: tuple[dt.date, Period, str, int]) -> tuple[dt.date, Perio
     picklable. Zero bytes means the bucket had no NetCDF at all.
     """
     date, period, variable, width = job
-    result = bucket_mean(date, period, variable)
+    result = bucket_field(date, period, variable)
     if result is None:
         return date, period, variable, 0
     field, no_clim, _ = result

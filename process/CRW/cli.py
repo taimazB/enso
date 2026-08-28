@@ -45,8 +45,8 @@ def _parse_date(value: str) -> dt.date:
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
 
 
-def _select(args) -> list[config.NcFile]:
-    files = config.scan()
+def _select(args, files: list[config.NcFile] | None = None) -> list[config.NcFile]:
+    files = config.scan() if files is None else files
     if getattr(args, "date", None):
         files = [f for f in files if f.date == args.date]
     if getattr(args, "start", None):
@@ -85,70 +85,99 @@ def cmd_init(args) -> int:
     return 0
 
 
-def cmd_scan(args) -> int:
-    files = _select(args)
+def _report_scan(label, directory, files, done) -> None:
+    print(f"\n{label}")
     if not files:
-        print(f"no CoralTemp files found under {config.NC_DIR}")
-        return 1
-
-    with get_client() as client:
-        done = status_mod.ingested_dates(client)
-
+        print(f"  directory    : {directory}")
+        print("  files on disk: 0")
+        return
     stale = [f for f in files if f.date not in done]
-    print(f"directory      : {config.NC_DIR}")
-    print(f"files on disk  : {len(files)}  ({files[0].date} .. {files[-1].date})")
-    print(f"already loaded : {len(files) - len(stale)}")
-    print(f"to ingest      : {len(stale)}")
+    print(f"  directory    : {directory}")
+    print(f"  files on disk: {len(files)}  ({files[0].date} .. {files[-1].date})")
+    print(f"  already loaded: {len(files) - len(stale)}")
+    print(f"  to ingest    : {len(stale)}")
     if stale:
         shown = ", ".join(str(f.date) for f in stale[:5])
         more = f" ... (+{len(stale) - 5} more)" if len(stale) > 5 else ""
-        print(f"  next         : {shown}{more}")
+        print(f"    next       : {shown}{more}")
+
+
+def cmd_scan(args) -> int:
+    """Report each archive separately — they progress independently."""
+    sst = _select(args)
+    mhw = _select(args, config.scan_mhw())
+    if not sst and not mhw:
+        print(f"no NetCDF files found under {config.NC_DIR} or {config.MHW_DIR}")
+        return 1
+
+    with get_client() as client:
+        done_sst = status_mod.ingested_dates(client, status_mod.SST_TABLE)
+        done_mhw = status_mod.ingested_dates(client, status_mod.MHW_TABLE)
+
+    _report_scan("CoralTemp SST", config.NC_DIR, sst, done_sst)
+    _report_scan("Marine heatwave category", config.MHW_DIR, mhw, done_mhw)
     return 0
 
 
 def cmd_backfill(args) -> int:
     ensure_schema()
 
-    if args.fresh:
-        # Both together, always. `ingest_status` describes what is in
-        # `sst_daily`; emptying one without the other makes every day look
-        # already-ingested, and `ingest_files` would then issue an
-        # `ALTER ... DELETE` mutation per day against rows that do not exist.
-        with get_client() as client:
-            for table in ("sst_daily", "ingest_status"):
-                client.command(f"TRUNCATE TABLE IF EXISTS {DATABASE}.{table}")
-        print("truncated sst_daily and ingest_status")
+    # Which archives this invocation covers. Both by default: MHW is part of the
+    # pipeline, not a side job, so the ordinary command loads it.
+    products = tuple(args.product or ("sst", "mhw"))
 
-    files = _select(args)
-    if args.reverse:
-        files = list(reversed(files))
-    if not files:
-        print("nothing to do")
-        return 0
+    if args.fresh:
+        # Data table and status table together, always. The status table
+        # describes what is in the data table; emptying one without the other
+        # makes every day look already-ingested, and `ingest_files` would then
+        # issue an `ALTER ... DELETE` mutation per day against rows that do not
+        # exist. Only the selected products are truncated — a `--fresh` MHW
+        # reload must not throw away 113 billion rows of SST.
+        tables = []
+        if "sst" in products:
+            tables += ["sst_daily", "ingest_status"]
+        if "mhw" in products:
+            tables += ["mhw_daily", "mhw_status"]
+        with get_client() as client:
+            for table in tables:
+                client.command(f"TRUNCATE TABLE IF EXISTS {DATABASE}.{table}")
+        print("truncated " + ", ".join(tables))
 
     def committed(nc: config.NcFile) -> None:
         if args.delete_nc:
             nc.path.unlink(missing_ok=True)
 
-    print(
-        f"backfilling {len(files)} day(s), {files[0].date} .. {files[-1].date}"
-        + (" (deleting NetCDF as it goes)" if args.delete_nc else "")
-    )
-    with get_client() as client:
-        counts = ingest.ingest_files(
-            client,
-            files,
-            force=args.force,
-            batch_days=args.batch,
-            on_committed=committed,
-        )
+    failed = 0
+    for product in products:
+        target = ingest.MHW_TARGET if product == "mhw" else ingest.SST_TARGET
+        files = _select(args, config.scan_mhw() if product == "mhw" else None)
+        if args.reverse:
+            files = list(reversed(files))
+        if not files:
+            print(f"{product}: nothing to do")
+            continue
 
-    print(
-        "ingested {ingested} day(s), {rows:,} rows; skipped {skipped}; failed {failed}".format(
-            **counts
+        print(
+            f"{product}: backfilling {len(files)} day(s), "
+            f"{files[0].date} .. {files[-1].date}"
+            + (" (deleting NetCDF as it goes)" if args.delete_nc else "")
         )
-    )
-    return 1 if counts["failed"] else 0
+        with get_client() as client:
+            counts = ingest.ingest_files(
+                client,
+                files,
+                force=args.force,
+                batch_days=args.batch,
+                on_committed=committed,
+                target=target,
+            )
+
+        print(
+            f"{product}: ingested {{ingested}} day(s), {{rows:,}} rows; "
+            "skipped {skipped}; failed {failed}".format(**counts)
+        )
+        failed += counts["failed"]
+    return 1 if failed else 0
 
 
 def cmd_render(args) -> int:
@@ -158,8 +187,12 @@ def cmd_render(args) -> int:
     writes the image cache, so it is safe to run against a half-finished
     backfill and needs no schema.
     """
+    variables = tuple(args.variable or imaging.VARIABLES)
     try:
-        lo, hi = imaging.archive_range()
+        # Bounded by the archives the requested variables actually read, so
+        # `--variable mhw` is not clipped to whatever CoralTemp files happen to
+        # be on disk (and vice versa).
+        lo, hi = imaging.archive_range(variables=variables)
     except ValueError as exc:
         print(exc)
         return 1
@@ -174,7 +207,6 @@ def cmd_render(args) -> int:
         return 1
 
     periods = tuple(args.period or PERIODS)
-    variables = tuple(args.variable or imaging.VARIABLES)
 
     def progress(done, total, written, elapsed):
         rate = done / elapsed if elapsed else 0.0
@@ -211,21 +243,36 @@ def cmd_render(args) -> int:
     return 0
 
 
-def _process_date(client, http, date, *, force, keep_nc, width) -> str:
-    """Download, ingest and render one date. Returns a short outcome word."""
-    remote = download.head(date, client=http)
+# The two daily archives, paired with everything that differs between them.
+# `run` walks this list per date rather than branching, so adding a third product
+# later is a tuple, not a second copy of the download/ingest/status dance.
+PRODUCTS = (
+    ("sst", download.SST, ingest.SST_TARGET),
+    ("mhw", download.MHW, ingest.MHW_TARGET),
+)
+
+
+def _process_product(client, http, date, product, target, *, force) -> str:
+    """Download and ingest one date of one archive. Returns an outcome word.
+
+    Rendering is deliberately **not** here: a date's frames are rewritten once,
+    after both archives have had their turn, so a single MHW-only day does not
+    re-encode the SST images it did not change.
+    """
+    remote = download.head(date, client=http, product=product)
     if remote is None:
-        log.info("%s: not published by CRW yet", date)
+        log.info("%s: %s not published yet", date, product.key)
         return "unpublished"
 
-    existing = status_mod.load(client).get(date)
+    existing = status_mod.load(client, target.status_table).get(date)
     if not force and status_mod.is_current(existing, remote):
-        log.info("%s: already ingested and unrevised", date)
+        log.info("%s: %s already ingested and unrevised", date, product.key)
         return "skipped"
 
-    nc = download.fetch(date, client=http)
+    nc = download.fetch(date, client=http, product=product)
+    source = download.url(date, product)
     counts = ingest.ingest_files(
-        client, [nc], force=True, batch_days=1, source_url=download.url(date)
+        client, [nc], force=True, batch_days=1, source_url=source, target=target
     )
     if counts["failed"]:
         return "failed"
@@ -235,14 +282,44 @@ def _process_date(client, http, date, *, force, keep_nc, width) -> str:
         nc,
         status_mod.STATUS_SUCCESS,
         n_rows=counts["rows"],
-        source_url=download.url(date),
+        source_url=source,
         remote_size=remote[0],
         remote_modified=remote[1],
+        table=target.status_table,
     )
-    imaging.render_date(date, width=width, available=config.available_dates())
-    if not keep_nc:
-        imaging.prune(date)
     return "ingested"
+
+
+def _process_date(client, http, date, *, force, keep_nc, width) -> str:
+    """Download, ingest and render one date across both archives.
+
+    The two products are handled **independently**: NOAA publishes MHW about a
+    about 90 minutes after CoralTemp on the same day, so a run landing between the
+    two sees a date with SST and no MHW. One being unpublished is not a failure of the other, and the
+    date's frames are still rendered for whatever did land.
+
+    The date's overall outcome is the worst of the two, so a failure is never
+    hidden by the other product's success.
+    """
+    outcomes = [
+        _process_product(client, http, date, product, target, force=force)
+        for _name, product, target in PRODUCTS
+    ]
+
+    if "ingested" in outcomes:
+        imaging.render_date(
+            date,
+            width=width,
+            available=config.available_dates(),
+            available_mhw=config.available_mhw_dates(),
+        )
+        if not keep_nc:
+            imaging.prune(date)
+
+    for worst in ("failed", "ingested", "skipped"):
+        if worst in outcomes:
+            return worst
+    return "unpublished"
 
 
 def cmd_run(args) -> int:
@@ -253,7 +330,18 @@ def cmd_run(args) -> int:
             targets = [args.date]
         else:
             yesterday = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=1)
-            last = status_mod.last_ingested(client)
+            # The EARLIER of the two archives' last ingested day, so a date that
+            # is SST-done but still MHW-pending — which happens whenever a run
+            # lands in the ~90 minutes between the two publications — is revisited
+            # on the next run instead of being stranded behind the SST watermark.
+            # Revisiting a complete date costs two HEAD requests and nothing else.
+            watermarks = [
+                w for w in (
+                    status_mod.last_ingested(client, target.status_table)
+                    for _name, _product, target in PRODUCTS
+                ) if w
+            ]
+            last = min(watermarks) if len(watermarks) == len(PRODUCTS) else None
             # From the day after the last ingested through yesterday — one code
             # path covering normal daily operation, a missed cron run, and the
             # tail of a bulk download that has outrun the ingest.
@@ -296,27 +384,38 @@ def cmd_run(args) -> int:
 
 def cmd_status(args) -> int:
     with get_client() as client:
-        rows = client.query(
-            f"""
-            SELECT status, count() AS days, sum(n_rows) AS rows,
-                   min(date) AS first, max(date) AS last
-            FROM {DATABASE}.ingest_status FINAL
-            GROUP BY status ORDER BY status
-            """
-        ).result_rows
-        daily = client.query(
-            f"SELECT count(), min(date), max(date) FROM {DATABASE}.sst_daily"
-        ).result_rows[0]
+        def statuses(table):
+            return client.query(
+                f"""
+                SELECT status, count() AS days, sum(n_rows) AS rows,
+                       min(date) AS first, max(date) AS last
+                FROM {DATABASE}.{table} FINAL
+                GROUP BY status ORDER BY status
+                """
+            ).result_rows
+
+        def rowcount(table):
+            return client.query(
+                f"SELECT count(), min(date), max(date) FROM {DATABASE}.{table}"
+            ).result_rows[0]
+
+        archives = [
+            ("CoralTemp SST", status_mod.SST_TABLE, "sst_daily"),
+            ("Marine heatwave", status_mod.MHW_TABLE, "mhw_daily"),
+        ]
+        report = [(label, statuses(status), rowcount(data), data) for label, status, data in archives]
         clim = client.query(
             f"SELECT count(), uniqExact(mmdd) FROM {DATABASE}.sst_clim"
         ).result_rows[0]
 
-    if not rows:
-        print("no ingest recorded yet")
-    for st, days, n_rows, first, last in rows:
-        print(f"{st:<18} {days:>6} day(s)  {n_rows or 0:>15,} rows  {first} .. {last}")
-    print(f"\nsst_daily: {daily[0]:,} rows, {daily[1]} .. {daily[2]}")
-    print(f"sst_clim : {clim[0]:,} rows, {clim[1]} of 366 mmdd keys")
+    for label, rows, daily, table in report:
+        print(f"\n{label}")
+        if not rows:
+            print("  no ingest recorded yet")
+        for st, days, n_rows, first, last in rows:
+            print(f"  {st:<18} {days:>6} day(s)  {n_rows or 0:>15,} rows  {first} .. {last}")
+        print(f"  {table}: {daily[0]:,} rows, {daily[1]} .. {daily[2]}")
+    print(f"\nsst_clim : {clim[0]:,} rows, {clim[1]} of 366 mmdd keys")
     return 0
 
 
@@ -349,14 +448,16 @@ def main(argv: list[str] | None = None) -> int:
     p_back.add_argument("--delete-nc", action="store_true",
                         help="delete each file once its batch has committed")
     p_back.add_argument("--fresh", action="store_true",
-                        help="truncate sst_daily and ingest_status first")
+                        help="truncate the selected products' data and status tables first")
+    p_back.add_argument("--product", action="append", choices=("sst", "mhw"),
+                        help="repeatable; default both archives")
     p_back.set_defaults(func=cmd_backfill)
 
     p_rend = with_selection(sub.add_parser("render", help="render images in bulk"))
     p_rend.add_argument("--period", action="append", choices=PERIODS,
                         help="repeatable; default all three")
     p_rend.add_argument("--variable", action="append", choices=imaging.VARIABLES,
-                        help="repeatable; default both")
+                        help="repeatable; default all three")
     p_rend.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     p_rend.add_argument("--workers", type=int, default=imaging.default_workers(),
                         help="pool size (default: half the cores)")

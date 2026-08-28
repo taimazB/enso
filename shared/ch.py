@@ -65,6 +65,26 @@ def get_client(database: str | None = None, **kwargs):
 # far better than Float32) with an ALIAS doing the *0.01. ALIAS columns cost no
 # storage, so queries read naturally as `sst`.
 
+# One row per date, per archive. Written as a template because there are two
+# archives with identical bookkeeping — see the `mhw_status` entry below.
+_STATUS_DDL = """
+    CREATE TABLE IF NOT EXISTS {database}.{table}
+    (
+        date             Date,
+        filename         String,
+        status           LowCardinality(String),
+        n_rows           UInt32,
+        file_size        UInt64,
+        source_url       String,
+        remote_size      UInt64,
+        remote_modified  String,
+        message          String,
+        updated_at       DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY date
+"""
+
 DDL: tuple[str, ...] = (
     f"CREATE DATABASE IF NOT EXISTS {DATABASE}",
     # One row per (date, ocean cell) inside the Pacific subset. Ordered
@@ -140,27 +160,57 @@ DDL: tuple[str, ...] = (
     ENGINE = ReplacingMergeTree(updated_at)
     ORDER BY (region, mmdd)
     """,
+    # NOAA CRW Marine Heatwave category, one row per (date, cell) — but ONLY for
+    # cells actually in a heatwave.
+    #
+    # Land (-127), ice (-1) and heatwave-free ocean (0) are all dropped, which is
+    # what makes this table affordable: measured over 40 random days spanning the
+    # archive, the Pacific box averages 1,592,012 cells at category >= 1 per day
+    # against 7,477,923 ocean cells — so ~24.2 B rows for the full archive rather
+    # than the ~113.7 B `sst_daily` carries.
+    #
+    # The cost of that sparsity, stated plainly: **absence is ambiguous**. A
+    # missing (date, cell) is heatwave-free ocean, ice, or land, and this table
+    # cannot say which. Every query therefore reads it as the RIGHT side of a
+    # LEFT JOIN against `sst_daily`, which holds exactly the ocean cells — that
+    # join supplies the zeros and excludes the land, and both tables are ordered
+    # `(gy, gx, date)`, so at a point it is a primary-key read on both sides.
+    #
+    # Same ORDER BY as `sst_daily`, and same reason: a point timeseries is the
+    # query that is unaffordable any other way, and a box is one contiguous key
+    # range per `gy`. Same absence of a projection, too.
+    f"""
+    CREATE TABLE IF NOT EXISTS {DATABASE}.mhw_daily
+    (
+        date      Date    CODEC(DoubleDelta, ZSTD(3)),
+        gy        UInt16  CODEC(DoubleDelta, ZSTD(3)),
+        gx        UInt16  CODEC(DoubleDelta, ZSTD(3)),
+
+        -- The source's own category, 1..5 (Moderate .. Beyond Extreme). Stored
+        -- unscaled: `heatwave_category` is already an ordinal class, so unlike
+        -- `sst_raw` there is no ALIAS undoing a scale factor.
+        cat       UInt8   CODEC(ZSTD(3)),
+
+        lat       Float32 ALIAS -89.975 + gy * 0.05,
+        lon       Float32 ALIAS 0.025 + gx * 0.05
+    )
+    ENGINE = MergeTree
+    PARTITION BY toYear(date)
+    ORDER BY (gy, gx, date)
+    """,
     # One row per date. `remote_size`/`remote_modified` are what a re-check
     # compares against: CoralTemp v3.1_op is a near-real-time stream whose files
     # can be revised in place, and the local NetCDF is deleted after ingest, so
     # staleness can only be detected by a HEAD against the source.
-    f"""
-    CREATE TABLE IF NOT EXISTS {DATABASE}.ingest_status
-    (
-        date             Date,
-        filename         String,
-        status           LowCardinality(String),
-        n_rows           UInt32,
-        file_size        UInt64,
-        source_url       String,
-        remote_size      UInt64,
-        remote_modified  String,
-        message          String,
-        updated_at       DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY date
-    """,
+    _STATUS_DDL.format(database=DATABASE, table="ingest_status"),
+    # The same table again for the MHW archive. A second TABLE rather than a
+    # `product` column in `ingest_status`, because that table is `ORDER BY date`
+    # with one row per date — adding a product would have to go into the sorting
+    # key, which cannot be altered in place, and the two archives genuinely do
+    # move independently: MHW is published about 90 minutes after CoralTemp on the
+    # same day, so a `run` that lands between the two sees a date as SST-ingested
+    # and MHW-pending.
+    _STATUS_DDL.format(database=DATABASE, table="mhw_status"),
 )
 
 # Status values used by process/CRW. ReplacingMergeTree keyed on `date` means

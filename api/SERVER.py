@@ -36,7 +36,7 @@ from modules.timeseries import (
 
 # A Literal so FastAPI rejects an unknown name with a 422 before it reaches the
 # query builder, and documents the choice in /docs.
-Variable = Literal["sst", "anom"]
+Variable = Literal["sst", "anom", "mhw"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("enso.api")
@@ -117,6 +117,15 @@ def domain() -> dict:
                 "colormap": v.colormap,
                 # `anom` is computed as sst - climatology, not stored.
                 "derived": v.derived,
+                # An ordinal class rather than a measurement. The frontend needs
+                # this to draw a step ramp instead of an interpolation, to hide
+                # the colour-range control (there is nothing between two classes
+                # to re-range), and to stop printing degrees at it.
+                "categorical": v.categorical,
+                "categories": [
+                    {"value": c.value, "color": c.color, "label": c.label}
+                    for c in v.colors
+                ],
                 # How /image packs this variable's value into the WebP, ready to
                 # hand to Mapbox: `mix` is `raster-color-mix` verbatim and
                 # `range` is what the encoding can represent. Computed here, not
@@ -128,15 +137,14 @@ def domain() -> dict:
                     "scale": v.encoding.scale,
                     "sentinel": v.encoding.sentinel,
                     # `raster-color-range`: the span the 256-entry colour ramp
-                    # is tabulated over. A variable with a sentinel has to
-                    # tabulate its whole encoding range so code 0 lands in a
-                    # slot of its own; one without spends all 256 entries on the
+                    # is tabulated over. A variable whose codes must land
+                    # one-per-entry tabulates its whole encoding range — `anom`
+                    # so its sentinel gets a slot of its own, `mhw` so that code
+                    # k is entry k. Everything else spends all 256 entries on the
                     # display range instead, which is where they are useful.
-                    "colorRange": (
-                        list(v.encoding.value_range())
-                        if v.encoding.sentinel is not None
-                        else [v.vmin, v.vmax]
-                    ),
+                    # `Variable.color_range()` owns that decision; the frontend
+                    # mirrors it in `colorRangeFor`.
+                    "colorRange": list(v.color_range()),
                     # How far the user may move the displayed range. The map is
                     # re-ranged client-side — the images carry data, not colour —
                     # and this bounds that control. Not the same as `range`:
@@ -183,6 +191,7 @@ def variables_endpoint() -> dict:
                 "shortName": variable(name).short_name,
                 "units": variable(name).units,
                 "derived": variable(name).derived,
+                "categorical": variable(name).categorical,
             }
             for name in VARIABLES
         ]

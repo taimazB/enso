@@ -17,6 +17,10 @@
           :empty-message="emptyPointMessage"
           :title="pointTitle"
           :selected-date="store.selectedDate"
+          :stops="store.activeStops"
+          :zero-line="store.variable === 'anom'"
+          :unit="store.activeUnitLabel"
+          :categorical="store.activeIsCategorical"
           @select="store.setDate($event)"
         />
 
@@ -59,6 +63,9 @@
         :loading="store.loadingPoint"
         :empty-message="emptyPointMessage"
         :selected-date="store.selectedDate"
+        :unit="store.activeUnitLabel"
+        :categorical="store.activeIsCategorical"
+        :rank-order="rankOrder"
         @select="store.setDate($event)"
       />
     </SideDock>
@@ -85,6 +92,13 @@ const emptyPointMessage = computed(
   () => store.outsideDomain ?? 'Click anywhere on the map to read that cell’s full record.',
 )
 
+/**
+ * What rank 1 means for the active variable. "Warmest" is right for a
+ * temperature and wrong for a heatwave category, where the ranking is by mean
+ * severity — nothing about it is a temperature.
+ */
+const rankOrder = computed(() => (store.variable === 'mhw' ? 'most severe' : 'warmest'))
+
 const ranksOpen = ref(false)
 const captionOpen = ref(false)
 
@@ -102,7 +116,12 @@ const ranksDescription = computed(() => {
   // Edge months included, hence the star — the month in progress is ranked
   // alongside the rest rather than waiting for its last day.
   return `Every month from ${span.start.slice(0, 7)} to ${span.end.slice(0, 7)}, `
-    + `ranked within its calendar month, warmest first. Pick a month on the left; bars are `
+    + `ranked within its calendar month, ${rankOrder.value} first. `
+    + (store.variable === 'mhw'
+      ? 'A month is scored by its MEAN daily heatwave category, not its worst day — '
+      + 'a max would put most years on Cat 1 and rank nothing. '
+      : '')
+    + `Pick a month on the left; bars are `
     + `±1 SD of that month's daily values and the top ${top} are bold. A * marks a month `
     + `truncated by the edge of the archive, drawn as an open dot — its mean is over a `
     + `part-month. Click a row to move the map to it.`

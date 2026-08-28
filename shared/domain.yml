@@ -119,6 +119,56 @@ variables:
       scale: 0.1
       offset: -12.8
       sentinel: 0
+  mhw:
+    long_name: Marine heatwave category
+    short_name: MHW
+    # Not a physical unit — the value is an ordinal class, not a measurement.
+    # Everything that prints "degC" has to consult this rather than assume.
+    units: category
+    precision: 0
+    # NOAA CRW Marine Heatwave v1.0.1, `heatwave_category`, int8 counts that are
+    # already the category — no scaling. -127 is land; -1 is ice; 0 is ocean with
+    # no heatwave. Only 1..5 are ingested and only 1..5 are drawn.
+    scale_factor: 1.0
+    add_offset: 0.0
+    fill_value: -127
+    vmin: 1.0
+    vmax: 5.0
+    # CATEGORICAL, and it changes three things that are otherwise automatic:
+    # the Mercator resample is nearest-neighbour rather than bilinear (blending
+    # a Cat 2 against a Cat 4 would invent a Cat 3 along every edge), the colour
+    # ramp is a `step` rather than an `interpolate`, and the displayed range is
+    # not user-adjustable — there is nothing between two categories to re-range.
+    categorical: true
+    # THE OFFICIAL NOAA PALETTE, not a colormap sampled at five points.
+    # Extracted from NOAA's own plain PNG for 2023-10-01 by matching every pixel
+    # against that date's NetCDF: all five categories matched 100%, as did the
+    # three non-heatwave classes (land #969696, ice #ffffff, no-heatwave
+    # #b3f2ff) — which this project draws transparent instead.
+    #
+    # `colors` replaces `colormap`: matplotlib has no say here, because the point
+    # of these five is that people already recognise them from NOAA's own maps.
+    colors:
+      - {value: 1, color: '#ffff80', label: Moderate}
+      - {value: 2, color: '#ffb333', label: Strong}
+      - {value: 3, color: '#ff8000', label: Severe}
+      - {value: 4, color: '#cc4d00', label: Extreme}
+      - {value: 5, color: '#991a00', label: Beyond extreme}
+    # The whole scale. A categorical range is not draggable, so this exists only
+    # so `range_limits()` has something bounded to report.
+    limits: [1.0, 5.0]
+    # One byte holding the category itself, so code == value. Land, ice and
+    # no-heatwave ocean are all NaN before encoding and land in **alpha 0** —
+    # transparent, as asked: the only thing this layer draws is a heatwave.
+    #
+    # There is no sentinel, but the ramp is still tabulated over the *whole*
+    # encoding range (0..255) rather than over 1..5, so that ramp entry k is
+    # exactly code k. Tabulating 256 entries over 1..5 would put code 2 at entry
+    # 63.75 and let a Cat 2 pick up Cat 1's colour. See `SERVER.py`'s /domain.
+    encoding:
+      channels: [R]
+      scale: 1.0
+      offset: 0.0
 
 # Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
 # degrees_east (0-360) / degrees_north, and all of them fit inside `subset`.

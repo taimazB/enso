@@ -72,11 +72,18 @@ def bounds() -> dict:
     }
 
 
-def to_mercator(field: np.ndarray, width: int = DEFAULT_WIDTH) -> np.ndarray:
+def to_mercator(
+    field: np.ndarray, width: int = DEFAULT_WIDTH, nearest: bool = False
+) -> np.ndarray:
     """Resample a lat-linear field onto an evenly spaced Mercator y axis.
 
     Returns a north-up array; the input's row 0 is the *southern* edge, as
     `shared.fields` guarantees.
+
+    `nearest` samples instead of blending, and is required for a **categorical**
+    field. Blending a Cat 2 against a Cat 4 produces a 3, which rounds to a real
+    category the source never contained — a ring of spurious Cat 3 around every
+    Cat 4 core. There is nothing between two classes to interpolate.
     """
     box = subset()
     extent = bounds()
@@ -91,25 +98,32 @@ def to_mercator(field: np.ndarray, width: int = DEFAULT_WIDTH) -> np.ndarray:
     lat = np.degrees(2 * np.arctan(np.exp(y)) - np.pi / 2)
 
     src = (lat - box.lat_min) / res
-    i0 = np.clip(np.floor(src).astype("int32"), 0, box.nlat - 1)
-    i1 = np.clip(i0 + 1, 0, box.nlat - 1)
-    w = (src - i0).astype("float32")[:, None]
+    if nearest:
+        out = field[np.clip(np.rint(src).astype("int32"), 0, box.nlat - 1)]
+    else:
+        i0 = np.clip(np.floor(src).astype("int32"), 0, box.nlat - 1)
+        i1 = np.clip(i0 + 1, 0, box.nlat - 1)
+        w = (src - i0).astype("float32")[:, None]
 
-    a, b = field[i0], field[i1]
-    out = a * (1 - w) + b * w
-    # Linear blending propagates NaN from either neighbour, which would erode a
-    # pixel of ocean along every coastline; fall back to whichever side is real.
-    out = np.where(np.isnan(out), np.where(np.isnan(a), b, a), out)
+        a, b = field[i0], field[i1]
+        out = a * (1 - w) + b * w
+        # Linear blending propagates NaN from either neighbour, which would erode
+        # a pixel of ocean along every coastline; fall back to whichever side is
+        # real.
+        out = np.where(np.isnan(out), np.where(np.isnan(a), b, a), out)
 
     if width != box.nlon:
         # Longitude is linear in Mercator x, so this is a plain horizontal resize.
         src_x = (np.arange(width) + 0.5) / width * box.nlon - 0.5
-        j0 = np.clip(np.floor(src_x).astype("int32"), 0, box.nlon - 1)
-        j1 = np.clip(j0 + 1, 0, box.nlon - 1)
-        wx = (src_x - j0).astype("float32")[None, :]
-        a, b = out[:, j0], out[:, j1]
-        blended = a * (1 - wx) + b * wx
-        out = np.where(np.isnan(blended), np.where(np.isnan(a), b, a), blended)
+        if nearest:
+            out = out[:, np.clip(np.rint(src_x).astype("int32"), 0, box.nlon - 1)]
+        else:
+            j0 = np.clip(np.floor(src_x).astype("int32"), 0, box.nlon - 1)
+            j1 = np.clip(j0 + 1, 0, box.nlon - 1)
+            wx = (src_x - j0).astype("float32")[None, :]
+            a, b = out[:, j0], out[:, j1]
+            blended = a * (1 - wx) + b * wx
+            out = np.where(np.isnan(blended), np.where(np.isnan(a), b, a), blended)
 
     return out
 
@@ -139,8 +153,19 @@ def colorize(
     without a browser, and to build the legend stops below.
     """
     var = variable(variable_name)
-    cmap = matplotlib.colormaps[var.colormap].with_extremes(bad=(0, 0, 0, 0))
-    norm = matplotlib.colors.Normalize(vmin=var.vmin, vmax=var.vmax, clip=True)
+    if var.colors:
+        # A categorical variable has no colormap to normalise against: its
+        # classes are integers, so the boundaries go between them.
+        cmap = matplotlib.colors.ListedColormap([c.color for c in var.colors])
+        cmap = cmap.with_extremes(bad=(0, 0, 0, 0))
+        norm = matplotlib.colors.BoundaryNorm(
+            [c.value - 0.5 for c in var.colors] + [var.colors[-1].value + 0.5],
+            cmap.N,
+            clip=True,
+        )
+    else:
+        cmap = matplotlib.colormaps[var.colormap].with_extremes(bad=(0, 0, 0, 0))
+        norm = matplotlib.colors.Normalize(vmin=var.vmin, vmax=var.vmax, clip=True)
     rgba = cmap(norm(np.ma.masked_invalid(field)), bytes=True)
     if no_clim is not None:
         rgba[no_clim] = NO_CLIM_RGBA
@@ -201,7 +226,7 @@ def encode(
     """
     var = variable(variable_name)
     enc = var.encoding
-    merc = to_mercator(field, width)
+    merc = to_mercator(field, width, nearest=var.categorical)
     has_value = np.isfinite(merc)
 
     # Ocean without a value on this variable — the ice fringe, which has SST but
@@ -280,8 +305,20 @@ def write_cache(path: Path, payload: bytes) -> None:
 
 
 def colormap_stops(variable_name: str = "sst", n: int = 33) -> list[dict]:
-    """Legend stops: evenly spaced values with their hex colours."""
+    """Legend stops: evenly spaced values with their hex colours.
+
+    For a **categorical** variable the stops are the classes themselves — one per
+    category, at its own integer value, in NOAA's own colours. They are still
+    evenly spaced, which is what lets the frontend re-label them onto a range the
+    same way it does a sampled colormap's; for a categorical that re-labelling is
+    the identity, because the range is not adjustable.
+    """
     var = variable(variable_name)
+    if var.colors:
+        return [
+            {"value": float(c.value), "color": c.color, "label": c.label}
+            for c in var.colors
+        ]
     cmap = matplotlib.colormaps[var.colormap]
     values = np.linspace(var.vmin, var.vmax, n)
     norm = matplotlib.colors.Normalize(vmin=var.vmin, vmax=var.vmax)

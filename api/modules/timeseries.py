@@ -20,6 +20,22 @@ main thing worth understanding here:
   The identity's precondition is that both sides average the *same* cells, which
   is what `sst_daily.has_clim` is for: about 3.2% of the box's ocean has SST but
   no climatology, and the ice edge that defines it moves through the year.
+
+`mhw` is stored, in its own table, but **sparsely**: only cells at category >= 1
+have a row. So absence is ambiguous — it is heatwave-free ocean, ice, or land —
+and every MHW query reads `mhw_daily` as the right side of a LEFT JOIN against
+`sst_daily`, which holds exactly the ocean cells for a date. That join is what
+supplies the zeros and excludes the land, and both tables are ordered
+`(gy, gx, date)`, so at a point it is a primary-key read on both sides.
+
+**How a bucket is reduced differs for `mhw`, and it has to.** A category is an
+ordinal class, and its mean is not one: a cell at Cat 1 for two days of seven
+averages to 0.29, which is no category at all. Weekly and monthly buckets take
+the **max**, matching `shared/buckets.py` — so a chart point and the map frame
+carrying the same date still agree, which is the invariant the whole period
+mechanism exists to keep. The two places this deliberately does not apply are
+noted where they occur: a region area-mean, which is no longer a category, and
+`/monthlyRanking`, which is asking a different question.
 """
 
 from __future__ import annotations
@@ -31,8 +47,23 @@ from shared.domain import global_grid, regions, subset, variable
 from .clickhouse_helpers import DATABASE, client
 from .periods import Period, bucket_sql
 
-# Queryable variables. `sst` is a stored ALIAS column; `anom` is derived.
-VARIABLES: tuple[str, ...] = ("sst", "anom")
+# Queryable variables. `sst` is a stored ALIAS column, `anom` is derived, and
+# `mhw` is stored in its own sparse table.
+VARIABLES: tuple[str, ...] = ("sst", "anom", "mhw")
+
+# The per-cell, per-date MHW category with its zeros restored.
+#
+# `sst_daily` is the authority on which cells are ocean on a given date, so it is
+# the left side; `mhw_daily` only carries category >= 1. A LEFT JOIN miss yields
+# ClickHouse's default for a UInt8 — 0 — which is exactly "ocean, no heatwave".
+# `ifNull` covers the case where a caller has `join_use_nulls` on.
+MHW_SOURCE = """
+    SELECT d.date AS date, toUInt8(ifNull(m.cat, 0)) AS value
+    FROM {db}.sst_daily AS d
+    LEFT JOIN {db}.mhw_daily AS m
+        ON m.gy = d.gy AND m.gx = d.gx AND m.date = d.date
+    WHERE d.gy = %(gy)s AND d.gx = %(gx)s{where}
+"""
 
 
 def check_variable(name: str) -> str:
@@ -99,7 +130,20 @@ def point_timeseries(
     grid = global_grid()
     gy, gx = int(grid.gy(lat)), int(grid.gx(lon))
 
-    if name == "sst":
+    if name == "mhw":
+        # `max`, not `avg`: see the module docstring. A daily bucket has one row
+        # per date either way, so this is one code path across all three periods
+        # and the chart cannot disagree with the map frame.
+        where, params = _date_filter(start, end, alias="d")
+        params |= {"gy": gy, "gx": gx}
+        sql = f"""
+            SELECT {bucket_sql(period)} AS bucket,
+                   max(value) AS value,
+                   count() AS n
+            FROM ({MHW_SOURCE.format(db=DATABASE, where=where)})
+            GROUP BY bucket ORDER BY bucket
+        """
+    elif name == "sst":
         where, params = _date_filter(start, end)
         params |= {"gy": gy, "gx": gx}
         sql = f"""
@@ -127,6 +171,9 @@ def point_timeseries(
         """
 
     rows = client().query(sql, parameters=params).result_rows
+    # Rounded to the variable's own precision rather than a fixed 2: `mhw` is an
+    # integer category and "3.0" invites the reader to look for a 3.4.
+    places = variable(name).precision
     return {
         "variable": name,
         "units": variable(name).units,
@@ -139,7 +186,7 @@ def point_timeseries(
             "lon": float(grid.lon(gx)),
         },
         "dates": [str(r[0]) for r in rows],
-        "values": [None if r[1] is None else round(float(r[1]), 2) for r in rows],
+        "values": [None if r[1] is None else round(float(r[1]), places) for r in rows],
         "n_days": [int(r[2]) for r in rows],
     }
 
@@ -173,6 +220,59 @@ def _region_clim_by_mmdd(key: str) -> dict[int, float]:
     return {int(m): float(v) for m, v in rows}
 
 
+def _region_mhw_daily(
+    gy0: int, gy1: int, gx0: int, gx1: int, where: str, params: dict
+) -> list[tuple]:
+    """Per-day cos(lat)-weighted mean MHW category over a box, and its cell count.
+
+    **Deliberately not a join.** `mhw_daily` is sparse, so a LEFT JOIN over a box
+    would put the whole box's ocean on the left — 14.55 B rows for the PDO domain
+    — to add zeros that contribute nothing to a sum. Instead the two halves of
+    the mean are computed separately and divided:
+
+        numerator   sum(cat * cos(lat))  over mhw_daily   -- sparse, cheap
+        denominator sum(cos(lat))        over sst_daily   -- the box's ocean
+
+    The denominator has to come from `sst_daily` because it is the only table
+    that knows which cells are ocean on a given date, and the ice edge moves. A
+    day with no heatwave anywhere in the box has no numerator row at all, and is
+    reported as a mean of 0 rather than dropped — "no heatwave" is a real answer,
+    not a gap.
+    """
+    box = {"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1}
+    weight = "cos(lat * pi() / 180)"
+
+    numerator = {
+        date: float(value)
+        for date, value in client().query(
+            f"""
+            SELECT date, sum(cat * {weight}) AS weighted
+            FROM {DATABASE}.mhw_daily
+            WHERE gy BETWEEN %(gy0)s AND %(gy1)s
+              AND gx BETWEEN %(gx0)s AND %(gx1)s{where}
+            GROUP BY date
+            """,
+            parameters=params | box,
+        ).result_rows
+        if value is not None
+    }
+
+    return [
+        (date, numerator.get(date, 0.0) / float(total), int(n_cells))
+        for date, total, n_cells in client().query(
+            f"""
+            SELECT date, sum({weight}) AS total, count() AS n_cells
+            FROM {DATABASE}.sst_daily
+            WHERE gy BETWEEN %(gy0)s AND %(gy1)s
+              AND gx BETWEEN %(gx0)s AND %(gx1)s{where}
+            GROUP BY date ORDER BY date
+            """,
+            parameters=params | box,
+        ).result_rows
+        if total
+    ]
+
+
 def region_timeseries(
     lat_bounds: tuple[float, float],
     lon_bounds: tuple[float, float],
@@ -192,6 +292,12 @@ def region_timeseries(
     For `anom` the daily mean is restricted to `has_clim = 1` and the
     climatology mean for each contributing day is subtracted — see the module
     docstring for why this is not a join.
+
+    **`mhw` buckets by mean, unlike a point.** Over a box the daily value is
+    already an area mean — a continuous "average severity across the region" —
+    and no longer a category, so there is nothing ordinal left for a max to
+    preserve. Taking the max of daily area means would turn the series into a
+    spike detector for the single worst day of each week.
     """
     name = check_variable(variable_name)
     grid = global_grid()
@@ -202,22 +308,25 @@ def region_timeseries(
     params |= {"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1}
     clim_filter = " AND has_clim = 1" if name == "anom" else ""
 
-    # For anomaly the per-day SST mean has to be formed before bucketing, so the
-    # climatology can be subtracted day by day; weekly/monthly means are then the
-    # mean of those daily anomalies. For SST the bucket mean can be taken
-    # directly.
-    rows = client().query(
-        f"""
-        SELECT date,
-               sum(sst * cos(lat * pi() / 180)) / sum(cos(lat * pi() / 180)) AS mean_sst,
-               count() AS n_cells
-        FROM {DATABASE}.sst_daily
-        WHERE gy BETWEEN %(gy0)s AND %(gy1)s
-          AND gx BETWEEN %(gx0)s AND %(gx1)s{clim_filter}{where}
-        GROUP BY date ORDER BY date
-        """,
-        parameters=params,
-    ).result_rows
+    if name == "mhw":
+        rows = _region_mhw_daily(gy0, gy1, gx0, gx1, where, params)
+    else:
+        # For anomaly the per-day SST mean has to be formed before bucketing, so
+        # the climatology can be subtracted day by day; weekly/monthly means are
+        # then the mean of those daily anomalies. For SST the bucket mean can be
+        # taken directly.
+        rows = client().query(
+            f"""
+            SELECT date,
+                   sum(sst * cos(lat * pi() / 180)) / sum(cos(lat * pi() / 180)) AS mean_sst,
+                   count() AS n_cells
+            FROM {DATABASE}.sst_daily
+            WHERE gy BETWEEN %(gy0)s AND %(gy1)s
+              AND gx BETWEEN %(gx0)s AND %(gx1)s{clim_filter}{where}
+            GROUP BY date ORDER BY date
+            """,
+            parameters=params,
+        ).result_rows
 
     if name == "anom":
         clim = clim_by_mmdd if clim_by_mmdd is not None else _box_clim_by_mmdd(gy0, gy1, gx0, gx1)
@@ -288,7 +397,10 @@ def coverage() -> dict:
         f"SELECT count(), min(date), max(date) FROM {DATABASE}.sst_daily"
     ).result_rows[0]
     if not row[0]:
-        return {"rows": 0, "start": None, "end": None, "days": 0, "climatology": None}
+        return {
+            "rows": 0, "start": None, "end": None, "days": 0,
+            "climatology": None, "mhw": None,
+        }
     days = client().query(
         f"SELECT uniqExact(date) FROM {DATABASE}.ingest_status FINAL "
         "WHERE status = 'success_ingest'"
@@ -296,11 +408,43 @@ def coverage() -> dict:
     clim_keys = client().query(
         f"SELECT uniqExact(mmdd) FROM {DATABASE}.sst_clim"
     ).result_rows[0][0]
+    mhw = client().query(
+        f"SELECT count(), min(date), max(date) FROM {DATABASE}.mhw_daily"
+    ).result_rows[0]
+    mhw_days = client().query(
+        f"SELECT uniqExact(date) FROM {DATABASE}.mhw_status FINAL "
+        "WHERE status = 'success_ingest'"
+    ).result_rows[0][0]
     return {
         "rows": int(row[0]),
         "start": str(row[1]),
         "end": str(row[2]),
         "days": int(days),
+        # The MHW archive is ingested separately and lands about 90 minutes later,
+        # so it gets its own range rather than being assumed to match.
+        #
+        # `complete` is the counterpart of `climatology.complete`, and it exists
+        # for a sharper reason. `mhw_daily` is SPARSE — only category >= 1 has a
+        # row — so every query restores the zeros with a LEFT JOIN against
+        # `sst_daily`. That join cannot tell "this cell had no heatwave" from
+        # "this date was never ingested": a half-backfilled archive reports a
+        # confident **category 0** for every missing year, and a monthly ranking
+        # then ranks 40 fabricated zeroes below one real month. There is no value
+        # that could signal the difference, so the frontend must not offer the
+        # variable until the archive covers the SST record. A day's tolerance,
+        # because MHW is published about 90 minutes after CoralTemp and a run
+        # landing between the two leaves a one-day gap that is not a hole.
+        #
+        # Guarded on the count, not on a null date: ClickHouse's min/max over an
+        # empty Date column return the epoch, not NULL, so an un-ingested MHW
+        # table would otherwise advertise coverage from 1970-01-01.
+        "mhw": {
+            "rows": int(mhw[0]),
+            "days": int(mhw_days),
+            "start": str(mhw[1]) if mhw[0] else None,
+            "end": str(mhw[2]) if mhw[0] else None,
+            "complete": bool(mhw[0]) and int(mhw_days) >= int(days) - 1,
+        },
         # Anomaly is unavailable until all 366 keys are loaded; the frontend
         # uses this to decide whether to offer the variable at all.
         "climatology": {"keys": int(clim_keys), "complete": int(clim_keys) == 366},
@@ -366,7 +510,14 @@ def monthly_ranking(
     if edges is not None:
         lo, hi = edges
         partial = _partial_months(lo, hi)
-        if name == "sst":
+        if name == "mhw":
+            # **Mean, not max** — the one place `mhw` is deliberately averaged.
+            # This ranks years against each other, and a max would put half the
+            # archive on Cat 1 and rank nothing. The mean daily category over a
+            # month is a severity-days index: it separates a month with one bad
+            # week from one that spent all of it at Cat 1.
+            source = MHW_SOURCE.format(db=DATABASE, where="")
+        elif name == "sst":
             source = f"""
                 SELECT date, sst AS value FROM {DATABASE}.sst_daily
                 WHERE gy = %(gy)s AND gx = %(gx)s

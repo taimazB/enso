@@ -1,8 +1,8 @@
 # Pacific Sea Surface Temperature
 
-Daily sea-surface temperature and anomaly for the Pacific basin, from **NOAA Coral Reef
-Watch CoralTemp v3.1**, ingested into ClickHouse and served as an interactive map plus
-point and region timeseries.
+Daily sea-surface temperature, anomaly and marine-heatwave category for the Pacific basin,
+from **NOAA Coral Reef Watch**, ingested into ClickHouse and served as an interactive map
+plus point and region timeseries.
 
 **0.05° resolution, 1985-01-01 onward**, one NetCDF per day in `./data/sst/`. The ingested box
 is **60°S–65°N, 100°E–290°E** — 7.5 million ocean cells per day. That covers the Coral
@@ -13,6 +13,13 @@ Antarctic Circumpolar Current at Pacific longitudes.
 against a separate 366-file **1991–2020 daily climatology** in `./data/climatology/`, one per
 day-of-year including 29 February. All four Niño indices (1+2, 3, 3.4, 4) fall inside the
 domain.
+
+**Marine heatwave category is a second daily product**, NOAA CRW MHW v1.0.1, in
+`./data/MHW/` — the same grid and the same days. Both publish at roughly one day's
+latency, MHW landing about 90 minutes after CoralTemp.
+It is an ordinal class from 1 (Moderate) to 5 (Beyond Extreme), drawn in NOAA's own
+palette; land, ice and heatwave-free ocean are all transparent, and only category ≥ 1 is
+stored.
 
 ## Services
 
@@ -64,9 +71,10 @@ a date that is not published yet is a no-op, not a failure.
 |---|---|
 | ocean cells/day | 7,477,923 (96.8% with a climatology) |
 | daily archive | ~113.7 B rows, ~85 GB |
+| marine heatwave | ~24.2 B rows (only category ≥ 1 is stored; 1.59 M cells/day) |
 | climatology | 2.68 B rows, 2.2 GB |
-| NetCDF on disk | ~153 GB for 15,212 days |
-| images | ~36k WebPs (2 variables × 3 periods) |
+| NetCDF on disk | ~153 GB SST + ~9.7 GB MHW for 15,213 days |
+| images | ~54k WebPs (3 variables × 3 periods) |
 
 ## Layout
 
@@ -76,7 +84,8 @@ front/       Nuxt 4 frontend (everything under front/app/)
 process/     CRW.cli download / ingest / render pipeline
 shared/      grid geometry, NetCDF reading, rendering, schema — mounted into api and process
 clickhouse/  local ClickHouse volumes and user config
-data/sst/          the daily NetCDF archive, pruned to a retention window (untracked)
+data/sst/          the daily SST NetCDF archive, pruned to a retention window (untracked)
+data/MHW/          the daily marine-heatwave archive, pruned the same way (untracked)
 data/climatology/  the 366-file 1991-2020 daily climatology, kept forever (untracked)
 data/images/       the rendered image cache (untracked)
 ```
@@ -88,7 +97,7 @@ curl localhost:9021/health
 curl localhost:9021/coverage
 curl localhost:9021/domain
 
-# variable is sst (default) or anom; period is daily / weekly / monthly
+# variable is sst (default), anom or mhw; period is daily / weekly / monthly
 curl -X POST localhost:9021/timeseries \
   -H 'content-type: application/json' \
   -d '{"lat": 0.0, "lon": 200.0, "variable": "anom", "period": "monthly"}'
@@ -97,6 +106,11 @@ curl "localhost:9021/region/nino34?variable=anom&period=monthly"
 
 curl -o day.webp "localhost:9021/image/2026-08-24.webp?variable=anom&period=weekly"
 ```
+
+`mhw` buckets differently from the other two, and deliberately: a point and the map take
+the **max** category over a week or month (a category's mean is not a category), while a
+region takes the mean of its daily area means, and `/monthlyRanking` ranks a month by its
+mean daily category.
 
 Full endpoint notes, schema rationale and gotchas: [CLAUDE.md](CLAUDE.md).
 
