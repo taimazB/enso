@@ -294,7 +294,7 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | liveness + ClickHouse reachability |
-| `GET /domain` | grid extent, image bounds, variable metadata, per-variable colour stops, `noClimColor`, region list |
+| `GET /domain` | grid extent, image bounds, variable metadata, per-variable colour stops and `encoding` (mix, ranges, `limits`), `noClimColor`, region list |
 | `GET /coverage` | ingested date range, row count, climatology completeness |
 | `GET /variables` | variable list, with `derived` on `anom` |
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
@@ -411,6 +411,20 @@ no meaningful midpoint, so a diverging map would invent one at 15 °C and read a
 field. Since the images carry data rather than colour, changing either range or colormap now
 only needs an API restart — **the image cache is not invalidated by a palette change.**
 
+`vmin`/`vmax` are only where the scale **opens**: the displayed range is adjustable in the
+browser (see the colour range control below), and `domain.yml`'s pair is the default and
+what Reset returns to. The colormap is not adjustable — the ramp is matplotlib's, evaluated
+server-side.
+
+**`limits` is the span the user may drag that range over, and it is deliberately not the
+encoding's.** `sst` packs into two bytes at 0.01 °C and can therefore represent −5…650 °C,
+which is arithmetic rather than oceanography — a control bounded by it would spend 95% of
+its travel above the boiling point. So `sst` declares `limits: [-2, 36]` (the freezing point
+of seawater; 36 clears the warmest ocean SST anywhere, and this box peaks near 32) and
+`anom` omits the key and falls back to its encoding, ±12.7, which is already physical.
+`Variable.range_limits()` clips whatever is declared to what is encodable, and `/domain`
+ships the result as `encoding.limits`.
+
 ### Frontend (`front/`)
 
 Nuxt 4 + Nuxt UI v4 (Tailwind v4) + Pinia + MapboxGL + ECharts, dark mode pinned — the
@@ -421,7 +435,7 @@ app/app.vue                        header + coverage badge; awaits store.loadMet
 app/pages/index.vue                map + point chart rail on the left, ranks dock on the right
 app/components/AnomalyMap.vue      MapboxGL + the field image source
 app/components/TimeControl.vue     variable + period toggles, date stepper, playback
-app/components/ColorLegend.vue     gradient from the active variable's colorStops
+app/components/ColorLegend.vue     gradient + the colour range control (popover)
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
 app/components/SideDock.vue        resizable right-hand dock (drag handle, remembered width)
@@ -449,6 +463,52 @@ partly-loaded climatology would blank the missing dates rather than fail, which 
 The monthly ranking **refetches on a variable change** but not on a period change: ranking
 years by absolute SST is a different question from ranking by anomaly, whereas the ranking
 is period-independent by construction.
+
+#### The colour range control
+
+**The displayed range is a user setting, per variable, and this is what the value-encoded
+imagery is for.** Clicking the legend's gradient opens a popover (`ColorLegend.vue`) with a
+two-handle slider, exact min/max number fields, and Reset. Narrowing `sst` to 20–30 recolours
+the map instantly and **issues no network request at all** — verified in Chromium, zero
+`/image` fetches — because the frame on screen carries the value and Mapbox re-applies the
+ramp. Nothing in the cache is invalidated, and the range is not part of the image URL's key.
+
+The range lives in `store.scales` and everything reads it through one getter, so the map,
+the legend and the ranking dots cannot disagree about what a colour means:
+
+- **`stopsFor(v)`** spreads `/domain`'s stops over the range in force. The server samples
+  the colormap at 33 **evenly spaced** points (`render.colormap_stops`), so stop *i* is the
+  colormap at `t = i/32` and re-labelling those same colours onto a new range is exact.
+  **The frontend never evaluates a colormap** — that stays matplotlib's job, server-side,
+  which is why there is no colormap picker.
+- **`colorRangeFor(v)`** mirrors the conditional in `/domain` and must stay conditional:
+  `anom` has a sentinel, so it keeps tabulating its whole encoding span (code 0 needs a slot
+  of its own) and its `raster-color-range` **never follows the display range**; `sst` has
+  none, so its does.
+- **`scaleBoundsFor(v)`** is `encoding.limits`, with the low end stepping over the sentinel
+  so a user's `vmin` can never land on the grey no-climatology entry and overwrite it.
+- **`setScale`** owns all clamping, so the slider and a typed value are constrained
+  identically. It holds the ends at least one step apart — a zero-width range makes the
+  ramp's interpolation degenerate and the map undrawable.
+
+Three things here fail in ways worth knowing about, all found by driving the browser:
+
+- **The ramp's sentinel anchor collides at full range.** `anom`'s ramp is grey at −12.8,
+  then the first scale colour at −12.7; drag `vmin` to its floor and the first *stop* is
+  also −12.7, and Mapbox rejects an `interpolate` with two identical inputs — taking down
+  the whole layer, not just the pair. `AnomalyMap.vue` skips the anchor when the first stop
+  has already reached it.
+- **The control's step is deliberately not the encoding's** (`rangeStep`, `max(scale, 0.1)`).
+  `sst` encodes at 0.01 °C, which is right for the data and absurd for a slider: one arrow
+  press would move a hundredth of a degree and crossing the range would take 3800 of them.
+  Slider and number fields share the one step, so a typed value can never sit off the
+  slider's grid and get silently snapped.
+- **Quantising needs the quotient settled first.** `12.7 / 0.1` is `126.99999999999999`, so
+  a bare `Math.floor` quietly shaves the top step off the anomaly's range.
+
+Persistence follows `SideDock`'s convention — `localStorage`, key `enso.scale.<variable>`,
+read once from `ColorLegend`'s `onMounted` (**not** `loadMetadata()`, which runs under SSR)
+and re-clamped on read, since the encoding may have moved since it was written.
 
 **The monthly-ranking browser lives in a dock beside the map**, not over it. It needs
 full page height — one month of ~45 years is already taller than the chart rail — but it

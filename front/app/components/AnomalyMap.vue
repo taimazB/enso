@@ -80,7 +80,9 @@ function currentUrl(): string | null {
  */
 function rasterPaint(name: VariableName): Record<string, unknown> {
   const enc = store.domain!.variables[name]!.encoding
-  const stops = store.domain!.colorStops[name]
+  // Both go through the store rather than /domain directly: the displayed range
+  // is a user setting, and `stopsFor` spreads the server's colours over it.
+  const stops = store.stopsFor(name)
 
   const ramp: Array<unknown> = ['interpolate', ['linear'], ['raster-value']]
   if (enc.sentinel !== null) {
@@ -90,7 +92,13 @@ function rasterPaint(name: VariableName): Record<string, unknown> {
     // whole encoding step below the first real code, so the ramp cannot blend
     // the two.
     ramp.push(enc.range[0], store.domain!.noClimColor)
-    ramp.push(enc.range[0] + enc.scale, stops[0]!.color)
+    // The anchor that ends the sentinel's flat grey and starts the scale. It is
+    // skipped when the user has dragged vmin down onto it, because the first
+    // real stop is then already at that value and already that colour —
+    // `interpolate` rejects two entries with the same input, which took the
+    // whole layer down rather than just the one pair.
+    const anchor = enc.range[0] + enc.scale
+    if (stops[0]!.value > anchor) ramp.push(anchor, stops[0]!.color)
   }
   for (const stop of stops) ramp.push(stop.value, stop.color)
 
@@ -99,7 +107,7 @@ function rasterPaint(name: VariableName): Record<string, unknown> {
     'raster-fade-duration': 0,
     'raster-resampling': 'nearest',
     'raster-color-mix': enc.mix,
-    'raster-color-range': enc.colorRange,
+    'raster-color-range': store.colorRangeFor(name),
     'raster-color': ramp,
   }
 }
@@ -184,6 +192,13 @@ watch(() => [store.selectedDate, store.period, store.variable], () => {
   }
   else if (map.isStyleLoaded()) addRaster()
 })
+
+// A range change is a repaint and nothing more — deliberately separate from the
+// watcher above, which also swaps the image. The frame on screen carries the
+// value, not the colour, so re-ranging never needs another byte from /image;
+// calling updateImage here would flash the basemap and refetch a frame the
+// browser already has, for a result identical to setting the paint property.
+watch(() => store.activeScale, applyPaint, { deep: true })
 
 onBeforeUnmount(() => {
   resize?.disconnect()

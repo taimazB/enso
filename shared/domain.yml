@@ -67,6 +67,12 @@ variables:
     vmin: -2.0
     vmax: 32.0
     colormap: turbo
+    # How far the user may drag the displayed range, which is NOT the encoding's
+    # limit: two bytes at 0.01 degC reach 650 degC, and a control bounded by that
+    # would be almost entirely above the boiling point. -2 is the freezing point
+    # of seawater and the data's own floor; 36 clears the warmest ocean SST
+    # anywhere on Earth, and the Pacific box peaks near 32.
+    limits: [-2.0, 36.0]
     # How the value is packed into the WebP the map consumes. The image carries
     # DATA, not colour: Mapbox does the colouring with `raster-color`, so the
     # palette and the displayed range are client-side settings and changing

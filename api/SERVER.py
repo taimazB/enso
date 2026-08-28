@@ -137,6 +137,11 @@ def domain() -> dict:
                         if v.encoding.sentinel is not None
                         else [v.vmin, v.vmax]
                     ),
+                    # How far the user may move the displayed range. The map is
+                    # re-ranged client-side — the images carry data, not colour —
+                    # and this bounds that control. Not the same as `range`:
+                    # what the bytes can hold is not what is worth showing.
+                    "limits": list(v.range_limits()),
                 },
             }
             for name, v in variables().items()

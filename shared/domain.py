@@ -111,6 +111,26 @@ class Variable:
     encoding: Encoding
     # `anom` is computed as `sst - climatology(mmdd)` rather than stored.
     derived: bool = False
+    # How far the *user* may move the displayed colour range, as opposed to
+    # `vmin`/`vmax`, which are only where it opens. The frontend re-ranges the
+    # map client-side — the images carry data, not colour — and this is what
+    # bounds that control. Optional: absent, it falls back to `encoding` limits.
+    #
+    # It exists because the two are not the same question. `sst` packs into two
+    # bytes at 0.01 degC and can therefore represent up to 650 degC, which is
+    # arithmetic, not oceanography — a slider bounded by it would spend 95% of
+    # its travel above the boiling point. `anom` has no such gap, so it can and
+    # does simply omit this.
+    limits: tuple[float, float] | None = None
+
+    def range_limits(self) -> tuple[float, float]:
+        """Bounds for a user-chosen display range, clipped to what is encodable."""
+        low, high = self.encoding.value_range()
+        # Never past the encoding: a range the image cannot represent would show
+        # a span of colour that no pixel can ever land in.
+        if self.limits is None:
+            return low, high
+        return max(self.limits[0], low), min(self.limits[1], high)
 
 
 @dataclass(frozen=True)
@@ -196,6 +216,8 @@ def variables() -> dict[str, Variable]:
         cfg = dict(cfg)
         enc = dict(cfg.pop("encoding"))
         enc["channels"] = tuple(enc["channels"])
+        if cfg.get("limits") is not None:
+            cfg["limits"] = tuple(cfg["limits"])
         out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
     return out
 
