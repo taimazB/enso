@@ -33,4 +33,4 @@ COPY shared ./shared
 # docker-compose may pass a host UID via `user:`; keep /app writable for it.
 RUN chmod -R a+rwX /app
 
-CMD ["sleep", "infinity"]
+# CMD ["sleep", "infinity"]

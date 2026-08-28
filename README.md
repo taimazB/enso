@@ -38,8 +38,8 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
   python -m CRW.cli backfill --reverse
 
 # render the image cache — must run while the NetCDF is still on disk
-docker compose -f docker-compose.dev.yml --env-file .env.dev exec api \
-  python prerender.py --workers 12
+docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm --no-deps process \
+  python -m CRW.cli render --workers 12
 ```
 
 Then open http://localhost:9020.

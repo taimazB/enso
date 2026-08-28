@@ -46,6 +46,7 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
 python -m CRW.cli init                                    # tables + climatology + region means
 python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested
 python -m CRW.cli backfill [--start|--end] [--reverse] [--fresh] [--delete-nc]
+python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts
 ```
@@ -60,14 +61,25 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev exec db-ch \
   clickhouse-client --database enso --query "SHOW TABLES"
 ```
 
-**Pre-render the image cache** (`api/prerender.py`):
+**Render the image cache in bulk:**
 ```bash
-docker compose -f docker-compose.dev.yml --env-file .env.dev exec api \
-  python prerender.py --workers 12   # --variable/--period/--start/--end/--width/--force
+docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm --no-deps process \
+  python -m CRW.cli render --workers 12
 ```
 **This reads NetCDF, not ClickHouse**, so it has a hard prerequisite: the daily archive
 must still be on disk. Run it before `backfill --delete-nc` and before the daily retention
 prune has eaten the range. Afterwards the source for those frames is gone.
+
+`render` and `run` are the same code path — both go through `imaging.bucket_mean()`, so
+a change to how a week is averaged cannot apply to one and not the other. `run` renders
+the date it just ingested; `render` walks history in a `spawn` pool. It touches neither
+ClickHouse nor the network (hence `--no-deps`), so it is safe to run against a
+half-finished backfill — though the two contend for the same `./data` mount, ingest being
+disk-bound and rendering CPU-bound.
+
+Only **closed** buckets are written: a week or month whose last day is past the end of
+the archive is still filling, and caching it would freeze a mean over however many days
+happen to be present. `run` rewrites those daily until they close.
 
 **Frontend (outside Docker):**
 ```bash
@@ -596,9 +608,16 @@ values; `dataZoom` is what makes that browsable.
   500s under no real load, and a **map that silently keeps showing the previous frame** —
   Mapbox's `ImageSource` never retries a failed image and logs the error only to the
   browser console.
-- **`prerender.py` runs its pool under `multiprocessing`'s `spawn` context.** Workers each
-  open their own NetCDF handles and HDF5 is not fork-safe once a file has been touched in
-  the parent.
+- **`CRW.cli render` runs its pool under `multiprocessing`'s `spawn` context.** Workers
+  each open their own NetCDF handles and HDF5 is not fork-safe once a file has been
+  touched in the parent.
+- **`/image` renders on demand but never caches** (`api/modules/render.py`). Only
+  `process` writes the cache, because only it knows whether the retention window still
+  holds days that have yet to land in a bucket. So an unrendered bucket costs ~2.9 s
+  (daily) to ~8.7 s (monthly) on **every** request, and the browser's playback prefetch
+  warms 8 frames at a time — enough to saturate the API's thread pool and stall unrelated
+  requests behind it. Symptom: the map is slow, `data/images/` is empty, and a `curl` to
+  the API appears to hang. Fix is to run `CRW.cli render`.
 
 ## Status / not yet built
 
@@ -641,6 +660,6 @@ ranking grid first shipped blank because its canvas sits inside `<ClientOnly>`, 
 `container.value` was still null at `onMounted` and nothing ever observed it. Watch the
 template ref, not the mount.
 
-Not built yet: the full-archive backfill and prerender pass (in progress), the region-query
+Not built yet: the full-archive backfill and render pass (in progress), the region-query
 benchmark that decides whether `region_daily` is needed, a cron entry for `run`, production
 compose files, PostHog analytics, tests.

@@ -30,7 +30,7 @@ export function useApi() {
     /**
      * Always browser-facing: this URL is handed to Mapbox, not fetched here.
      *
-     * `width` must match what `prerender.py` was run with — the cache is keyed
+     * `width` must match what `CRW.cli render` was run with — the cache is keyed
      * by (variable, period, bucket start, width), so a different width is a
      * different file, and for a historical bucket there is no NetCDF left to
      * render one from. A mismatch shows up as a 404 and a blank map, not as a

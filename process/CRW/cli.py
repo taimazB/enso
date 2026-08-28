@@ -3,12 +3,22 @@
     python -m CRW.cli init                          # schema + climatology + region means
     python -m CRW.cli scan     [--limit N]          # what is on disk vs. ingested
     python -m CRW.cli backfill [--start/--end]      # ingest local files
-    python -m CRW.cli run      [--date ...]         # download + ingest + image
+    python -m CRW.cli render   [--start/--end]      # render images in bulk
+    python -m CRW.cli run      [--date ...]         # download + ingest + render
     python -m CRW.cli status   [--date ...]
 
-`run` is the daily job. `backfill` is its one-time counterpart over an archive
-already on disk, and tolerates a partial one — the bulk download can still be in
-flight; re-running picks up whatever has since arrived.
+`run` is the daily job: for each date it downloads, ingests, then renders that
+date's buckets. `backfill` and `render` are its one-time counterparts over an
+archive already on disk — the same two halves of `run`, split so each can
+saturate a different resource. Ingest is disk-bound at ~3 s a day; rendering is
+CPU-bound at ~2.8 s a frame, and `render` runs it across a pool.
+
+`backfill` tolerates a partial archive — the bulk download can still be in
+flight; re-running picks up whatever has since arrived. So does `render`.
+
+**`render` must run before the NetCDF goes.** Images are built from the daily
+files, never from ClickHouse, so `backfill --delete-nc` or a retention prune
+over a range destroys the only source those frames can come from.
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ import sys
 
 import httpx
 from shared.ch import DATABASE, ensure_schema, get_client
+from shared.periods import PERIODS
 from shared.render import DEFAULT_WIDTH
 
 from . import climatology, config, download, imaging, ingest, status as status_mod
@@ -138,6 +149,66 @@ def cmd_backfill(args) -> int:
         )
     )
     return 1 if counts["failed"] else 0
+
+
+def cmd_render(args) -> int:
+    """Render every closed bucket in the range, in parallel.
+
+    Touches neither ClickHouse nor the network — it reads the NetCDF archive and
+    writes the image cache, so it is safe to run against a half-finished
+    backfill and needs no schema.
+    """
+    try:
+        lo, hi = imaging.archive_range()
+    except ValueError as exc:
+        print(exc)
+        return 1
+    if args.start:
+        lo = max(lo, args.start)
+    if args.end:
+        hi = min(hi, args.end)
+    if args.date:
+        lo = hi = args.date
+    if lo > hi:
+        print(f"empty range: {lo} .. {hi}")
+        return 1
+
+    periods = tuple(args.period or PERIODS)
+    variables = tuple(args.variable or imaging.VARIABLES)
+
+    def progress(done, total, written, elapsed):
+        rate = done / elapsed if elapsed else 0.0
+        eta = (total - done) / rate if rate else 0.0
+        print(f"  {done}/{total}  {rate:.1f}/s  eta {eta / 60:.1f}m  "
+              f"{written / 1e6:.0f} MB", flush=True)
+
+    print(f"archive {lo} .. {hi} | variables {','.join(variables)} | "
+          f"periods {','.join(periods)} | width {args.width}")
+
+    counts = imaging.render_range(
+        lo, hi,
+        variables=variables,
+        periods=periods,
+        width=args.width,
+        workers=args.workers,
+        force=args.force,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        progress=progress,
+    )
+
+    print(f"{counts['pending']} to render, {counts['skipped']} already cached")
+    if args.dry_run:
+        return 0
+    print(
+        "rendered {rendered} image(s), {mb:.0f} MB in {mins:.1f}m".format(
+            rendered=counts["rendered"],
+            mb=counts["bytes"] / 1e6,
+            mins=counts["seconds"] / 60,
+        )
+        + (f"; {counts['empty']} bucket(s) had no NetCDF" if counts["empty"] else "")
+    )
+    return 0
 
 
 def _process_date(client, http, date, *, force, keep_nc, width) -> str:
@@ -281,7 +352,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="truncate sst_daily and ingest_status first")
     p_back.set_defaults(func=cmd_backfill)
 
-    p_run = sub.add_parser("run", help="download + ingest + image")
+    p_rend = with_selection(sub.add_parser("render", help="render images in bulk"))
+    p_rend.add_argument("--period", action="append", choices=PERIODS,
+                        help="repeatable; default all three")
+    p_rend.add_argument("--variable", action="append", choices=imaging.VARIABLES,
+                        help="repeatable; default both")
+    p_rend.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    p_rend.add_argument("--workers", type=int, default=imaging.default_workers(),
+                        help="pool size (default: half the cores)")
+    p_rend.add_argument("--force", action="store_true",
+                        help="re-render buckets already cached")
+    p_rend.add_argument("--dry-run", action="store_true")
+    p_rend.set_defaults(func=cmd_render)
+
+    p_run = sub.add_parser("run", help="download + ingest + render")
     p_run.add_argument("--date", type=_parse_date,
                        help="a single day; without it, every day from the last "
                             "ingested through yesterday, plus a revision recheck")

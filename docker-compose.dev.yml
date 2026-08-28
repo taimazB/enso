@@ -110,6 +110,3 @@ services:
     depends_on:
       db-ch:
         condition: service_healthy
-    # No long-running work yet — ingest is invoked on demand:
-    #   docker compose run --rm process python -m OISST.cli ingest
-    command: ["sleep", "infinity"]

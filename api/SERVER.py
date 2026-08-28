@@ -308,7 +308,7 @@ def image(
     rebuilding an old bucket here would be a partition scan over billions of
     rows. A cache miss with no NetCDF left on disk is a 404 — deliberately, so
     a missing frame is a fast error rather than a hung request. Re-rendering
-    history means re-downloading the range and running `prerender.py`.
+    history means re-downloading the range and running `CRW.cli render`.
 
     There is no tile pyramid; the Pacific box is one image, and a pyramid can be
     added behind the same URL shape later.
