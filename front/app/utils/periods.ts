@@ -54,11 +54,6 @@ export function shiftBuckets(date: string, period: Period, n: number): string {
   return iso(d)
 }
 
-/** How many buckets make up roughly a year — the double-arrow step. */
-export function bucketsPerYear(period: Period): number {
-  return period === 'daily' ? 365 : period === 'weekly' ? 52 : 12
-}
-
 /** Human label for the bucket containing `date`, e.g. `May 2024`. */
 export function bucketLabel(date: string, period: Period): string {
   const start = utc(bucketStart(date, period))

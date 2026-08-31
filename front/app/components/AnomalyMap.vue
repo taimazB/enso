@@ -465,6 +465,8 @@ onMounted(() => {
   map = new mapboxgl.Map({
     container: container.value,
     style: 'mapbox://styles/mapbox/dark-v11',
+    minZoom: 1,
+    maxZoom:6,
     // Globe by default, opened on the North Pacific. `bounds` and `center`/`zoom`
     // are alternatives, not both — see `frame()` for why each projection gets
     // its own.

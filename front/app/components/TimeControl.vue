@@ -35,15 +35,6 @@
 
     <div class="flex items-center gap-1">
       <UButton
-        icon="i-mdi-chevron-double-left"
-        variant="ghost"
-        color="neutral"
-        size="xs"
-        :disabled="atStart"
-        title="Back one year"
-        @click="step(-bucketsPerYear(store.period))"
-      />
-      <UButton
         icon="i-mdi-chevron-left"
         variant="ghost"
         color="neutral"
@@ -69,14 +60,18 @@
         :disabled="atEnd"
         @click="step(1)"
       />
+
+      <!-- The end of coverage in whatever period is in force, not a raw date:
+           `latest` is the bucket the map can actually show, so in a monthly view
+           this lands on the first of the month the archive ends in. -->
       <UButton
-        icon="i-mdi-chevron-double-right"
+        icon="i-mdi-skip-next"
         variant="ghost"
         color="neutral"
         size="xs"
-        :disabled="atEnd"
-        title="Forward one year"
-        @click="step(bucketsPerYear(store.period))"
+        :disabled="!latest || atEnd"
+        :title="latest ? `Jump to the latest ${periodWord} frame` : 'Coverage unknown'"
+        @click="goLatest()"
       />
     </div>
 
@@ -135,7 +130,7 @@
 
 <script setup lang="ts">
 import { useMainStore } from '~/stores/main'
-import { PERIODS, bucketLabel, bucketStart, bucketsPerYear, shiftBuckets } from '~/utils/periods'
+import { PERIODS, bucketLabel, bucketStart, shiftBuckets } from '~/utils/periods'
 import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
 import { cellSlug, downloadCsv, seriesCsv, slug } from '~/utils/csv'
 
@@ -181,7 +176,8 @@ const dateInput = computed({
 // usually start before / end after the ingested range, so comparing raw dates
 // would leave the arrows enabled forever.
 const atStart = computed(() => store.selectedDate === snapped(store.coverage?.start))
-const atEnd = computed(() => store.selectedDate === snapped(store.coverage?.end))
+const latest = computed(() => snapped(store.coverage?.end))
+const atEnd = computed(() => store.selectedDate === latest.value)
 
 function snapped(iso: string | null | undefined): string | null {
   return iso ? bucketStart(iso, store.period) : null
@@ -197,6 +193,12 @@ function clamp(iso: string): string {
 function step(buckets: number) {
   if (!store.selectedDate) return
   store.setDate(clamp(shiftBuckets(store.selectedDate, store.period, buckets)))
+}
+
+// Like the arrows, this does not stop playback: the playhead is just repeated
+// `store.setDate()`, so a jump relocates it rather than fighting it.
+function goLatest() {
+  if (latest.value) store.setDate(latest.value)
 }
 
 const canExport = computed(() => (store.activeSeries?.dates.length ?? 0) > 0)

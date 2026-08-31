@@ -170,7 +170,6 @@ const rows = computed(() => {
 
   if (s.max) out.push({ label: `Highest ${noun}`, value: fmt(s.max.value), unit, note: s.max.date })
   if (s.min) out.push({ label: `Lowest ${noun}`, value: fmt(s.min.value), unit, note: s.min.date })
-  if (s.mean != null) out.push({ label: 'Archive mean', value: fmt(s.mean), unit, note: '' })
   if (s.recentMean != null) {
     out.push({
       label: 'Last 12 months',
