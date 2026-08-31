@@ -1,13 +1,19 @@
 [project]
 name = "enso-process"
 version = "0.1.0"
-description = "OISST daily SST-anomaly NetCDF -> ClickHouse ingest pipeline"
+description = "CoralTemp daily NetCDF -> ClickHouse download/ingest/render pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "clickhouse-connect>=0.8.0",
     "netCDF4>=1.7.0",
     "numpy>=2.0",
     "PyYAML>=6.0",
+    # Fetching from NOAA Coral Reef Watch.
+    "httpx>=0.27",
+    # `run` renders a date's images from the NetCDF via shared/render.py, the
+    # same code path the API serves /image from.
+    "matplotlib>=3.9",
+    "pillow>=11.0",
 ]
 
 [dependency-groups]

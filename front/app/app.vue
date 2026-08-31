@@ -4,9 +4,10 @@
       <header class="flex shrink-0 items-center gap-3 border-b border-default px-4 py-2">
         <UIcon name="i-mdi-waves" class="size-6 text-primary" />
         <div>
-          <h1 class="text-sm font-semibold leading-tight">North Pacific SST Anomaly</h1>
+          <h1 class="text-sm font-semibold leading-tight">Pacific Sea Surface Temperature</h1>
           <p class="text-xs text-muted leading-tight">
-            NOAA OISST v2.1 &middot; daily &middot; 0.25&deg;
+            NOAA Coral Reef Watch CoralTemp v3.1 &middot; daily &middot; 0.05&deg;
+            <span v-if="store.variable === 'anom'"> &middot; vs. 1991&ndash;2020</span>
           </p>
         </div>
         <div class="grow" />

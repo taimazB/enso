@@ -1,6 +1,9 @@
 import axios from 'axios'
 import type { Period } from '~/utils/periods'
 
+/** Mirrors `shared/render.py`'s DEFAULT_WIDTH — see `imageUrl` below. */
+export const IMAGE_WIDTH = 2048
+
 /**
  * Thin axios wrapper bound to the API.
  *
@@ -24,9 +27,17 @@ export function useApi() {
       const { data } = await axios.post<T>(`${requestBase}${path}`, body)
       return data
     },
-    /** Always browser-facing: this URL is handed to Mapbox, not fetched here. */
-    imageUrl(date: string, period: Period = 'daily', width = 720): string {
-      return `${publicBase}/image/${date}.webp?width=${width}&period=${period}`
+    /**
+     * Always browser-facing: this URL is handed to Mapbox, not fetched here.
+     *
+     * `width` must match what `CRW.cli render` was run with — the cache is keyed
+     * by (variable, period, bucket start, width), so a different width is a
+     * different file, and for a historical bucket there is no NetCDF left to
+     * render one from. A mismatch shows up as a 404 and a blank map, not as a
+     * slower render.
+     */
+    imageUrl(date: string, period: Period = 'daily', variable = 'sst', width = IMAGE_WIDTH): string {
+      return `${publicBase}/image/${date}.webp?width=${width}&period=${period}&variable=${variable}`
     },
   }
 }

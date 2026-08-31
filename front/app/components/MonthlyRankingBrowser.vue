@@ -1,5 +1,7 @@
 <template>
-  <div class="flex size-full min-h-0 flex-col">
+  <!-- `@container`: this now lives in a dock the user can drag narrower or
+       wider, so what fits is a question about this element, not the viewport. -->
+  <div class="@container flex w-full min-h-0 flex-col">
     <div
       v-if="!hasData"
       class="flex min-h-48 w-full items-center justify-center px-6 text-center text-sm text-muted"
@@ -9,14 +11,14 @@
     </div>
 
     <ClientOnly v-else>
-      <div class="flex size-full min-h-0 gap-4">
+      <div class="flex min-h-0 w-full grow gap-4">
         <!-- The rail: twelve months at a glance, one of them open on the right.
              Names are HTML rather than canvas text so they stay crisp, selectable
              and focusable, and the thumbnail beside each is the same spine the
              detail draws — the rail is scanned for shape and colour, not read. -->
         <nav
           ref="rail"
-          class="w-56 shrink-0 space-y-1 overflow-y-auto pr-1"
+          class="w-40 shrink-0 space-y-1 overflow-y-auto pr-1 @md:w-56"
           aria-label="Calendar months"
         >
           <button
@@ -38,8 +40,8 @@
                 :class="activeMonth === i + 1 ? 'text-highlighted' : 'text-default'"
                 :style="mapMonth === i + 1 ? { color: ACCENT } : undefined"
               >{{ MONTHS[i] }}</span>
-              <span v-if="rows.length" class="ml-auto text-[10px] tabular-nums text-dimmed">
-                warmest {{ rows[0]!.year }}
+              <span v-if="rows.length" class="ml-auto hidden text-[10px] tabular-nums text-dimmed @lg:inline">
+                {{ rankOrder }} {{ rows[0]!.year }}<template v-if="rows[0]!.partial">&nbsp;*</template>
               </span>
             </div>
             <div :ref="el => setThumb(i, el as HTMLElement | null)" class="h-14 w-full" />
@@ -52,11 +54,27 @@
         <section class="flex min-w-0 grow flex-col">
           <div class="mb-1 flex shrink-0 items-center gap-3">
             <h3 class="text-base font-semibold text-highlighted">{{ MONTHS[activeMonth - 1] }}</h3>
-            <span class="text-xs text-muted">
-              {{ activeRows.length }} years ranked, warmest first
+            <span class="truncate text-xs text-muted">
+              {{ activeRows.length }} years ranked, {{ rankOrder }} first
             </span>
-            <ColorLegend class="ml-auto" />
+            <ColorLegend class="ml-auto hidden @lg:block" />
+            <!-- All twelve months, not just the one open here: the rail exists
+                 because 45 rows twelve times over is unreadable on screen, which
+                 is not a limit a file has. -->
+            <UButton
+              icon="i-mdi-download"
+              variant="ghost"
+              color="neutral"
+              size="xs"
+              class="ml-auto shrink-0 @lg:ml-2"
+              title="Download every month's ranking as CSV"
+              aria-label="Download the rankings as CSV"
+              @click="exportRanking()"
+            />
           </div>
+          <!-- The archive's edge months are ranked with the rest rather than
+               hidden, so this is where the star is cashed in. -->
+          <p v-if="note" class="mb-1 shrink-0 text-[11px] text-dimmed">{{ note }}</p>
           <!-- Only the plot scrolls, and `detailPitch()` is spent out of this
                element's height — so measuring it must not include the heading. -->
           <div ref="pane" class="min-h-0 grow overflow-y-auto">
@@ -72,6 +90,7 @@
 import * as echarts from 'echarts'
 import type { ColorStop } from '~/utils/colorScale'
 import type { MonthlyRanking } from '~/utils/ranking'
+import { cellSlug, downloadCsv, rankingCsv } from '~/utils/csv'
 import {
   ACCENT,
   MONTHS,
@@ -79,6 +98,7 @@ import {
   detailOption,
   detailPitch,
   monthsOf,
+  partialNote,
   thumbOption,
   xDomainOf,
 } from '~/utils/ranking'
@@ -91,9 +111,40 @@ const props = defineProps<{
   emptyMessage?: string
   /** Bucket on the map. Its year is ringed amber, and its month opens first. */
   selectedDate?: string | null
+  /** Unit suffix for the detail tooltip and x-axis; '' where there is none. */
+  unit?: string
+  /**
+   * Whether the ranked value is a mean over an ordinal class (`mhw`). Drops the
+   * signed '+', which only means something on a scale centred at zero.
+   */
+  categorical?: boolean
+  /**
+   * What rank 1 means — 'warmest' for a temperature, 'most severe' for the
+   * heatwave category, which is not a temperature at all.
+   */
+  rankOrder?: string
+  /** Decimals the ranked means are written with on export; the panel's own. */
+  precision?: number
 }>()
 
 const emit = defineEmits<{ select: [date: string] }>()
+
+/**
+ * Save the whole ranking table.
+ *
+ * The cell is in the filename because a ranking is only ever about one cell, and
+ * two cells' files are otherwise indistinguishable — the same twelve months and
+ * the same years, with different numbers.
+ */
+function exportRanking() {
+  const ranking = props.ranking
+  if (!ranking) return
+  const variable = ranking.variable ?? 'anom'
+  downloadCsv(
+    `${variable}_monthly-ranks_${cellSlug(ranking.cell)}.csv`,
+    rankingCsv(ranking, props.precision ?? 2),
+  )
+}
 
 const months = computed(() => monthsOf(props.ranking))
 const hasData = computed(() => months.value.some(rows => rows.length > 0))
@@ -122,6 +173,8 @@ const activeRows = computed(() => months.value[activeMonth.value - 1] ?? [])
  * a shared domain leaves January using a third of the pane.
  */
 const detailDomain = computed(() => xDomainOf([activeRows.value]))
+/** Spells out the `*` on a truncated edge month, when the open month has one. */
+const note = computed(() => partialNote(activeRows.value, activeMonth.value))
 
 // --- Rail --------------------------------------------------------------------
 
@@ -143,7 +196,13 @@ function renderThumbs() {
     thumbs[i] ??= echarts.init(el, null, { renderer: 'canvas' })
     thumbs[i]!.resize()
     thumbs[i]!.setOption(
-      thumbOption({ rows, stops: props.stops, domain: railDomain.value, selectedYear: selectedYear.value }),
+      thumbOption({
+        rows,
+        stops: props.stops,
+        domain: railDomain.value,
+        selectedYear: selectedYear.value,
+        categorical: props.categorical,
+      }),
       { notMerge: true },
     )
   })
@@ -184,6 +243,8 @@ function renderDetail() {
       pitch: pitch.value,
       topN: topN.value,
       selectedYear: selectedYear.value,
+      unit: props.unit,
+      categorical: props.categorical,
     }),
     { notMerge: true },
   )
@@ -192,6 +253,22 @@ function renderDetail() {
 // --- Lifecycle ---------------------------------------------------------------
 
 let observer: ResizeObserver | null = null
+let resizeTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Coalesced, because the dock's drag handle fires this on every frame and one
+ * redraw is twelve thumbnails plus a 45-row panel. 100ms is invisible when the
+ * panel merely opens and is the difference between smooth and gluey on a drag.
+ */
+function onResize() {
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null
+    paneH.value = pane.value?.clientHeight ?? 0
+    renderThumbs()
+    nextTick(renderDetail)
+  }, 100)
+}
 
 /**
  * Watch the elements, not the mount.
@@ -207,11 +284,7 @@ watch([rail, pane, detail, thumbCount], () => {
   observer?.disconnect()
   if (!pane.value && !rail.value) return
 
-  observer = new ResizeObserver(() => {
-    paneH.value = pane.value?.clientHeight ?? 0
-    renderThumbs()
-    nextTick(renderDetail)
-  })
+  observer = new ResizeObserver(onResize)
   if (pane.value) observer.observe(pane.value)
   if (rail.value) observer.observe(rail.value)
 
@@ -239,6 +312,8 @@ watch([activeMonth, detailHeight], () => {
 onBeforeUnmount(() => {
   observer?.disconnect()
   observer = null
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = null
   thumbs.forEach((c, i) => { c?.dispose(); thumbs[i] = null })
   chart?.off('click', onClick)
   chart?.dispose()

@@ -42,8 +42,10 @@ services:
       - .env.dev
     environment:
       - HDF5_USE_FILE_LOCKING=FALSE
-      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
       - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
+      - CRW_MHW_DIR=${CRW_MHW_DIR:-/opt/data/MHW}
       # ClickHouse: local docker-compose instance (db-ch service) by default
       - CH_HOST=${CH_HOST:-db-ch}
       - CH_PORT=${CH_PORT:-8123}
@@ -93,8 +95,10 @@ services:
       - .env.dev
     environment:
       - HDF5_USE_FILE_LOCKING=FALSE
-      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data}
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
       - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
+      - CRW_MHW_DIR=${CRW_MHW_DIR:-/opt/data/MHW}
       # Override any host-IP values from .env.dev with the compose service name
       - CH_HOST=db-ch
       - CH_PORT=8123
@@ -108,6 +112,3 @@ services:
     depends_on:
       db-ch:
         condition: service_healthy
-    # No long-running work yet — ingest is invoked on demand:
-    #   docker compose run --rm process python -m OISST.cli ingest
-    command: ["sleep", "infinity"]

@@ -1,5 +1,25 @@
 <template>
   <div class="flex items-center gap-2 rounded-lg border border-default bg-elevated/90 px-2 py-1 shadow-lg backdrop-blur">
+    <!--
+      UFieldGroup, not UButtonGroup: Nuxt UI v4 renamed it and the old name
+      resolves to an empty comment node instead of erroring, so the control
+      simply vanishes from the DOM.
+    -->
+    <UFieldGroup size="xs">
+      <UButton
+        v-for="item in VARIABLES"
+        :key="item.value"
+        :label="item.label"
+        :color="store.variable === item.value ? 'primary' : 'neutral'"
+        :variant="store.variable === item.value ? 'solid' : 'subtle'"
+        :disabled="!store.variableReady(item.value)"
+        :title="store.variableReady(item.value) ? item.title : item.pending"
+        @click="store.setVariable(item.value)"
+      />
+    </UFieldGroup>
+
+    <div class="h-5 w-px bg-accented" />
+
     <UFieldGroup size="xs">
       <UButton
         v-for="item in PERIODS"
@@ -93,6 +113,23 @@
     <span v-if="store.period !== 'daily' && store.selectedDate" class="pr-1 text-xs text-muted">
       {{ bucketLabel(store.selectedDate, store.period) }}
     </span>
+
+    <!-- Exports the series the chart is drawing, at the current variable and
+         period, rather than issuing a request of its own: a second path to the
+         same numbers would be a second definition of "the weekly mean".
+         `ml-auto` parks it at the far right, away from the controls that change
+         what is plotted — it is the one button here that leaves the app. -->
+    <UButton
+      icon="i-mdi-download"
+      label="Download data"
+      variant="ghost"
+      color="neutral"
+      size="xs"
+      class="ml-auto shrink-0"
+      :disabled="!canExport"
+      :title="canExport ? `Download this ${periodWord} series as CSV` : 'Nothing plotted to download'"
+      @click="exportSeries()"
+    />
   </div>
 </template>
 
@@ -100,11 +137,39 @@
 import { useMainStore } from '~/stores/main'
 import { PERIODS, bucketLabel, bucketStart, bucketsPerYear, shiftBuckets } from '~/utils/periods'
 import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
-
-// Note: the period toggle above is a UFieldGroup, not a UButtonGroup — Nuxt UI
-// v4 renamed that component, and the old name silently renders nothing.
+import { cellSlug, downloadCsv, seriesCsv, slug } from '~/utils/csv'
 
 const store = useMainStore()
+
+// Anomaly first, and it is what the app opens on: the question this dashboard
+// exists for is "how far from normal is it", and absolute SST is the reference
+// view you switch to. MHW comes last because it is the narrowest question of the
+// three — not "how warm" but "is this officially a heatwave, and how bad" — and
+// it is the one most likely to be unavailable, being a separate archive.
+//
+// `pending` is the tooltip shown while a variable's precondition is unmet. Each
+// says what is missing rather than just greying out, because in both cases the
+// failure mode without the gate is silent wrong data, not an error — see
+// `variableReady` in the store.
+const VARIABLES = [
+  {
+    value: 'anom' as const,
+    label: 'Anomaly',
+    title: 'Difference from the 1991-2020 daily climatology',
+    pending: 'Anomaly needs the full 366-day climatology, which is still loading',
+  },
+  {
+    value: 'sst' as const,
+    label: 'SST',
+    title: 'Sea surface temperature',
+  },
+  {
+    value: 'mhw' as const,
+    label: 'MHW',
+    title: 'NOAA marine heatwave category, 1 (Moderate) to 5 (Beyond extreme)',
+    pending: 'Marine heatwave needs its own archive, which has not finished ingesting',
+  },
+]
 const { playing, fps, canPlay, toggle, stop } = usePlayback()
 
 const dateInput = computed({
@@ -132,5 +197,35 @@ function clamp(iso: string): string {
 function step(buckets: number) {
   if (!store.selectedDate) return
   store.setDate(clamp(shiftBuckets(store.selectedDate, store.period, buckets)))
+}
+
+const canExport = computed(() => (store.activeSeries?.dates.length ?? 0) > 0)
+
+const periodWord = computed(() => ({ daily: 'daily', weekly: 'weekly', monthly: 'monthly' })[store.period])
+
+/**
+ * Save the plotted series.
+ *
+ * The filename carries everything that decides what the numbers ARE — variable,
+ * period, subject and span — because a folder of `timeseries.csv` files is
+ * indistinguishable a week later, and the two subjects a series can have (a
+ * clicked cell, a named region) are not comparable numbers.
+ */
+function exportSeries() {
+  const series = store.activeSeries
+  if (!series?.dates.length) return
+  const subject = store.scope === 'region'
+    ? slug(store.activeRegionMeta?.label ?? store.activeRegion ?? 'region')
+    : series.cell ? cellSlug(series.cell) : 'point'
+  const span = `${series.dates[0]}_${series.dates[series.dates.length - 1]}`
+  downloadCsv(
+    `${store.variable}_${store.period}_${subject}_${span}.csv`,
+    seriesCsv(series, {
+      variable: store.variable,
+      period: store.period,
+      unit: store.activeUnitLabel,
+      precision: store.domain?.variables?.[store.variable]?.precision,
+    }),
+  )
 }
 </script>

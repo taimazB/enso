@@ -88,7 +88,7 @@ export function usePlayback() {
       const began = performance.now()
       const target = next(store.selectedDate)
 
-      await ready(api.imageUrl(target, store.period))
+      await ready(api.imageUrl(target, store.period, store.variable))
       if (!playing.value || mine !== run) return
 
       store.setDate(target)
@@ -98,7 +98,7 @@ export function usePlayback() {
       let ahead = target
       for (let i = 0; i < AHEAD; i++) {
         ahead = next(ahead)
-        warm(api.imageUrl(ahead, store.period))
+        warm(api.imageUrl(ahead, store.period, store.variable))
       }
 
       // fps is read per frame, so the slider takes effect on the next one.
