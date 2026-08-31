@@ -4,10 +4,10 @@ FROM node:22-alpine AS base
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
+RUN npm install --legacy-peer-deps
 
 # Development stage
 FROM base AS development
-RUN npm install --legacy-peer-deps
 COPY . .
 # compose runs this as the host UID so that .nuxt/ and any lockfile the dev
 # server writes into the bind-mounted ./front are not root-owned. node_modules
