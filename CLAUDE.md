@@ -1025,6 +1025,20 @@ alone drags a 25–30 °C SST record down against a 0–30 axis and draws it as 
 ## Gotchas
 
 - **`--env-file .env.dev` is required** on every compose invocation, as above.
+- **`CH_IMAGE_TAG` must be >= the version that wrote `CH_DATA_DIR`.** ClickHouse has no
+  downgrade path. Dev runs `clickhouse-server:latest`, so a data directory copied from a
+  dev box to prod carries whatever major was current — 26.5.1.882 for the first copy —
+  and prod's original `25.8` pin could not load its metadata. **The symptom is not a crash**:
+  the container comes up and answers `/ping`, so the healthcheck passes, `SHOW TABLES`
+  returns nothing, `api`'s `/health` reports ClickHouse unreachable, and `front` — which
+  waits on `api` being healthy — never serves. Read the version off the source archive's own
+  log before pinning:
+  `grep -ao 'Starting ClickHouse [0-9.]*' <CH_LOG_DIR>/clickhouse-server.log | tail -1`.
+- **`API_INTERNAL_BASE_URL` is `http://api:4000`, not the published `API_PORT`.** `API_PORT`
+  (9021) is the *host* side of the mapping; inside the compose network uvicorn is on 4000.
+  Pointing SSR at `api:9021` is the same `ECONNREFUSED` the dev notes warn about, just
+  arriving from the other direction — and it surfaces as a plain 500 from the frontend
+  while the API itself is fine on the published port.
 - **Env vars are baked in at container creation.** Editing `.env.dev` does not affect a
   running container — use `up -d --force-recreate <service>`, not `restart`.
 - **`domain.yml` changes need an API restart.** `shared.domain` caches the parsed YAML with
