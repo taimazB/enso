@@ -1,7 +1,7 @@
 <template>
   <!-- `@container`: this now lives in a dock the user can drag narrower or
        wider, so what fits is a question about this element, not the viewport. -->
-  <div class="@container flex size-full min-h-0 flex-col">
+  <div class="@container flex w-full min-h-0 flex-col">
     <div
       v-if="!hasData"
       class="flex min-h-48 w-full items-center justify-center px-6 text-center text-sm text-muted"
@@ -11,7 +11,7 @@
     </div>
 
     <ClientOnly v-else>
-      <div class="flex size-full min-h-0 gap-4">
+      <div class="flex min-h-0 w-full grow gap-4">
         <!-- The rail: twelve months at a glance, one of them open on the right.
              Names are HTML rather than canvas text so they stay crisp, selectable
              and focusable, and the thumbnail beside each is the same spine the
@@ -58,6 +58,19 @@
               {{ activeRows.length }} years ranked, {{ rankOrder }} first
             </span>
             <ColorLegend class="ml-auto hidden @lg:block" />
+            <!-- All twelve months, not just the one open here: the rail exists
+                 because 45 rows twelve times over is unreadable on screen, which
+                 is not a limit a file has. -->
+            <UButton
+              icon="i-mdi-download"
+              variant="ghost"
+              color="neutral"
+              size="xs"
+              class="ml-auto shrink-0 @lg:ml-2"
+              title="Download every month's ranking as CSV"
+              aria-label="Download the rankings as CSV"
+              @click="exportRanking()"
+            />
           </div>
           <!-- The archive's edge months are ranked with the rest rather than
                hidden, so this is where the star is cashed in. -->
@@ -77,6 +90,7 @@
 import * as echarts from 'echarts'
 import type { ColorStop } from '~/utils/colorScale'
 import type { MonthlyRanking } from '~/utils/ranking'
+import { cellSlug, downloadCsv, rankingCsv } from '~/utils/csv'
 import {
   ACCENT,
   MONTHS,
@@ -109,9 +123,28 @@ const props = defineProps<{
    * heatwave category, which is not a temperature at all.
    */
   rankOrder?: string
+  /** Decimals the ranked means are written with on export; the panel's own. */
+  precision?: number
 }>()
 
 const emit = defineEmits<{ select: [date: string] }>()
+
+/**
+ * Save the whole ranking table.
+ *
+ * The cell is in the filename because a ranking is only ever about one cell, and
+ * two cells' files are otherwise indistinguishable — the same twelve months and
+ * the same years, with different numbers.
+ */
+function exportRanking() {
+  const ranking = props.ranking
+  if (!ranking) return
+  const variable = ranking.variable ?? 'anom'
+  downloadCsv(
+    `${variable}_monthly-ranks_${cellSlug(ranking.cell)}.csv`,
+    rankingCsv(ranking, props.precision ?? 2),
+  )
+}
 
 const months = computed(() => monthsOf(props.ranking))
 const hasData = computed(() => months.value.some(rows => rows.length > 0))

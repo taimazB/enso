@@ -12,6 +12,18 @@ import { bucketStart } from '~/utils/periods'
  */
 export type VariableName = 'sst' | 'anom' | 'mhw'
 
+/**
+ * Whether the chart and the numbers panel are reading a clicked cell or a named
+ * region.
+ *
+ * ONE mode switch for the whole app, not one per panel. It drives the chart and
+ * the numbers panel together, exactly as `variable` and `period` already drive
+ * the chart and the map image together — so the two can never end up describing
+ * different things, and the dock's tabs choose a *view* of the current scope
+ * rather than a second scope of their own.
+ */
+export type Scope = 'point' | 'region'
+
 /** A variable's displayed range — what the colour ramp is spread over. */
 export interface ColorScaleRange { vmin: number, vmax: number }
 
@@ -110,6 +122,13 @@ export interface Series {
  * water — a land cell would bootstrap into an empty series.
  */
 const DEFAULT_POINT = { lat: 48, lon: -128 }
+
+/**
+ * Region the app opens on. Nino 3.4 is the index the repo is named for, and it
+ * is the one number this dashboard exists to show — so it is what the numbers
+ * panel reads before anyone has clicked anything.
+ */
+const DEFAULT_REGION = 'nino34'
 
 /** localStorage key a variable's display range is remembered under. */
 const scaleKey = (variable: VariableName) => `enso.scale.${variable}`
@@ -222,6 +241,21 @@ export const useMainStore = defineStore('main', {
      * failing, and the Anomaly button is disabled in that state anyway.
      */
     variable: 'anom' as VariableName,
+    /**
+     * Whether the chart and the numbers panel read a point or a region.
+     *
+     * Opens on `region`, and that is a first-run decision rather than a
+     * preference: a point panel has nothing to show until someone clicks the
+     * map, so opening there means opening on an empty "click something" state —
+     * the tutorial this app is trying not to need. A region needs no selection,
+     * so the app can land showing a named number beside the map. Clicking the
+     * map then moves to `point`, which is what teaches the toggle.
+     */
+    scope: 'region' as Scope,
+    /** Named region the region scope is reading. Seeded by `loadMetadata()`. */
+    activeRegion: null as string | null,
+    regionSeries: null as Series | null,
+    loadingRegion: false,
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
@@ -294,6 +328,22 @@ export const useMainStore = defineStore('main', {
       return true
     },
 
+    /** The active region's metadata from /domain, or null before it loads. */
+    activeRegionMeta: state =>
+      state.domain?.regions?.find(r => r.key === state.activeRegion) ?? null,
+
+    /**
+     * The series the chart draws: whichever the current scope names.
+     *
+     * Read through here rather than by branching in the component, so the chart
+     * stays presentational and the scope has exactly one definition.
+     */
+    activeSeries: (state): Series | null =>
+      state.scope === 'region' ? state.regionSeries : state.pointSeries,
+
+    activeSeriesLoading: state =>
+      state.scope === 'region' ? state.loadingRegion : state.loadingPoint,
+
     /** Whether a variable is an ordinal class rather than a measurement. */
     isCategorical: state => (variable: VariableName): boolean =>
       state.domain?.variables?.[variable]?.categorical ?? false,
@@ -365,7 +415,10 @@ export const useMainStore = defineStore('main', {
       const point = this.selectedPoint
         ? null
         // Non-fatal: a failure here costs the opening chart, not the whole page.
-        : this.selectPoint(DEFAULT_POINT.lat, DEFAULT_POINT.lon).catch(() => {})
+        // Not a user gesture: this populates the chart for the first click that
+        // has not happened yet, and must leave the app in its region-first
+        // opening state.
+        : this.selectPoint(DEFAULT_POINT.lat, DEFAULT_POINT.lon, { enterScope: false }).catch(() => {})
 
       const [domain, coverage] = await Promise.all([
         api.get<DomainMeta>('/domain'),
@@ -374,6 +427,14 @@ export const useMainStore = defineStore('main', {
       this.domain = domain
       this.coverage = coverage
       if (!this.selectedDate && coverage.end) this.setDate(coverage.end)
+      // Seeded from /domain rather than assumed: the default key is only used
+      // if the API actually offers it, so removing a region from domain.yml
+      // cannot leave the app opening on a 404.
+      if (!this.activeRegion && domain.regions?.length) {
+        this.activeRegion = domain.regions.some(r => r.key === DEFAULT_REGION)
+          ? DEFAULT_REGION
+          : domain.regions[0]!.key
+      }
       await point
       // Only now is it known which variables are actually available. Nothing to
       // do in the normal case; where a derived or separately-ingested variable
@@ -382,6 +443,10 @@ export const useMainStore = defineStore('main', {
       // opening point on it. Opening on a variable whose own toggle is disabled
       // is worse than opening on the reference view.
       if (!this.variableReady(this.variable)) await this.setVariable('sst')
+      // Last, so it requests the variable that survived the check above rather
+      // than the one the app hoped to open on. Non-fatal for the same reason
+      // the opening point is: it costs the landing panel, not the page.
+      if (this.scope === 'region') await this.loadRegionSeries(api).catch(() => {})
     },
 
     /**
@@ -453,6 +518,67 @@ export const useMainStore = defineStore('main', {
       }
     },
 
+    /**
+     * Fetch the active region's series for the current variable and period.
+     *
+     * `/region/{key}` is served from the `region_daily` rollup, so this is a
+     * ~150 ms read of 121,696 rows rather than the 3-12 s aggregation over
+     * billions that the same request cost before the rollup existed.
+     *
+     * The `api` parameter is not a convenience. `useApi()` reaches for the Nuxt
+     * instance, which SSR only keeps for the *synchronous* part of a call chain
+     * — so calling it here, from the tail of `loadMetadata()` after several
+     * awaits, throws and the fetch never lands. `loadMetadata` passes the client
+     * it captured before its first await; a browser-side caller can let this
+     * default.
+     */
+    async loadRegionSeries(api = useApi()) {
+      const key = this.activeRegion
+      if (!key) return
+      this.loadingRegion = true
+      try {
+        this.regionSeries = await api.get<Series>(`/region/${key}`, {
+          period: this.period,
+          variable: this.variable,
+        })
+      }
+      finally {
+        this.loadingRegion = false
+      }
+    },
+
+    /**
+     * Show a named region, switching scope to match.
+     *
+     * Selecting a region *is* switching to region scope — there is no way to
+     * pick one without wanting to look at it, and a picker that silently left
+     * the chart on a point would be the second mode switch this design exists
+     * to avoid.
+     */
+    selectRegion(key: string): Promise<void> | void {
+      const changed = key !== this.activeRegion
+      this.activeRegion = key
+      this.scope = 'region'
+      if (changed || !this.regionSeries) return this.loadRegionSeries()
+    },
+
+    /**
+     * Switch between the clicked cell and the named region.
+     *
+     * Fetches only what the target scope is missing: the point series survives a
+     * trip through region scope and back, so returning to it is instant and does
+     * not re-request a cell that has not changed.
+     */
+    setScope(scope: Scope): Promise<void> | void {
+      if (scope === this.scope) return
+      this.scope = scope
+      if (scope === 'region' && !this.regionSeries) return this.loadRegionSeries()
+      if (scope === 'point' && !this.pointSeries && this.selectedPoint) {
+        const { lat, lon } = this.selectedPoint
+        return this.selectPoint(lat, lon)
+      }
+    },
+
     /** Set the map date, snapped to the current period's bucket. */
     setDate(date: string) {
       this.selectedDate = bucketStart(date, this.period)
@@ -463,6 +589,14 @@ export const useMainStore = defineStore('main', {
       if (period === this.period) return
       this.period = period
       if (this.selectedDate) this.setDate(this.selectedDate)
+      // Both series are bucketed by the API, so both are stale. The inactive
+      // one is dropped rather than refetched — switching scope reloads it, and
+      // fetching a series nobody is looking at is a request for nothing.
+      if (this.scope === 'region') {
+        this.pointSeries = null
+        return this.loadRegionSeries()
+      }
+      this.regionSeries = null
       if (this.selectedPoint) {
         const { lat, lon } = this.selectedPoint
         return this.selectPoint(lat, lon)
@@ -481,13 +615,28 @@ export const useMainStore = defineStore('main', {
     setVariable(variable: VariableName): Promise<void> | void {
       if (variable === this.variable) return
       this.variable = variable
+      if (this.scope === 'region') {
+        this.pointSeries = null
+        return this.loadRegionSeries()
+      }
+      this.regionSeries = null
       if (this.selectedPoint) {
         const { lat, lon } = this.selectedPoint
         return this.selectPoint(lat, lon)
       }
     },
 
-    async selectPoint(lat: number, lon: number) {
+    /**
+     * Load a cell's series and ranking.
+     *
+     * `enterScope` is what separates a *user gesture* from a *bootstrap*. A map
+     * click means "look at this cell" and must move the app into point scope;
+     * `loadMetadata()` calling this to populate the opening chart means nothing
+     * of the sort, and letting it switch scope silently landed the app in point
+     * scope on every load — defeating the region-first opening state, whose
+     * whole purpose is to have something to show before the first click.
+     */
+    async selectPoint(lat: number, lon: number, { enterScope = true }: { enterScope?: boolean } = {}) {
       // The ranking is period-independent, so a period toggle — which re-enters
       // here with the same cell — must not refetch it and flash the grid. It is
       // NOT variable-independent, though: ranking years by SST rather than by
@@ -498,6 +647,10 @@ export const useMainStore = defineStore('main', {
         && this.monthlyRanking.variable === this.variable
 
       this.selectedPoint = { lat, lon }
+      // What makes the Point/Region toggle self-teaching: you land in Region,
+      // click the map, and the control that moved you is visibly the one that
+      // moves you back.
+      if (enterScope) this.scope = 'point'
       this.outsideDomain = null
       this.loadingPoint = true
       try {

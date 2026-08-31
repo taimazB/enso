@@ -220,6 +220,48 @@ def _region_clim_by_mmdd(key: str) -> dict[int, float]:
     return {int(m): float(v) for m, v in rows}
 
 
+# Which `region_daily` column serves which variable. The two SST columns are not
+# interchangeable: `mean_sst` is the mean over every ocean cell in the box and
+# `mean_sst_clim` the mean over its `has_clim = 1` cells only, which is what the
+# `mean(sst - clim) == mean(sst) - mean(clim)` identity requires on the daily
+# side. Serving `anom` from `mean_sst` would drift wherever the ice edge sits.
+_ROLLUP_COLUMNS = {
+    "sst": ("mean_sst", "n_cells"),
+    "anom": ("mean_sst_clim", "n_cells_clim"),
+    "mhw": ("mean_mhw", "n_cells"),
+}
+
+
+def _region_daily_rows(
+    key: str, variable_name: str, start: dt.date | None, end: dt.date | None
+) -> list[tuple]:
+    """The named region's daily area means, read from the `region_daily` rollup.
+
+    Returns exactly what the live aggregation in `region_timeseries()` returns —
+    `(date, value, n_cells)` — so the bucketing below is shared and cannot drift
+    between the two paths.
+
+    Measured before this table existed, the live query it replaces ran 3.14 s for
+    the smallest named region and 12.14 s for Nino 3.4. Only NAMED regions have a
+    rollup; `/regionTimeseries` on an arbitrary box still aggregates live.
+
+    `isFinite` drops dates where the region had no climatology cells at all, for
+    which the rollup stores NaN rather than a 0 that would read as "exactly at
+    climatology". No configured region hits this today.
+    """
+    value_col, count_col = _ROLLUP_COLUMNS[variable_name]
+    where, params = _date_filter(start, end)
+    return client().query(
+        f"""
+        SELECT date, {value_col}, {count_col}
+        FROM {DATABASE}.region_daily FINAL
+        WHERE region = %(key)s AND isFinite({value_col}){where}
+        ORDER BY date
+        """,
+        parameters=params | {"key": key},
+    ).result_rows
+
+
 def _region_mhw_daily(
     gy0: int, gy1: int, gx0: int, gx1: int, where: str, params: dict
 ) -> list[tuple]:
@@ -282,6 +324,7 @@ def region_timeseries(
     period: Period = "daily",
     variable_name: str = "sst",
     clim_by_mmdd: dict[int, float] | None = None,
+    daily_rows: list[tuple] | None = None,
 ) -> dict:
     """cos(lat)-weighted mean over a lat/lon box, per `period` bucket.
 
@@ -308,7 +351,13 @@ def region_timeseries(
     params |= {"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1}
     clim_filter = " AND has_clim = 1" if name == "anom" else ""
 
-    if name == "mhw":
+    if daily_rows is not None:
+        # A named region, served from the `region_daily` rollup. Everything below
+        # — the climatology subtraction, the bucketing, the response shape — is
+        # the same code the live path runs, which is the point of passing rows in
+        # rather than giving named regions their own function.
+        rows = daily_rows
+    elif name == "mhw":
         rows = _region_mhw_daily(gy0, gy1, gx0, gx1, where, params)
     else:
         # For anomaly the per-day SST mean has to be formed before bucketing, so
@@ -374,8 +423,16 @@ def named_region_timeseries(
     period: Period = "daily",
     variable_name: str = "sst",
 ) -> dict:
+    """One of `domain.yml`'s named regions, served from the rollups.
+
+    Both precomputed sides meet here: `region_daily` supplies the daily area
+    means and `region_clim` the climatology to subtract from them. An arbitrary
+    box through `/regionTimeseries` has neither and aggregates live, which is the
+    only difference between the two endpoints.
+    """
     region = regions()[key]
-    clim = _region_clim_by_mmdd(key) if variable_name == "anom" else None
+    name = check_variable(variable_name)
+    clim = _region_clim_by_mmdd(key) if name == "anom" else None
     result = region_timeseries(
         region.lat,
         region.lon,
@@ -383,8 +440,9 @@ def named_region_timeseries(
         end,
         label=region.label,
         period=period,
-        variable_name=variable_name,
+        variable_name=name,
         clim_by_mmdd=clim,
+        daily_rows=_region_daily_rows(key, name, start, end),
     )
     result["region"] = key
     result["partial"] = region.partial

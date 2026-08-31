@@ -1,9 +1,115 @@
 <template>
-  <!-- Map and the ranks dock sit side by side rather than one over the other:
-       reading a month's ranking is a per-cell question, so the map has to stay
-       clickable while the panel is open. It used to be a fullscreen modal, which
-       meant close / click / reopen for every cell. -->
+  <!-- The panel sits beside the map, not over it. Reading numbers is a
+       per-selection question, so the map has to stay clickable while the panel
+       is open — it was a fullscreen modal first, which meant close / click /
+       reopen for every cell. It is on the LEFT because the map's own controls
+       (projection, legend, time bar) grew on the right and below. -->
   <div class="flex h-full min-h-0">
+    <SideDock
+      v-if="dockOpen"
+      side="left"
+      :title="subjectTitle"
+      storage-key="enso.dock.width"
+      @close="dockOpen = false"
+    >
+      <template #header>
+        <!-- The panel names its subject and nothing more. CHOOSING that subject
+             is the map's job — the scope switch sits over the canvas next to the
+             projection pair, because picking a cell means clicking the map and
+             picking a region means seeing the box move. Duplicating the control
+             here would give one decision two homes. -->
+        <h2 class="truncate text-sm font-semibold text-highlighted">{{ subjectTitle }}</h2>
+        <p class="truncate text-xs text-muted">{{ subjectSubtitle }}</p>
+      </template>
+
+      <!-- Tabs choose a VIEW of the current scope, never a second scope: both
+           read whatever the switch above names. -->
+      <UFieldGroup size="xs" class="mb-2 w-full shrink-0">
+        <UButton
+          v-for="t in TABS"
+          :key="t.value"
+          class="grow justify-center"
+          :color="tab === t.value ? 'primary' : 'neutral'"
+          :variant="tab === t.value ? 'solid' : 'subtle'"
+          :icon="t.icon"
+          :label="t.label"
+          @click="tab = t.value"
+        />
+      </UFieldGroup>
+
+      <StatsPanel
+        v-if="tab === 'numbers'"
+        :series="store.activeSeries"
+        :loading="store.activeSeriesLoading"
+        :empty-message="emptyPointMessage"
+        :stops="store.activeStops"
+        :categorical="store.activeIsCategorical"
+        :unit="store.activeUnitLabel"
+        :precision="store.domain?.variables?.[store.variable]?.precision"
+        :signed="store.variable === 'anom'"
+        :variable-label="variableLabel"
+        :period="store.period"
+        :selected-date="store.selectedDate"
+      />
+
+      <!-- Ranks are a per-cell question and there is no region equivalent yet,
+           so region scope gets an honest empty state that offers the switch
+           rather than a disabled tab or, worse, a cell's ranking shown under a
+           region's heading. -->
+      <div
+        v-else-if="store.scope === 'region'"
+        class="flex grow flex-col items-center justify-center gap-3 px-6 text-center text-sm text-muted"
+      >
+        <p>Monthly ranks are per cell — there is no region ranking yet.</p>
+        <UButton size="xs" color="neutral" variant="subtle" icon="i-mdi-map-marker" label="Show the clicked cell" @click="store.setScope('point')" />
+      </div>
+
+      <template v-else>
+        <!-- Clamped, because the detail panel wants every pixel of height it can
+             get; the whole caption is one click away for anyone who needs it. -->
+        <button
+          v-if="ranksDescription"
+          type="button"
+          class="mb-2 shrink-0 cursor-pointer text-left text-xs leading-snug text-muted hover:text-default"
+          :class="captionOpen ? '' : 'line-clamp-2'"
+          :title="captionOpen ? 'Show less' : 'Show more'"
+          @click="captionOpen = !captionOpen"
+        >
+          {{ ranksDescription }}
+        </button>
+
+        <!-- `min-h-0 grow` rather than the component's own height: the caption
+             above it is a sibling of variable height, so the plot has to take
+             what is left over rather than a fixed share of the dock. -->
+        <MonthlyRankingBrowser
+          class="min-h-0 grow"
+          :ranking="store.monthlyRanking"
+          :stops="store.activeStops"
+          :loading="store.loadingPoint"
+          :empty-message="emptyPointMessage"
+          :selected-date="store.selectedDate"
+          :unit="store.activeUnitLabel"
+          :categorical="store.activeIsCategorical"
+          :precision="store.domain?.variables?.[store.variable]?.precision"
+          :rank-order="rankOrder"
+          @select="store.setDate($event)"
+        />
+      </template>
+    </SideDock>
+
+    <!-- Closed, the dock leaves a strip rather than vanishing: a panel with no
+         visible way back is a panel users do not find twice. -->
+    <button
+      v-else
+      type="button"
+      class="flex w-7 shrink-0 cursor-pointer flex-col items-center gap-2 border-r border-default bg-default py-3 text-muted transition-colors hover:text-default"
+      title="Show the panel"
+      @click="dockOpen = true"
+    >
+      <UIcon name="i-mdi-chevron-right" class="size-4" />
+      <span class="text-xs [writing-mode:vertical-rl]">Panel</span>
+    </button>
+
     <div class="flex min-w-0 grow flex-col">
       <div class="relative grow">
         <AnomalyMap />
@@ -12,10 +118,10 @@
 
       <div class="relative h-[38%] shrink-0 border-t border-default p-3">
         <TimeseriesChart
-          :series="store.pointSeries"
-          :loading="store.loadingPoint"
+          :series="store.activeSeries"
+          :loading="store.activeSeriesLoading"
           :empty-message="emptyPointMessage"
-          :title="pointTitle"
+          :title="chartTitle"
           :selected-date="store.selectedDate"
           :stops="store.activeStops"
           :zero-line="store.variable === 'anom'"
@@ -23,52 +129,8 @@
           :categorical="store.activeIsCategorical"
           @select="store.setDate($event)"
         />
-
-        <UButton
-          class="absolute right-4 top-4 z-20"
-          icon="i-mdi-podium-gold"
-          size="xs"
-          :color="ranksOpen ? 'primary' : 'neutral'"
-          :variant="ranksOpen ? 'solid' : 'subtle'"
-          label="Monthly ranks"
-          :disabled="!store.monthlyRanking && !ranksOpen"
-          @click="ranksOpen = !ranksOpen"
-        />
       </div>
     </div>
-
-    <SideDock
-      v-if="ranksOpen"
-      title="Monthly ranks"
-      :subtitle="ranksSubtitle"
-      storage-key="enso.ranksDock.width"
-      @close="ranksOpen = false"
-    >
-      <!-- Clamped, because the detail panel wants every pixel of height it can
-           get; the whole caption is one click away for anyone who needs it. -->
-      <button
-        v-if="ranksDescription"
-        type="button"
-        class="mb-2 shrink-0 cursor-pointer text-left text-xs leading-snug text-muted hover:text-default"
-        :class="captionOpen ? '' : 'line-clamp-2'"
-        :title="captionOpen ? 'Show less' : 'Show more'"
-        @click="captionOpen = !captionOpen"
-      >
-        {{ ranksDescription }}
-      </button>
-
-      <MonthlyRankingBrowser
-        :ranking="store.monthlyRanking"
-        :stops="store.activeStops"
-        :loading="store.loadingPoint"
-        :empty-message="emptyPointMessage"
-        :selected-date="store.selectedDate"
-        :unit="store.activeUnitLabel"
-        :categorical="store.activeIsCategorical"
-        :rank-order="rankOrder"
-        @select="store.setDate($event)"
-      />
-    </SideDock>
   </div>
 </template>
 
@@ -77,16 +139,86 @@ import { useMainStore } from '~/stores/main'
 
 const store = useMainStore()
 
+const TABS = [
+  { value: 'numbers' as const, label: 'Numbers', icon: 'i-mdi-numeric' },
+  { value: 'ranks' as const, label: 'Monthly ranks', icon: 'i-mdi-podium-gold' },
+]
+
+/**
+ * Opens on Numbers, and open. The panel needs no selection to have something to
+ * say — the app lands in region scope for exactly that reason — so there is
+ * nothing to be gained by making the first thing a user sees an empty dock.
+ */
+const tab = ref<'numbers' | 'ranks'>('numbers')
+const dockOpen = ref(true)
+const captionOpen = ref(false)
+
 const periodLabel = computed(
   () => ({ daily: 'daily', weekly: 'weekly mean', monthly: 'monthly mean' })[store.period],
 )
 
-const pointTitle = computed(() => {
-  const cell = store.pointSeries?.cell
+/**
+ * `shortName`, not `longName`. domain.yml's long names all begin "Daily ...",
+ * which is the *source's* cadence and collides with the period the panel is
+ * actually showing — "Daily sea surface temperature anomaly - 24 Aug to 30 Aug"
+ * invites reading a weekly mean as a single day.
+ */
+const variableLabel = computed(() => {
+  const meta = store.domain?.variables?.[store.variable]
+  return meta?.shortName || meta?.longName || store.variable
+})
+
+/**
+ * A cell as hemispheres, not signed degrees.
+ *
+ * Cells come back on the 0-360 convention the database stores, so most of this
+ * box's longitudes are above 180 and have to be unwrapped for display. Printing
+ * the signed result as "°E" gave `-168.125°E`, which is a compass direction
+ * contradicting its own sign.
+ */
+function formatCell(cell: { lat: number, lon: number } | undefined): string {
   if (!cell) return ''
   const lon = ((cell.lon + 180) % 360) - 180
-  return `${cell.lat.toFixed(3)}°N, ${lon.toFixed(3)}°E · ${periodLabel.value} · click the chart to move the map`
+  return `${Math.abs(cell.lat).toFixed(2)}°${cell.lat < 0 ? 'S' : 'N'}, `
+    + `${Math.abs(lon).toFixed(2)}°${lon < 0 ? 'W' : 'E'}`
+}
+
+/**
+ * What the panel is describing, said in the panel's own header.
+ *
+ * The scope switch is on the map now, so the header is a label rather than a
+ * control — but it still has to be there: the dock can be dragged wide enough
+ * that its numbers sit a long way from the button that chose them.
+ */
+const subjectTitle = computed(() => (store.scope === 'region'
+  ? store.activeRegionMeta?.label ?? 'Region'
+  : formatCell(store.pointSeries?.cell) || 'No cell selected'))
+
+const subjectSubtitle = computed(() => (store.scope === 'region'
+  ? 'Area mean over the region'
+  : store.pointSeries?.cell ? 'Nearest grid cell' : 'Click the map to pick one'))
+
+const pointTitle = computed(() => {
+  const cell = formatCell(store.pointSeries?.cell)
+  if (!cell) return ''
+  return `${cell} · ${periodLabel.value} · click the chart to move the map`
 })
+
+/**
+ * The region's own caption. No cell coordinates and no "click the chart" hint —
+ * clicking still moves the map, but a region series is read for its shape over
+ * time rather than for locating a place, and the box on the map already says
+ * where it is.
+ */
+const regionTitle = computed(() => {
+  const label = store.activeRegionMeta?.label
+  if (!label) return ''
+  return `${label} · area mean · ${periodLabel.value} · click the chart to move the map`
+})
+
+const chartTitle = computed(() =>
+  store.scope === 'region' ? regionTitle.value : pointTitle.value,
+)
 
 const emptyPointMessage = computed(
   () => store.outsideDomain ?? 'Click anywhere on the map to read that cell’s full record.',
@@ -98,16 +230,6 @@ const emptyPointMessage = computed(
  * severity — nothing about it is a temperature.
  */
 const rankOrder = computed(() => (store.variable === 'mhw' ? 'most severe' : 'warmest'))
-
-const ranksOpen = ref(false)
-const captionOpen = ref(false)
-
-const ranksSubtitle = computed(() => {
-  const cell = store.monthlyRanking?.cell
-  if (!cell) return 'Click the map to pick a cell'
-  const lon = ((cell.lon + 180) % 360) - 180
-  return `${cell.lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`
-})
 
 const ranksDescription = computed(() => {
   const span = store.monthlyRanking?.span

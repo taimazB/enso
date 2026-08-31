@@ -57,11 +57,32 @@ CLIM_GLOB = "ct5km_v3.1_clim-sst-mean-daily-window-01day-01grid-source*_day{mmdd
 VARIABLE_NAME = "analysed_sst"
 MHW_VARIABLE_NAME = "heatwave_category"
 
-# The lowest category that counts as a heatwave. Everything below is dropped at
-# ingest and drawn transparent: land (-127), ice (-1) and ocean with no heatwave
-# (0) are three different things but none of them is a marine heatwave, and this
-# layer exists to show where one is.
+# The category range that counts as a heatwave. Everything outside it is dropped
+# at ingest and drawn transparent: land, ice and heatwave-free ocean are three
+# different things but none of them is a marine heatwave, and this layer exists
+# to show where one is.
+#
+# **Both ends are load-bearing, and the upper one is the whole reason this is a
+# range rather than a floor.** NOAA re-encoded `heatwave_category` on
+# **2024-07-01**, mid-archive and without changing the filename, the version
+# string or the URL:
+#
+#     ..2024-06-30   int8   _FillValue=-127  valid_min=-2  land -127, ice -1
+#     2024-07-01..   uint8  _FillValue= 251  valid_min= 0  land and ice both 251
+#
+# A `raw >= 1` floor is correct on the first and catastrophic on the second: 251
+# is a *positive* number, so every land and ice cell passes it. It cost 1.7
+# billion junk rows in `mhw_daily` (787 days, ~46% of the table) and put land at
+# Cat 5 in every rendered frame from that date on — and nothing failed. The
+# ingest ran clean, `/coverage` reported the archive complete, and the only
+# outward sign was a region mean of 62 on a 1..5 scale.
+#
+# Testing `<= 5` instead of the file's own `_FillValue` is deliberate: 1..5 is
+# fixed by the product definition (it is the five names in the legend), so the
+# rule holds across both encodings and any third one NOAA ships next. The fill
+# value is what changed; the categories are what did not.
 MHW_MIN_CATEGORY = 1
+MHW_MAX_CATEGORY = 5
 
 
 def mmdd_of(date: dt.date) -> int:
@@ -129,9 +150,10 @@ def _read_raw(path: Path, *, squeeze_time: bool, var_name: str = VARIABLE_NAME) 
         var = ds.variables[var_name]
         # Raw shorts, not the masked/scaled floats netCDF4 would hand back — the
         # scale factor is reapplied by the ALIAS columns in ClickHouse, and by
-        # `as_celsius()` for rendering. For MHW this also matters for a second
-        # reason: auto-masking would collapse the fill value into a mask and lose
-        # the distinction between land (-127) and ice (-1).
+        # `as_celsius()` for rendering. For MHW it also keeps the fill value
+        # visible instead of collapsed into a mask — which is what lets
+        # `mhw_valid_mask` see, and reject, the 251 that the post-2024-07-01
+        # files use for land and ice.
         var.set_auto_maskandscale(False)
         return np.asarray(var[0] if squeeze_time else var[:])
 
@@ -151,8 +173,12 @@ def read_mhw_raw(date: dt.date, nc_dir: Path | None = None) -> np.ndarray:
     PNGs for the same product *are* north-up, which is a trap if the palette is
     ever re-derived from one.)
 
-    Values come back as the source's own codes: -127 land, -1 ice, 0 no
-    heatwave, 1..5 the categories.
+    Values come back as the source's own codes, and **which codes those are
+    depends on the date** — NOAA re-encoded the variable on 2024-07-01. Before:
+    int8, -127 land, -1 ice, 0 no heatwave. From then on: uint8, 251 for land
+    *and* ice together, 0 no heatwave. Only 1..5 mean the same thing in both,
+    which is why `mhw_valid_mask` bounds the range at both ends rather than
+    testing for a fill value. See `MHW_MIN_CATEGORY`.
     """
     return _to_project_frame(
         _read_raw(mhw_path(date, nc_dir), squeeze_time=True, var_name=MHW_VARIABLE_NAME),
@@ -161,8 +187,13 @@ def read_mhw_raw(date: dt.date, nc_dir: Path | None = None) -> np.ndarray:
 
 
 def mhw_valid_mask(raw: np.ndarray) -> np.ndarray:
-    """Cells that are actually in a heatwave — the only ones stored or drawn."""
-    return raw >= MHW_MIN_CATEGORY
+    """Cells that are actually in a heatwave — the only ones stored or drawn.
+
+    Bounded above as well as below. See `MHW_MIN_CATEGORY` for why: the upper
+    bound is what excludes the post-2024-07-01 files' 251 fill, which a floor
+    alone lets through as a heatwave four times worse than Cat 5.
+    """
+    return (raw >= MHW_MIN_CATEGORY) & (raw <= MHW_MAX_CATEGORY)
 
 
 def as_category(raw: np.ndarray) -> np.ndarray:
@@ -175,7 +206,7 @@ def as_category(raw: np.ndarray) -> np.ndarray:
     value has to be told apart from land and gets its own grey sentinel.)
     """
     out = raw.astype("float32")
-    out[raw < MHW_MIN_CATEGORY] = np.nan
+    out[~mhw_valid_mask(raw)] = np.nan
     return out
 
 

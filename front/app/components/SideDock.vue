@@ -1,30 +1,38 @@
 <template>
   <aside
-    class="relative flex min-h-0 shrink-0 flex-col border-l border-default bg-default"
+    class="relative flex min-h-0 shrink-0 flex-col bg-default"
+    :class="side === 'left' ? 'border-r border-default' : 'border-l border-default'"
     :style="{ width: `${width}px` }"
   >
     <!-- The dock and the map compete for the same width, and which one wins
          depends on what the user is doing — so it is a drag, not a constant.
          Arrow keys move it too: the handle is the only control here that a
-         pointer-only implementation would put out of reach. -->
+         pointer-only implementation would put out of reach. The key that widens
+         is the one pointing away from the map, whichever edge the dock is on. -->
     <div
       role="separator"
       aria-orientation="vertical"
-      :aria-label="`Resize ${title}`"
+      :aria-label="`Resize ${label}`"
       tabindex="0"
-      class="absolute inset-y-0 -left-1 z-20 w-2 cursor-col-resize touch-none transition-colors hover:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
-      :class="dragging ? 'bg-primary/40' : ''"
+      class="absolute inset-y-0 z-20 w-2 cursor-col-resize touch-none transition-colors hover:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
+      :class="[side === 'left' ? '-right-1' : '-left-1', dragging ? 'bg-primary/40' : '']"
       @pointerdown="startDrag"
-      @keydown.left.prevent="nudge(STEP)"
-      @keydown.right.prevent="nudge(-STEP)"
+      @keydown.left.prevent="nudge(side === 'left' ? -STEP : STEP)"
+      @keydown.right.prevent="nudge(side === 'left' ? STEP : -STEP)"
     />
 
-    <header class="flex shrink-0 items-start gap-2 border-b border-default py-2 pl-3 pr-2">
+    <header
+      v-if="title || $slots.header"
+      class="flex shrink-0 items-start gap-2 border-b border-default py-2 pl-3 pr-2"
+    >
       <div class="min-w-0 grow">
-        <h2 class="truncate text-sm font-semibold text-highlighted">{{ title }}</h2>
-        <p v-if="subtitle" class="truncate text-xs text-muted">{{ subtitle }}</p>
+        <slot name="header">
+          <h2 class="truncate text-sm font-semibold text-highlighted">{{ title }}</h2>
+          <p v-if="subtitle" class="truncate text-xs text-muted">{{ subtitle }}</p>
+        </slot>
       </div>
       <UButton
+        v-if="closable"
         icon="i-mdi-close"
         size="xs"
         color="neutral"
@@ -42,18 +50,29 @@
 
 <script setup lang="ts">
 const props = withDefaults(defineProps<{
-  title: string
+  title?: string
   subtitle?: string
+  /**
+   * Which edge it is docked to. Only the handle's side and the drag arithmetic
+   * differ — a left dock measures the pointer from 0, a right one from the
+   * window's width — but getting either wrong makes the handle drag the wrong
+   * way, which is why they are derived from one prop rather than duplicated.
+   */
+  side?: 'left' | 'right'
   /** localStorage key the width is remembered under; omit to not remember it. */
   storageKey?: string
   defaultWidth?: number
-}>(), { defaultWidth: 520 })
+  /** Show the close button. A dock that is part of the page layout has none. */
+  closable?: boolean
+}>(), { defaultWidth: 520, side: 'right', closable: true })
 
 const emit = defineEmits<{ close: [] }>()
 
 /**
- * Floor, not a taste call: the rail and the panel's 66px of rank labels are
- * fixed, so below this the detail's plot area stops being wide enough to read.
+ * Floor, not a taste call: the ranks view's rail and its 66px of fixed rank
+ * labels leave the detail plot unreadable below this. The numbers view is
+ * comfortable well under it, but the floor cannot depend on which tab is open —
+ * switching tabs would then resize the map.
  */
 const MIN = 420
 const MAX = 1000
@@ -63,6 +82,7 @@ const STEP = 24
 
 const width = ref(props.defaultWidth)
 const dragging = ref(false)
+const label = computed(() => props.title || 'panel')
 
 function clamp(w: number): number {
   const max = Math.min(MAX, Math.max(MIN, window.innerWidth - KEEP))
@@ -83,9 +103,11 @@ let stopDrag: (() => void) | null = null
 function startDrag(event: PointerEvent) {
   event.preventDefault()
   dragging.value = true
-  // The dock is flush to the right edge, so the pointer's distance from that
-  // edge *is* the width.
-  const onMove = (e: PointerEvent) => { width.value = clamp(window.innerWidth - e.clientX) }
+  // The dock is flush to one edge, so the pointer's distance from that edge
+  // *is* the width.
+  const onMove = (e: PointerEvent) => {
+    width.value = clamp(props.side === 'left' ? e.clientX : window.innerWidth - e.clientX)
+  }
   const onUp = () => { stopDrag?.() }
   stopDrag = () => {
     dragging.value = false

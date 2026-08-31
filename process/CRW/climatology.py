@@ -8,6 +8,28 @@ date.
 anomaly series reads 366 contiguous rows for its cell. Whole-day reads across
 all cells are deliberately not served here, because image generation reads the
 climatology NetCDF directly instead — the 366 files are 1.6 GB and kept forever.
+
+### Where the files come from
+
+There is no download code for them — they are fetched once, by hand, from a
+**different product tree** than the dailies. Not under `5km/v3.1_op/`, whose
+`climatology/` holds only a single combined file on the *older* baseline:
+
+    .../crw/data/5km/v3.1-clim19912020-v1/climatology/nc/
+        ct5km_v3.1_clim-sst-mean-daily-window-01day-01grid-source19912020_day{MMDD}.nc
+
+Recording it here because "kept forever" is not the same as "safe". One of the
+366 was found silently bit-rotted on disk months after `init` loaded it: the
+file still opened, its metadata and byte count were intact, and only a full read
+of `analysed_sst` raised `NetCDF: HDF error`. Re-downloading gave a byte-identical
+size, so nothing about the file on disk advertised the damage.
+
+The failure it caused is worth recognising, because it points at the wrong
+place: **`ingest.read_day()` reads the climatology to compute `has_clim`**, so a
+corrupt clim file fails the *daily* ingest, and the traceback names the daily
+file. The signature is a whole MMDD missing from `sst_daily` across many years
+at once — one bad clim file, not many bad dailies. `verify_files()` below is the
+cheap check; the daily files are innocent until it says otherwise.
 """
 
 from __future__ import annotations
@@ -39,6 +61,31 @@ def missing_files(clim_dir=None) -> list[int]:
             clim_path(mmdd, clim_dir)
         except FileNotFoundError:
             out.append(mmdd)
+    return out
+
+
+def verify_files(clim_dir=None) -> list[tuple[int, str]]:
+    """MMDD keys whose file will not read, as `(mmdd, reason)`.
+
+    Deliberately reads the **whole** `analysed_sst` array rather than opening
+    the file and trusting it. Bit rot in a data chunk leaves the header, the
+    variable list and the byte count all intact, so anything short of a full
+    read reports a damaged file as healthy — which is exactly how one sat
+    undetected here for months. `missing_files()` is not a substitute: the file
+    was present the entire time.
+
+    ~366 x 51 MB of reads, so a couple of minutes. Worth running before an
+    `init`, and worth reaching for whenever a single MMDD fails to ingest across
+    many years at once.
+    """
+    out: list[tuple[int, str]] = []
+    for mmdd in MMDD_KEYS:
+        try:
+            read_clim_raw(mmdd, clim_dir)
+        except FileNotFoundError:
+            out.append((mmdd, "missing"))
+        except Exception as exc:  # noqa: BLE001 — any read failure disqualifies the file
+            out.append((mmdd, f"{type(exc).__name__}: {exc}"))
     return out
 
 

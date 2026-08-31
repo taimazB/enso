@@ -160,6 +160,56 @@ DDL: tuple[str, ...] = (
     ENGINE = ReplacingMergeTree(updated_at)
     ORDER BY (region, mmdd)
     """,
+    # Per named region, the area means for each DATE: 8 regions x 15,211 days =
+    # ~121,688 rows. This is the rollup that `region_clim` is not.
+    #
+    # `region_clim` above precomputes the CLIMATOLOGY side of a region anomaly,
+    # measured at 0.296 s live against a daily side of 12.14 s for Nino 3.4 — so
+    # it removes 2.4% of the request. This table is the other 97.6%: the query it
+    # replaces runs 3.14 s for the smallest named region and 12.14 s for Nino
+    # 3.4, which is not a latency anything interactive can be built on.
+    #
+    # THERE ARE TWO SST COLUMNS AND THEY ARE NOT REDUNDANT. `region_timeseries()`
+    # restricts the daily mean to `has_clim = 1` for `anom` and deliberately does
+    # NOT for `sst`, so the two variables average different cell sets — and the
+    # gap is not small, because the climatological ice edge moves through the
+    # year. The Bering Sea box holds 70,166 ocean cells but only 12,086 with a
+    # climatology on 15 March. Serving `anom` from `mean_sst` would break the
+    # `mean(sst - clim) == mean(sst) - mean(clim)` identity exactly where a
+    # marine-heatwave question gets asked.
+    #
+    # `mean_mhw` is the cos(lat)-weighted mean category over the box's OCEAN, not
+    # over its heatwave cells: numerator from the sparse `mhw_daily`, denominator
+    # from `sst_daily`, which is the only table that knows which cells are ocean
+    # on a given date. A date with no heatwave anywhere in the box is a real 0.
+    #
+    # Nothing here is a bucket. Weekly and monthly reduction stays in
+    # `region_timeseries()`, which folds these daily rows in Python through
+    # `shared.periods` — so the rollup cannot drift from the point path's idea of
+    # what a week is.
+    f"""
+    CREATE TABLE IF NOT EXISTS {DATABASE}.region_daily
+    (
+        region         LowCardinality(String),
+        date           Date    CODEC(DoubleDelta, ZSTD(3)),
+
+        -- Over every ocean cell in the box. Serves `sst`.
+        mean_sst       Float32,
+        n_cells        UInt32,
+
+        -- Over the box's `has_clim = 1` cells only. Serves `anom`, after
+        -- subtracting `region_clim` for the date's MMDD.
+        mean_sst_clim  Float32,
+        n_cells_clim   UInt32,
+
+        -- sum(cat * cos(lat)) over mhw_daily / sum(cos(lat)) over sst_daily.
+        mean_mhw       Float32,
+
+        updated_at     DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY (region, date)
+    """,
     # NOAA CRW Marine Heatwave category, one row per (date, cell) — but ONLY for
     # cells actually in a heatwave.
     #

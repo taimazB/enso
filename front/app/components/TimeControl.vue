@@ -113,6 +113,23 @@
     <span v-if="store.period !== 'daily' && store.selectedDate" class="pr-1 text-xs text-muted">
       {{ bucketLabel(store.selectedDate, store.period) }}
     </span>
+
+    <!-- Exports the series the chart is drawing, at the current variable and
+         period, rather than issuing a request of its own: a second path to the
+         same numbers would be a second definition of "the weekly mean".
+         `ml-auto` parks it at the far right, away from the controls that change
+         what is plotted — it is the one button here that leaves the app. -->
+    <UButton
+      icon="i-mdi-download"
+      label="Download data"
+      variant="ghost"
+      color="neutral"
+      size="xs"
+      class="ml-auto shrink-0"
+      :disabled="!canExport"
+      :title="canExport ? `Download this ${periodWord} series as CSV` : 'Nothing plotted to download'"
+      @click="exportSeries()"
+    />
   </div>
 </template>
 
@@ -120,6 +137,7 @@
 import { useMainStore } from '~/stores/main'
 import { PERIODS, bucketLabel, bucketStart, bucketsPerYear, shiftBuckets } from '~/utils/periods'
 import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
+import { cellSlug, downloadCsv, seriesCsv, slug } from '~/utils/csv'
 
 const store = useMainStore()
 
@@ -179,5 +197,35 @@ function clamp(iso: string): string {
 function step(buckets: number) {
   if (!store.selectedDate) return
   store.setDate(clamp(shiftBuckets(store.selectedDate, store.period, buckets)))
+}
+
+const canExport = computed(() => (store.activeSeries?.dates.length ?? 0) > 0)
+
+const periodWord = computed(() => ({ daily: 'daily', weekly: 'weekly', monthly: 'monthly' })[store.period])
+
+/**
+ * Save the plotted series.
+ *
+ * The filename carries everything that decides what the numbers ARE — variable,
+ * period, subject and span — because a folder of `timeseries.csv` files is
+ * indistinguishable a week later, and the two subjects a series can have (a
+ * clicked cell, a named region) are not comparable numbers.
+ */
+function exportSeries() {
+  const series = store.activeSeries
+  if (!series?.dates.length) return
+  const subject = store.scope === 'region'
+    ? slug(store.activeRegionMeta?.label ?? store.activeRegion ?? 'region')
+    : series.cell ? cellSlug(series.cell) : 'point'
+  const span = `${series.dates[0]}_${series.dates[series.dates.length - 1]}`
+  downloadCsv(
+    `${store.variable}_${store.period}_${subject}_${span}.csv`,
+    seriesCsv(series, {
+      variable: store.variable,
+      period: store.period,
+      unit: store.activeUnitLabel,
+      precision: store.domain?.variables?.[store.variable]?.precision,
+    }),
+  )
 }
 </script>

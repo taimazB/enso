@@ -44,9 +44,11 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
   python -m CRW.cli <command>
 
 python -m CRW.cli init                                    # tables + climatology + region means
+python -m CRW.cli verify-clim                             # full-read all 366 climatology files
 python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested, per archive
 python -m CRW.cli backfill [--start|--end] [--product sst|mhw] [--reverse] [--fresh] [--delete-nc]
 python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
+python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh]   # region_daily
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
 ```
@@ -67,6 +69,18 @@ MMDD keys already present.
 docker compose -f docker-compose.dev.yml --env-file .env.dev exec db-ch \
   clickhouse-client --database enso --query "SHOW TABLES"
 ```
+
+**Build the region rollup** (after both archives are ingested, not during):
+```bash
+docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm --no-deps process \
+  python -m CRW.cli rollup --fresh
+```
+`backfill` deliberately does not maintain `region_daily` per date — one pass per region
+over the whole range reduces the big tables once, where a per-date hook would re-run eight
+aggregations 15,212 times. Same split as `render`. `run` is the exception and appends the
+single date it just ingested. **Roll up only once `mhw_daily` is complete**: `mean_mhw`
+divides a sparse numerator by an `sst_daily` denominator, so a partial MHW archive freezes
+confident zeros into the rollup, where they are harder to spot than in the sparse table.
 
 **Render the image cache in bulk:**
 ```bash
@@ -132,11 +146,10 @@ sees SST published and MHW not. That is why the two are tracked and processed
 independently rather than paired, and why the catch-up watermark is the earlier of the
 two.
 
-The variable is `heatwave_category` — `int8`, `_FillValue = -127`. Same 7200×3600 grid,
-**same latitude orientation as the dailies** (`lat[0] = -89.975`, so no flip), same
-longitude roll. Verified: the box's land mask matches `sst_daily` exactly at 7,477,923
-ocean cells. (NOAA's own browse PNGs for this product *are* north-up — a trap if the
-palette is ever re-derived from one.)
+The variable is `heatwave_category`. Same 7200×3600 grid, **same latitude orientation as
+the dailies** (`lat[0] = -89.975`, so no flip), same longitude roll. Verified: the box's
+land mask matches `sst_daily` exactly at 7,477,923 ocean cells. (NOAA's own browse PNGs for
+this product *are* north-up — a trap if the palette is ever re-derived from one.)
 
 Four states, and only one of them is drawn:
 
@@ -147,10 +160,46 @@ Four states, and only one of them is drawn:
 | 0 | ocean, no heatwave | no | transparent |
 | 1..5 | Moderate / Strong / Severe / Extreme / Beyond extreme | yes | NOAA's palette |
 
+**NOAA re-encoded this variable on 2024-07-01, mid-archive, without changing the filename,
+the `v1.0.1` version string or the URL.** The table above is the *old* encoding; land and
+ice are no longer distinguishable in the file at all:
+
+| | dtype | `_FillValue` | `valid_min` | land | ice |
+|---|---|---|---|---|---|
+| …2024-06-30 | `int8` | −127 | −2 | −127 | −1 |
+| 2024-07-01… | `uint8` | **251** | 0 | 251 | 251 |
+
+**`shared/fields.py`'s `mhw_valid_mask` therefore bounds the category range at both ends —
+`1 <= raw <= 5` — and must keep doing so.** The obvious `raw >= 1` is correct on the first
+encoding and catastrophic on the second, because 251 is a *positive* number: every land and
+ice cell passes as a heatwave four times worse than Cat 5.
+
+**Nothing about that failure is loud**, which is the part worth remembering. The ingest ran
+clean, `/coverage` reported the archive complete, `mhw_daily` filled with 1.7 billion rows
+of `cat = 251` (787 days, ~46% of the table), and every rendered frame from that date drew
+land at Cat 5. It surfaced only as a region area mean of **62** on a 1–5 scale — which the
+chart could not draw at all, because its y-axis is pinned to 0..5.
+
+Testing `<= 5` rather than the file's own `_FillValue` is deliberate: 1..5 is fixed by the
+product definition — it is the five names in the legend — so the rule survives both
+encodings and whatever NOAA ships next. The fill value is what changed; the categories are
+what did not.
+
 **The climatology is a second archive**: 366 files in `./data/climatology/`, mounted at
 `/opt/data/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
 mapping rule to invent. Baseline 1991–2020. 1.6 GB, static, and **kept forever**: image
 rendering reads it straight off disk.
+
+They come from a **different tree than the dailies** — not `5km/v3.1_op/`, whose
+`climatology/` holds only one combined file on the older baseline:
+
+```
+.../crw/data/5km/v3.1-clim19912020-v1/climatology/nc/
+    ct5km_v3.1_clim-sst-mean-daily-window-01day-01grid-source19912020_day{MMDD}.nc
+```
+
+There is no download code for them; they are fetched once by hand. **"Kept forever" is not
+the same as "safe"** — see the bit-rot gotcha below.
 
 #### Two orientation conventions, both of which fail silently
 
@@ -267,7 +316,47 @@ consequences, both load-bearing:
    offer the variable until it is true. This is the same shape as `climatology.complete`
    gating `anom`, but sharper: there is no value that could signal the difference.
 
-**`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The entire precomputation layer.
+**`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The climatology side of a
+region anomaly.
+
+**`region_daily`** — 8 regions × 15,212 days = **~121,700 rows**. The daily side, and the
+one that actually costs something.
+
+```sql
+region         LowCardinality(String)
+date           Date
+mean_sst       Float32   -- over every ocean cell in the box      -> sst
+n_cells        UInt32
+mean_sst_clim  Float32   -- over its has_clim = 1 cells only      -> anom
+n_cells_clim   UInt32
+mean_mhw       Float32   -- sum(cat*cos) / sum(cos) over the ocean -> mhw
+ENGINE = ReplacingMergeTree(updated_at) ORDER BY (region, date)
+```
+
+**Measured, this is the 97.6% that `region_clim` is not.** The climatology side costs
+0.296 s live against a daily side of 12.14 s for Niño 3.4 — so `region_clim` removes 2.4%
+of the request. The live daily query runs **3.14 s** for the smallest named region (Niño
+1+2, 38,455 cells) and **12.14 s** for Niño 3.4 (201,392 cells), which is not a latency an
+interactive panel can be built on. That measurement is what the "deliberately absent until
+measurement says otherwise" note above `region_daily` was waiting for.
+
+**The two SST columns are not redundant, and collapsing them is the way this table gets
+silently wrong.** `region_timeseries()` restricts the daily mean to `has_clim = 1` for
+`anom` and deliberately does not for `sst`, so the two variables average different cell
+sets — and the gap moves through the year with the climatological ice edge. The Bering Sea
+box holds 70,166 ocean cells but only **12,086** with a climatology on 15 March. Serving
+`anom` from `mean_sst` would break the `mean(sst - clim) == mean(sst) - mean(clim)`
+identity exactly over the ice fringe, which is where a marine-heatwave question gets asked.
+
+**No bucketing lives here.** Weekly and monthly reduction stays in `region_timeseries()`,
+which folds these daily rows in Python through `shared/periods.py`. Materialising weeks
+would put a second definition of "a week" in the codebase — the drift retiring
+`api/prerender.py` was meant to end. `mean_sst_clim` is **NaN**, not 0, when a region has
+no climatology cells at all on a date; no configured region hits this, but a 0 there would
+read as "exactly at climatology".
+
+**Only named regions have a rollup.** `/regionTimeseries` on an arbitrary box still
+aggregates live, and that is the only difference between the two endpoints.
 
 **`ingest_status`** / **`mhw_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one
 row per day, one table per archive. Two tables rather than one with a `product` column
@@ -320,12 +409,11 @@ Four decisions worth not undoing:
   sits, which is exactly where a marine-heatwave question gets asked. Verified equal to
   three decimals against a direct cell-wise `avg(sst - clim)`.
 
-**Region timeseries are queried live, not precomputed.** Named regions are 0.6–14.6 B rows
-over the archive (Niño 3.4 is 3.04 B; the PDO box, the largest, 14.55 B), and
-`ORDER BY (gy, gx, date)` makes a box a set of contiguous key ranges — one per `gy` — not a
-scan. A `region_daily` rollup would be 8 × 15,211 = 122 k rows and can be added later as a
-pure cache without touching the big table, so it is deliberately absent until measurement
-says otherwise.
+**Named-region timeseries are served from `region_daily`; arbitrary boxes are queried
+live.** Named regions are 0.6–14.6 B rows over the archive (Niño 3.4 is 3.04 B; the PDO
+box, the largest, 14.55 B), and `ORDER BY (gy, gx, date)` makes a box a set of contiguous
+key ranges — one per `gy` — not a scan. That is still 3.14–12.14 s, so the rollup was added
+exactly as predicted: a pure cache, 8 × 15,212 rows, without touching the big table.
 
 ### Process pipeline (`process/`)
 
@@ -334,6 +422,7 @@ Entry point `process/CRW/cli.py` (`python -m CRW.cli`). Modules:
 - `download.py` — NOAA CRW fetching; a `Product` value per archive (`SST`, `MHW`)
 - `ingest.py` — NetCDF → ClickHouse; a `Target` per archive (`SST_TARGET`, `MHW_TARGET`)
 - `climatology.py` — the 366-file load and `region_clim`
+- `regions.py` — the `region_daily` rollup (`CRW.cli rollup`)
 - `imaging.py` — day/week/month × sst/anom/mhw rendering, and the retention window
 - `status.py` — the `ingest_status` table
 
@@ -595,9 +684,40 @@ app/composables/usePlayback.ts     play/stop loop + frame prefetch for the map a
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
 app/utils/ranking.ts               ranking layout + both ECharts options (pure -> testable headlessly)
 app/utils/colorScale.ts            domain.yml's colour stops evaluated at a single value
+app/utils/csv.ts                   CSV export of the plotted series and the rankings (pure text + one download)
 app/app.config.ts                  maps Nuxt UI's internal icons onto mdi
 app/stores/main.ts                 Pinia store
 ```
+
+#### Downloading what is plotted
+
+Two download buttons, both exporting **the data the chart already has** rather than issuing
+a request of their own — a second path to the same numbers would be a second definition of
+"the weekly mean", the drift `shared/buckets.py` exists to prevent. `utils/csv.ts` is pure
+text-building plus a single DOM-touching `downloadCsv()`, for the same reason `ranking.ts`
+and `stats.ts` are pure.
+
+- **`TimeControl`'s button saves the series**, at whatever variable, period and scope the
+  chart is on. Columns are `start_date,end_date,<variable>` — **both** date columns, on
+  every period: a weekly row labelled `2024-05-06` is a mean over seven days, and a file
+  saying only `date` invites reading it as that Monday's reading. On a daily series the two
+  are equal, which is honest rather than redundant. A null value is an **empty field**; any
+  placeholder would read back as a reading.
+- **`MonthlyRankingBrowser`'s button saves all twelve months**, not the one the rail has
+  open — the rail shows one at a time because 45 rows twelve times over is unreadable on
+  screen, which is not a limit a file has, and a `month` column is what makes the table
+  filterable. `partial` is carried as a boolean: it is the difference between a settled rank
+  and one that will move.
+
+Filenames carry everything that decides what the numbers are —
+`anom_weekly_nino-3-4_1984-12-31_2026-08-24.csv`,
+`anom_monthly-ranks_47-98n_127-98w.csv` — because a folder of `timeseries.csv` files
+is indistinguishable a week later, and a cell and a region are not comparable numbers.
+Cells are slugged as hemispheres for the same reason `index.vue` prints them that way: the
+0-360 longitudes the API returns would name 128 W as `232.00`.
+
+Values are written through `toFixed` at the variable's own precision — the API's floats
+arrive as `0.20200000000000001`, which a spreadsheet shows verbatim.
 
 **The chart rail is point-only, and the map click is the only selection.** There was a
 `Point | Region mean` tab pair here; the region side is gone from the UI, though
@@ -814,6 +934,41 @@ all.)
 Stepping days calls `ImageSource.updateImage()` rather than removing and re-adding the
 layer, so the basemap does not flash between frames.
 
+**The active region's box is a GeoJSON polygon, and it needs neither of the raster's two
+workarounds.** Every named region's east edge is above 180 and three cross the antimeridian
+(Niño 4 160..210, Bering Sea 180..200, PDO 180..250). Verified in Chromium in **both**
+projections: an unwrapped ring draws as one continuous box on the globe and on Mercator —
+no westward second copy, no split ring, no MultiPolygon. Splitting at 180 was tried and is
+unnecessary. The edges *are* densified (a vertex every 2°), because a region box follows a
+parallel and a four-corner polygon would draw the PDO box's 70°-wide edges as straight
+chords bowing off it.
+
+**`queryRenderedFeatures` is not a witness on the globe** — it returns 0 for a box that is
+plainly on screen. This is the same lesson as `preserveDrawingBuffer: false`: take a
+screenshot and look at it.
+
+**Only one box is ever drawn, and only in region scope.** The box is the visual half of what
+the numbers panel is reading, so the two are one selection seen twice rather than a layer
+with a toggle of its own.
+
+**Selecting a region flies the camera to it** (`frameRegion()`), because Nino 1+2 is 10
+degrees wide on a basin that spans 190 and an amber rectangle at 3% of the map's width is
+something you have to go looking for. It uses `fitBounds` **on the globe too** — unlike
+`frame()`, which cannot, since half a 190-degree box sits behind the limb at any zoom that
+fits it; the widest region is the PDO box at 70 degrees, which frames fine on the sphere
+(verified in Chromium, screenshot). Longitudes go in unwrapped like everywhere else here,
+and Mapbox wraps the resulting centre itself — Nino 4 at 160..210 lands centred on -175,
+the Bering Sea at 180..200 on -170. `maxZoom` (4.5) keeps the smallest boxes from filling
+the pane with no coastline around them to say where they are. Leaving region scope moves
+nothing: the pin is already where the user clicked. Switching projection while a region is
+active re-frames to the *region*, not back out to the whole basin.
+
+**`map.isStyleLoaded()` is not "can I add layers".** It reports whether every source in the
+style has settled and is routinely **false** on a fully drawn map — measured at 10 s into a
+loaded page with both raster layers up. Guarding layer creation on it silently skips the
+layer forever. `AnomalyMap.vue` tracks a `styleReady` flag set in the `load` handler, which
+is the actual precondition.
+
 **Charts**: always ECharts, never a hand-rolled `<canvas>`. The point series is ~15k daily
 values; `dataZoom` is what makes that browsable.
 
@@ -845,16 +1000,48 @@ alone drags a 25–30 °C SST record down against a 0–30 axis and draws it as 
 - **`api` needs `netCDF4` too.** It renders the head of the archive (buckets still inside
   the retention window) from file. Historical frames come from the image cache, never from
   ClickHouse.
+- **The MHW category's on-disk encoding changes on 2024-07-01**, at a URL and filename that
+  do not. Anything reading `heatwave_category` must bound the value at 1..5 rather than
+  testing a sign or a fill value — see the source section above for what a floor alone
+  costs. The check that catches it in one line, and which belongs in any future test suite:
+  `SELECT count() FROM mhw_daily WHERE cat > 5` must be 0.
 - **A missing `mhw_daily` row is not a zero, it is an unknown.** The table is sparse by
   design, and the LEFT JOIN that restores its zeros cannot tell heatwave-free ocean from a
   date that was never ingested. Anything new that reads it must either go through that join
   *and* respect `/coverage`'s `mhw.complete`, or be honest that it is reporting zeros it
   cannot vouch for.
+- **A corrupt climatology file fails the *daily* ingest, and the traceback blames the daily
+  file.** `ingest.read_day()` reads the climatology to compute `has_clim`, so one unreadable
+  clim file takes out that MMDD **in every year at once** while the daily files are fine.
+  Found in practice: `day1106` had silently bit-rotted on disk months after `init` loaded
+  it, and every 1988–2011 Nov 6 failed with `NetCDF: HDF error`. The signature to recognise
+  is *one MMDD missing across many years*; `CRW.cli verify-clim` is the check, and
+  re-downloading that one file plus `backfill --product sst` is the whole fix.
+  - Only the older half failed because the backfill ran newest-first and the rot appeared
+    partway through — so the boundary year says when, not what.
+  - **The file gives nothing away**: it opened, listed all its variables, and had a byte
+    count identical to the re-downloaded copy. Only a full read of `analysed_sst` raised.
+    That is why `verify_files()` reads the whole array and `missing_files()` is not a
+    substitute — the file was present the entire time.
+  - **ClickHouse was unaffected** (`sst_clim` still had all 366 keys, loaded before the
+    rot), and so was the imagery, which had been rendered before it. Only the ingest of
+    dates processed after the rot was lost.
 - **Never truncate `sst_daily` without `ingest_status`.** Emptying one and not the other
   makes every day look already-ingested, and `ingest_files` then issues an
   `ALTER … DELETE` mutation per day against rows that do not exist — on a full archive that
   is ~15 k synchronous no-op mutations and dwarfs the inserts they precede. `backfill
   --fresh` does both together for exactly this reason.
+- **An ECharts `piecewise` visualMap whose pieces are exact `value`s draws the line
+  invisible.** ECharts turns the pieces into a y-axis gradient, and a `{ value: 1 }` piece
+  becomes a *zero-width* band with `stop-opacity: 0` on both sides — so every value that is
+  not exactly a class gets no ink at all. `mhw`'s chart shipped that way: the pane looked
+  empty while still answering clicks (the ZRender handler is on the canvas, not the line),
+  and in region scope nothing could ever show, since an area mean of classes never lands on
+  an integer. The pieces are half-open bands (`gte`/`lt`) now, which also matches the map's
+  `step` ramp. A region's series is not a category in two more places: it is printed
+  rounded rather than named, and its y-axis is not pinned to 0..5 — an archive that never
+  leaves 0..1.5 drawn against five classes is a flat line on the axis floor.
+
 - **Nuxt UI's own icons default to the `lucide` collection**, and only `@iconify-json/mdi`
   is installed. A component reaching for one of its internal icons (`UModal`'s close button
   is the first that does) logs `Collection lucide is not found locally` and renders nothing.

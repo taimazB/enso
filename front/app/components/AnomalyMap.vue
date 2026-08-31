@@ -2,22 +2,25 @@
   <div class="relative size-full">
     <div ref="container" class="size-full" />
 
-    <UFieldGroup
-      v-if="token"
-      size="xs"
-      class="absolute left-2 top-2 z-10 rounded-lg shadow-lg"
-    >
-      <UButton
-        v-for="item in PROJECTIONS"
-        :key="item.value"
-        :icon="item.icon"
-        :label="item.label"
-        :color="projection === item.value ? 'primary' : 'neutral'"
-        :variant="projection === item.value ? 'solid' : 'subtle'"
-        :title="item.title"
-        @click="setProjection(item.value)"
-      />
-    </UFieldGroup>
+    <!-- Everything that changes what the map is showing, in one column: how it
+         is projected, then what is being read off it. Stacked with a gap rather
+         than positioned individually so neither has to know the other's height. -->
+    <div class="absolute left-2 top-2 z-10 flex flex-col items-start gap-2">
+      <UFieldGroup v-if="token" size="xs" class="rounded-lg shadow-lg">
+        <UButton
+          v-for="item in PROJECTIONS"
+          :key="item.value"
+          :icon="item.icon"
+          :label="item.label"
+          :color="projection === item.value ? 'primary' : 'neutral'"
+          :variant="projection === item.value ? 'solid' : 'subtle'"
+          :title="item.title"
+          @click="setProjection(item.value)"
+        />
+      </UFieldGroup>
+
+      <ScopeControl />
+    </div>
 
     <div
       v-if="!token"
@@ -64,6 +67,12 @@ const WEST_SOURCE_ID = 'field-image-west'
 const WEST_LAYER_ID = 'field-layer-west'
 const WORLD = 360
 
+const REGION_SOURCE_ID = 'region-box'
+const REGION_FILL_ID = 'region-box-fill'
+const REGION_LINE_ID = 'region-box-line'
+/** Amber, matching the chart's MAP markLine — "where the app is looking". */
+const REGION_COLOR = '#05df72'
+
 type ProjectionName = 'globe' | 'mercator'
 
 const PROJECTIONS = [
@@ -84,6 +93,15 @@ const PROJECTION_KEY = 'enso.map.projection'
 const GLOBE_VIEW = { center: [-128, 48] as [number, number], zoom: 3 }
 
 const projection = ref<ProjectionName>('globe')
+
+/**
+ * Whether the style has finished loading and layers may be added.
+ *
+ * Tracked here rather than asked of Mapbox: `isStyleLoaded()` answers a
+ * different question — whether every source has settled — and is routinely
+ * false on a fully drawn map.
+ */
+let styleReady = false
 
 /** Move (or create) the pin marking the selected cell. */
 function showMarker(lat: number, lon: number) {
@@ -246,6 +264,104 @@ function fieldLayers(): Array<{ layer: string, source: string, offset: number }>
   return layers
 }
 
+/**
+ * The active region's box, as a densified GeoJSON polygon.
+ *
+ * TWO THINGS HERE ARE NOT DECORATION.
+ *
+ * 1. **The edges are densified.** A region box is a rectangle in lat/lon, not in
+ *    any projection: its north and south edges follow a parallel, which is a
+ *    curve on the globe and on Mercator both. The PDO domain spans 70 degrees of
+ *    longitude, so a four-corner polygon would be drawn as a straight chord and
+ *    bow off the parallel by a visible margin — putting the box somewhere other
+ *    than the data it summarises. A vertex every `EDGE_STEP` degrees keeps it on
+ *    the parallel.
+ *
+ * 2. **Longitudes stay unwrapped**, matching the image source and `/domain`'s own
+ *    convention. Every region's east edge is above 180 and three of the eight
+ *    cross the antimeridian outright (Nino 4 at 160..210, the Bering Sea at
+ *    180..200, the PDO box at 180..250). Normalising east into -180..180 would
+ *    make west > east — the same collapse `imageCoordinates()` documents.
+ *
+ *    **Verified in Chromium, both projections**, because the raster needed a
+ *    second westward quad to survive the globe and there was no reason to
+ *    assume a polygon would not: Nino 4 and the PDO box each draw as ONE
+ *    continuous box across the dateline on the globe and on Mercator. No split
+ *    ring, no MultiPolygon, no second copy. Splitting them at 180 was tried and
+ *    is not needed.
+ *
+ *    Do not re-derive that from `queryRenderedFeatures`: on the globe it returns
+ *    0 for a box that is plainly drawn on screen. Screenshot it, as CLAUDE.md
+ *    says for the canvas.
+ */
+const EDGE_STEP = 2
+
+function densify(from: number, to: number, at: (v: number) => [number, number]): Array<[number, number]> {
+  const steps = Math.max(1, Math.ceil(Math.abs(to - from) / EDGE_STEP))
+  return Array.from({ length: steps }, (_, i) => at(from + ((to - from) * i) / steps))
+}
+
+function regionPolygon(region: { lat: [number, number], lon: [number, number] }) {
+  const [south, north] = [...region.lat].sort((a, b) => a - b)
+  const [west, east] = [...region.lon].sort((a, b) => a - b)
+  const ring = [
+    ...densify(west, east, lon => [lon, north]),
+    ...densify(north, south, lat => [east, lat]),
+    ...densify(east, west, lon => [lon, south]),
+    ...densify(south, north, lat => [west, lat]),
+  ]
+  ring.push(ring[0]!)
+  return { type: 'Feature' as const, properties: {}, geometry: { type: 'Polygon' as const, coordinates: [ring] } }
+}
+
+/**
+ * Draw the region the app is currently reading, or nothing.
+ *
+ * Only ONE box is ever on the map, and only in region scope — the box is the
+ * visual half of what the numbers panel is showing, so the two are the same
+ * selection seen twice rather than two independent controls. Clicking a point
+ * moves the app to point scope and the box goes with it.
+ */
+function syncRegionBox() {
+  // NOT `map.isStyleLoaded()`. That reports whether every source in the style
+  // has settled, not whether layers can be added, and it stays false long after
+  // 'load' has fired and the raster layers are up — measured at 10 s into a
+  // loaded page. Guarding on it silently skipped the box forever. `styleReady`
+  // is set in the 'load' handler, which is the actual precondition.
+  if (!map || !styleReady) return
+  const region = store.scope === 'region' ? store.activeRegionMeta : null
+
+  if (!region) {
+    if (map.getLayer(REGION_FILL_ID)) map.removeLayer(REGION_FILL_ID)
+    if (map.getLayer(REGION_LINE_ID)) map.removeLayer(REGION_LINE_ID)
+    if (map.getSource(REGION_SOURCE_ID)) map.removeSource(REGION_SOURCE_ID)
+    return
+  }
+
+  const data = regionPolygon(region)
+  const existing = map.getSource(REGION_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined
+  if (existing) {
+    existing.setData(data)
+    return
+  }
+
+  map.addSource(REGION_SOURCE_ID, { type: 'geojson', data })
+  // A wash rather than a tint: the field underneath is the thing being read, and
+  // a fill heavy enough to notice would shift every colour inside the box.
+  map.addLayer({
+    id: REGION_FILL_ID,
+    type: 'fill',
+    source: REGION_SOURCE_ID,
+    paint: { 'fill-color': REGION_COLOR, 'fill-opacity': 0.07 },
+  })
+  map.addLayer({
+    id: REGION_LINE_ID,
+    type: 'line',
+    source: REGION_SOURCE_ID,
+    paint: { 'line-color': REGION_COLOR, 'line-width': 2, 'line-opacity': 0.9 },
+  })
+}
+
 /** The ramp, mix and range all change with the variable, not just the URL. */
 function applyPaint() {
   if (!map || !map.getLayer(LAYER_ID)) return
@@ -276,14 +392,57 @@ function frame(animate = true) {
   })
 }
 
+/**
+ * Fly to the active region's box.
+ *
+ * The box is the visual half of what the numbers panel is reading, so selecting
+ * a region moves the camera to it rather than leaving the user to find an amber
+ * rectangle somewhere on a 190-degree-wide basin — Nino 1+2 is 10 degrees wide
+ * on a box that spans 190, i.e. about 3% of its width.
+ *
+ * Longitudes stay **unwrapped**, as everywhere else here: three regions cross
+ * the antimeridian (Nino 4 at 160..210, the Bering Sea at 180..200, the PDO box
+ * at 180..250) and normalising east into -180..180 would make west > east, which
+ * `fitBounds` reads as a bounds running the long way round the planet. Mapbox
+ * projects 250 the same way it projects the polygon's vertices and wraps the
+ * resulting centre itself.
+ *
+ * `fitBounds` is used on the globe too — unlike `frame()`, which cannot use it
+ * because the whole domain is 190 degrees wide and half of it is behind the limb
+ * at any zoom that fits it. A region box is at most 70 degrees (the PDO domain),
+ * which fits on the visible face.
+ *
+ * `maxZoom` is what stops the smallest boxes from filling the screen: Nino 1+2
+ * fitted exactly would leave no coastline around it to say where it is, and the
+ * point of the flight is context, not magnification.
+ */
+const REGION_PADDING = 60
+const REGION_MAX_ZOOM = 4.5
+
+function frameRegion(animate = true) {
+  const region = store.scope === 'region' ? store.activeRegionMeta : null
+  if (!map || !region) return
+
+  const [south, north] = [...region.lat].sort((a, b) => a - b)
+  const [west, east] = [...region.lon].sort((a, b) => a - b)
+  map.fitBounds([[west, south], [east, north]], {
+    padding: REGION_PADDING,
+    maxZoom: REGION_MAX_ZOOM,
+    duration: animate ? 1200 : 0,
+  })
+}
+
 function setProjection(name: ProjectionName) {
   if (name === projection.value) return
   projection.value = name
   map?.setProjection({ name })
   syncWestCopy()
   // Re-frame after the swap: a view that fits the box flat is not a view that
-  // shows it on a sphere, and vice versa.
-  frame()
+  // shows it on a sphere, and vice versa. In region scope the region is what is
+  // being read, so the swap keeps looking at it rather than pulling back out to
+  // the whole basin.
+  if (store.scope === 'region' && store.activeRegionMeta) frameRegion()
+  else frame()
   try {
     localStorage.setItem(PROJECTION_KEY, name)
   }
@@ -317,6 +476,17 @@ onMounted(() => {
 
   map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'top-right')
 
+  // Dev-only handle for browser verification. The map cannot be checked by
+  // reading its canvas — it runs with `preserveDrawingBuffer: false`, so
+  // `drawImage` yields a blank frame — so a driven browser needs the instance
+  // itself to query layers and rendered features. Stripped from production by
+  // `import.meta.dev`.
+  if (import.meta.dev) {
+    const w = window as unknown as { __map?: mapboxgl.Map, __store?: typeof store }
+    w.__map = map
+    w.__store = store
+  }
+
   // The ranks dock takes width from the map, and its drag handle takes it
   // continuously — the canvas has to follow the container rather than the window.
   resize = new ResizeObserver(() => map?.resize())
@@ -324,8 +494,9 @@ onMounted(() => {
 
   // The style may already be loaded by the time this runs (a warm style cache),
   // in which case 'load' has fired and would never fire again.
-  if (map.isStyleLoaded()) addRaster()
-  else map.once('load', addRaster)
+  const draw = () => { styleReady = true; addRaster(); syncRegionBox() }
+  if (map.isStyleLoaded()) draw()
+  else map.once('load', draw)
 
   map.on('click', (event) => {
     const { lat, lng } = event.lngLat
@@ -363,6 +534,16 @@ watch(() => [store.selectedDate, store.period, store.variable], () => {
 // calling updateImage here would flash the basemap and refetch a frame the
 // browser already has, for a result identical to setting the paint property.
 watch(() => store.activeScale, applyPaint, { deep: true })
+
+// The box follows the scope and the chosen region together — it is one
+// selection drawn twice, not a layer with a toggle of its own — and the camera
+// follows the box. Leaving point scope deliberately moves nothing: the pin is
+// already where the user clicked, so a flight there would be a jolt with no
+// destination.
+watch(() => [store.scope, store.activeRegion], () => {
+  syncRegionBox()
+  frameRegion()
+})
 
 onBeforeUnmount(() => {
   resize?.disconnect()

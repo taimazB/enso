@@ -4,6 +4,7 @@
     python -m CRW.cli scan     [--limit N]          # what is on disk vs. ingested
     python -m CRW.cli backfill [--start/--end]      # ingest local files
     python -m CRW.cli render   [--start/--end]      # render images in bulk
+    python -m CRW.cli rollup   [--start/--end]      # build region_daily
     python -m CRW.cli run      [--date ...]         # download + ingest + render
     python -m CRW.cli status   [--date ...]
 
@@ -15,6 +16,11 @@ CPU-bound at ~2.8 s a frame, and `render` runs it across a pool.
 
 `backfill` tolerates a partial archive — the bulk download can still be in
 flight; re-running picks up whatever has since arrived. So does `render`.
+
+`rollup` is the third bulk command and runs **after** both archives are ingested:
+it reduces `sst_daily` + `mhw_daily` into `region_daily`, the per-region daily
+area means the API's named-region endpoint reads instead of aggregating billions
+of rows per request. `run` keeps it current one date at a time.
 
 **`render` must run before the NetCDF goes.** Images are built from the daily
 files, never from ClickHouse, so `backfill --delete-nc` or a retention prune
@@ -30,10 +36,19 @@ import sys
 
 import httpx
 from shared.ch import DATABASE, ensure_schema, get_client
+from shared.domain import regions
 from shared.periods import PERIODS
 from shared.render import DEFAULT_WIDTH
 
-from . import climatology, config, download, imaging, ingest, status as status_mod
+from . import (
+    climatology,
+    config,
+    download,
+    imaging,
+    ingest,
+    regions as regions_mod,
+    status as status_mod,
+)
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +115,26 @@ def _report_scan(label, directory, files, done) -> None:
         shown = ", ".join(str(f.date) for f in stale[:5])
         more = f" ... (+{len(stale) - 5} more)" if len(stale) > 5 else ""
         print(f"    next       : {shown}{more}")
+
+
+def cmd_verify_clim(args) -> int:
+    """Full-read every climatology file and report the ones that fail.
+
+    Separate from `init` rather than folded into it because it is the *recovery*
+    tool: the symptom that sends you here — one MMDD failing to ingest across
+    many years — shows up long after `init` has succeeded.
+    """
+    bad = climatology.verify_files()
+    if not bad:
+        print(f"climatology: all {len(climatology.MMDD_KEYS)} file(s) read OK")
+        return 0
+    print(f"climatology: {len(bad)} file(s) unreadable")
+    for mmdd, reason in bad:
+        print(f"  {mmdd:04d}  {reason}")
+    print("\nre-download these from")
+    print("  .../crw/data/5km/v3.1-clim19912020-v1/climatology/nc/")
+    print("then re-run: backfill --product sst  (the affected dates are marked failed)")
+    return 1
 
 
 def cmd_scan(args) -> int:
@@ -243,6 +278,44 @@ def cmd_render(args) -> int:
     return 0
 
 
+def cmd_rollup(args) -> int:
+    """Build `region_daily`, the per-region daily area means the API reads.
+
+    Not folded into `init` — `init` runs against an empty `sst_daily` and there
+    would be nothing to roll up. This is the counterpart to `backfill`: a one-off
+    pass over an archive already ingested, after which `run` keeps it current one
+    date at a time.
+
+    **`backfill` deliberately does not do this per date.** One pass per region
+    over a whole range reduces 113.77 billion rows once; doing it per ingested
+    date would re-run eight aggregations 15,212 times. That is the same split
+    `render` already has from `backfill` — bulk work gets its own command — and
+    it is why this exists rather than a hook in the ingest loop. `run` is the
+    exception: it appends a single date, which is eight small key-range reads.
+
+    Ordering matters against a fresh archive. `mean_mhw` divides a sparse
+    numerator by an `sst_daily` denominator, so rolling up a range whose MHW
+    ingest has not finished writes a confident 0 for every date it has not
+    reached — the same trap `/coverage`'s `mhw.complete` exists to gate, but
+    frozen into a rollup where it is harder to see. Roll up after both archives
+    are in.
+    """
+    ensure_schema()
+    with get_client() as client:
+        if args.fresh:
+            regions_mod.truncate(client, args.region)
+        counts = regions_mod.build_region_daily(
+            client, keys=args.region, start=args.start, end=args.end
+        )
+        regions_mod.optimize(client)
+
+    total = sum(counts.values())
+    for key, n in sorted(counts.items()):
+        print(f"  {key:<20} {n:>7,} row(s)")
+    print(f"region_daily: {total:,} row(s) across {len(counts)} region(s)")
+    return 0
+
+
 # The two daily archives, paired with everything that differs between them.
 # `run` walks this list per date rather than branching, so adding a third product
 # later is a tuple, not a second copy of the download/ingest/status dance.
@@ -313,6 +386,12 @@ def _process_date(client, http, date, *, force, keep_nc, width) -> str:
             available=config.available_dates(),
             available_mhw=config.available_mhw_dates(),
         )
+        # The third thing a date has to keep in step, after the two daily tables.
+        # Rebuilt for this date alone — eight small key-range reads — and rebuilt
+        # unconditionally rather than only when MHW landed, because an SST-only
+        # date writes a mean_mhw of 0 that the next run has to correct once the
+        # heatwave file arrives ~90 minutes later.
+        regions_mod.build_region_daily(client, start=date, end=date)
         if not keep_nc:
             imaging.prune(date)
 
@@ -437,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--allow-partial-climatology", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
+    sub.add_parser(
+        "verify-clim", help="full-read every climatology file, reporting unreadable ones"
+    ).set_defaults(func=cmd_verify_clim)
+
     with_selection(sub.add_parser("scan", help="report disk vs. ingested")).set_defaults(
         func=cmd_scan
     )
@@ -452,6 +535,15 @@ def main(argv: list[str] | None = None) -> int:
     p_back.add_argument("--product", action="append", choices=("sst", "mhw"),
                         help="repeatable; default both archives")
     p_back.set_defaults(func=cmd_backfill)
+
+    p_roll = sub.add_parser("rollup", help="build region_daily from the ingested archive")
+    p_roll.add_argument("--start", type=_parse_date, help="first day, inclusive")
+    p_roll.add_argument("--end", type=_parse_date, help="last day, inclusive")
+    p_roll.add_argument("--region", action="append", choices=sorted(regions()),
+                        help="repeatable; default every named region")
+    p_roll.add_argument("--fresh", action="store_true",
+                        help="truncate the selected regions first")
+    p_roll.set_defaults(func=cmd_rollup)
 
     p_rend = with_selection(sub.add_parser("render", help="render images in bulk"))
     p_rend.add_argument("--period", action="append", choices=PERIODS,

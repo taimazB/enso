@@ -84,8 +84,14 @@ const AXIS_H = 34
 const RIGHT_PAD = 18
 /** Below this a dot plus its gap stops being readable; the pane scrolls instead. */
 const MIN_PITCH = 9
-/** Above this the panel is just airy — 45 rows in ~900px sits around 19. */
-const MAX_PITCH = 22
+/**
+ * Above this the panel stops looking like a plot and starts looking like a list
+ * of widely-spaced dots. It is high enough that a full 45-year month spends the
+ * whole of a tall dock on rows — 45 x 40 is 1800px — so in practice the cap only
+ * bites on a *short* month, where spreading a handful of years over the pane
+ * would exaggerate the gaps between them.
+ */
+const MAX_PITCH = 40
 
 export function monthsOf(ranking: MonthlyRanking | null): RankingRow[][] {
   return MONTHS.map((_, m) => ranking?.months?.[String(m + 1)] ?? [])
@@ -285,7 +291,7 @@ export function detailOption({
       position: 'bottom',
       axisLabel: {
         fontSize: 10,
-        color: '#94a3b8',
+        color: '#cbd5e1',
         // The domain's own ends are padded, non-round numbers; labelling them
         // puts "-2.18" next to "-2.00". The round ticks between are the scale.
         showMinLabel: false,
@@ -322,7 +328,9 @@ export function detailOption({
         rich: {
           sel: { color: ACCENT, fontWeight: 'bold' as const, fontSize: labelSize },
           top: { color: '#e2e8f0', fontWeight: 'bold' as const, fontSize: labelSize },
-          rest: { color: '#64748b', fontSize: labelSize },
+          // Still the quietest of the three — the rank encoding is the
+          // *contrast* between these, not any one of them being unreadable.
+          rest: { color: '#94a3b8', fontSize: labelSize },
         },
       },
     },
