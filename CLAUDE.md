@@ -38,6 +38,45 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
 Without `--env-file .env.dev`, compose falls back to the in-file defaults (front 3000,
 api 4000) and can recreate dependent services on the wrong ports.
 
+**Start prod environment:**
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+```
+`docker-compose.prod.yml` carries its own header comment explaining every divergence from
+the dev file; `.env.prod.example` is the template. The five that matter:
+
+- **`name: enso-prod`.** Both compose files would otherwise take the project name `enso`
+  from the directory and clobber each other's containers, network and volumes.
+- **No source bind mounts, and `./shared` is mounted nowhere.** The images carry `api/`,
+  `process/` and `shared/` as built, so a deploy is `--build`. Mounting `shared` would let
+  the host tree diverge from the code the image was tested with, which is the one thing the
+  "single definition" design of that directory exists to prevent.
+- **`DATA_DIR` / `CH_DATA_DIR` / `CH_LOG_DIR` replace `./data` and `./clickhouse`.** The
+  archive is ~163 GB and ClickHouse another ~100 GB; neither belongs in the checkout.
+  **Create them and `chown` them to `UID:GID` before the first `up`** — Docker creates a
+  missing bind source as *root*, and that surfaces as an empty archive rather than as a
+  permission error. `api` gets `/opt/data` **read-only**, since only `process` writes the
+  image cache.
+- **`db-ch` publishes no host ports and requires `CLICKHOUSE_PASSWORD`.** Verified: the
+  password is enforced, `enso` is created, the healthcheck passes, and
+  `/health` reports `clickhouse: ok` through it. Do **not** mount `./clickhouse/users.d`
+  here — the image's entrypoint writes `users.d/default-user.xml` itself, so a `:ro` mount
+  stops the container starting, and the file it generates already grants `default` the
+  `::/0` networks that dev's `allow_docker_network.xml` is there for.
+- **`process` sits behind the `tools` profile**, so `up -d` starts three services and not a
+  fourth idling on `sleep infinity`. Drive it the same way as dev, which is also the shape
+  a cron entry wants:
+  ```bash
+  docker compose -f docker-compose.prod.yml --env-file .env.prod \
+    run --rm process python -m CRW.cli run
+  ```
+
+`api` runs without `--reload` (it would watch source that is no longer mounted) on
+`--workers ${API_WORKERS:-4}` — separate *processes*, so the per-thread ClickHouse client
+gotcha below is unaffected by the count. `front` runs the built Nitro entry
+(`node .output/server/index.mjs`) rather than `npm run start`, which is `nuxt preview`, a
+dev wrapper that re-reads `.env` and needs the full nuxt devDependency tree at runtime.
+
 **Pipeline CLI** (the `process` service idles on `sleep infinity` and is driven on demand):
 ```bash
 docker compose -f docker-compose.dev.yml --env-file .env.dev run --rm process \
@@ -1142,8 +1181,8 @@ template ref, not the mount.
 
 Not built yet: the full-archive backfill and render pass for **both** products (in
 progress — MHW ingest runs at ~2.9 days/s, so ~90 min for the archive), the region-query
-benchmark that decides whether `region_daily` is needed, a cron entry for `run`, production
-compose files, PostHog analytics, tests.
+benchmark that decides whether `region_daily` is needed, a cron entry for `run`, PostHog
+analytics, tests.
 
 **Until the MHW backfill finishes, `/coverage` reports `mhw.complete: false` and the
 frontend's MHW toggle stays disabled** — deliberately, see the sparse-table note above.

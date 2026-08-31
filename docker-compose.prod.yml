@@ -1,0 +1,193 @@
+# Production stack. Always pass --env-file .env.prod, exactly as dev needs
+# --env-file .env.dev; without it compose falls back to the in-file defaults
+# below and can recreate dependent services on the wrong ports.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Four differences from docker-compose.dev.yml, all deliberate:
+#
+#   1. No source bind mounts. The images carry api/, process/ and shared/ as
+#      built, so a deploy is `--build`, not a file copy. `./shared` is NOT
+#      mounted anywhere: mounting it would let the host's working tree diverge
+#      from the code the image was tested with, and shared/ is the contract
+#      between api and process.
+#   2. `db-ch` publishes nothing. The 85 GB+ of sst_daily is reachable only on
+#      the compose network; set CH_HTTP_PORT/CH_NATIVE_PORT and uncomment the
+#      ports block only if something off-box genuinely needs it.
+#   3. The data root is a variable, not ./data. The full archive is ~163 GB
+#      (153 GB sst + 9.7 GB MHW + 1.6 GB climatology) plus the image cache, so
+#      it lives on whatever volume actually has the room — DATA_DIR.
+#   4. `process` is behind the `tools` profile, so `up -d` starts three
+#      long-running services and not a fourth container idling on
+#      `sleep infinity`. Drive the pipeline with `run --rm`:
+#
+#        docker compose -f docker-compose.prod.yml --env-file .env.prod \
+#          run --rm process python -m CRW.cli run
+#
+#      That is also the shape a cron entry wants. Add `--no-deps` for `render`,
+#      which reads NetCDF off disk and touches neither ClickHouse nor the
+#      network; `backfill`, `rollup` and `run` all need db-ch up.
+#
+# One deploy prerequisite compose will not tell you about: create DATA_DIR,
+# CH_DATA_DIR and CH_LOG_DIR on the host and chown them to UID:GID FIRST.
+# Docker silently creates a missing bind source as root, and the failure then
+# looks like an empty archive rather than a permission error — `api` runs as
+# UID and gets an empty read-only mount, `process` cannot write at all.
+
+name: enso-prod
+
+services:
+  front:
+    build:
+      context: ./front
+      target: ${FRONTEND_TARGET:-production}
+      args:
+        - NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL:?set NUXT_PUBLIC_API_BASE_URL to the public API URL}
+        - NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION:-unknown}
+    # No `user:` and no volumes — nothing is written back to the host, so the
+    # UID/GID dance that keeps ./data from going root-owned is not needed here.
+    ports:
+      - "${FRONT_PORT:-3000}:3000"
+    environment:
+      # The browser's URL. Baked in as a build arg above and passed again here
+      # because Nuxt reads runtimeConfig.public from the environment at request
+      # time (see front/nuxt.config.ts) — the two must agree.
+      - NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL}
+      # SSR only: inside the compose network the Nitro server reaches the API by
+      # service name. Pointing this at the public URL is the ECONNREFUSED that
+      # the dev notes warn about.
+      - API_INTERNAL_BASE_URL=${API_INTERNAL_BASE_URL:-http://api:4000}
+      - NUXT_PUBLIC_MAPBOX_TOKEN=${NUXT_PUBLIC_MAPBOX_TOKEN:?set NUXT_PUBLIC_MAPBOX_TOKEN or the map renders blank}
+      - NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION:-unknown}
+    env_file:
+      - .env.prod
+    # `node .output/server/index.mjs` rather than `npm run start` (nuxt preview):
+    # preview is a dev wrapper that re-reads .env and needs the full nuxt
+    # devDependency tree at runtime. The Nitro entry is the built artifact.
+    command: ${FRONTEND_COMMAND:-node .output/server/index.mjs}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    # The image bakes code at root ownership but the process must be able to
+    # read DATA_DIR on the host, so keep running as the owning UID.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      # Read-only on purpose: only `process` writes the image cache, because
+      # only it knows whether the retention window still holds days that have
+      # yet to land in a bucket (see api/modules/render.py — /image renders on
+      # demand and never caches). If that ever changes, drop the :ro.
+      - ${DATA_DIR:-./data}:/opt/data:ro
+    ports:
+      - "${API_PORT:-4000}:4000"
+    env_file:
+      - .env.prod
+    environment:
+      - HDF5_USE_FILE_LOCKING=FALSE
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
+      - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
+      - CRW_MHW_DIR=${CRW_MHW_DIR:-/opt/data/MHW}
+      - CH_HOST=${CH_HOST:-db-ch}
+      - CH_PORT=${CH_PORT:-8123}
+      - CH_USER=${CH_USER:-default}
+      - CH_PASSWORD=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}
+      - CH_DATABASE=${CH_DATABASE:-enso}
+      # Set CH_USE_REMOTE=true and CH_REMOTE_URL to query a remote ClickHouse
+      # instead of the db-ch service below.
+      - CH_USE_REMOTE=${CH_USE_REMOTE:-false}
+      - CH_REMOTE_URL=${CH_REMOTE_URL:-}
+      - CH_REMOTE_USER=${CH_REMOTE_USER:-}
+      - CH_REMOTE_PASSWORD=${CH_REMOTE_PASSWORD:-}
+    # No --reload (it watches the source that is no longer bind-mounted) and
+    # multiple workers, which are separate processes — the per-thread ClickHouse
+    # client in modules/clickhouse_helpers.py is unaffected by the count.
+    # An unrendered monthly bucket costs ~8.7 s and the browser's playback
+    # prefetch warms 8 frames at a time, so a single worker is a stall.
+    command: >
+      uvicorn SERVER:app --host 0.0.0.0 --port 4000
+      --workers ${API_WORKERS:-4}
+      --timeout-keep-alive 65
+    healthcheck:
+      # /health checks ClickHouse reachability too, which is what front's
+      # depends_on wants to wait for.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health', timeout=5).status==200 else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      db-ch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db-ch:
+    image: clickhouse/clickhouse-server:${CH_IMAGE_TAG:-25.8}
+    # Pinned rather than :latest. The dev stack can afford a surprise major
+    # upgrade on a pull; a 100 GB data directory cannot.
+    # Not published. Uncomment, and set the two ports in .env.prod, only if
+    # something outside this compose network needs to query it directly.
+    # ports:
+    #   - "${CH_HTTP_PORT:-9023}:8123"
+    #   - "${CH_NATIVE_PORT:-9024}:9000"
+    volumes:
+      - ${CH_DATA_DIR:-./clickhouse/data}:/var/lib/clickhouse
+      - ${CH_LOG_DIR:-./clickhouse/logs}:/var/log/clickhouse-server
+    # ./clickhouse/users.d is deliberately NOT mounted here, and mounting it :ro
+    # is worse than not mounting it: the image's entrypoint WRITES
+    # users.d/default-user.xml into that directory, so a read-only mount stops
+    # the container starting at all. The one thing dev's allow_docker_network.xml
+    # does — networks ::/0 for `default` — is already in the file the entrypoint
+    # generates once CLICKHOUSE_PASSWORD is set.
+    environment:
+      CLICKHOUSE_DB: "${CH_DATABASE:-enso}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env.prod}"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  process:
+    build:
+      context: .
+      dockerfile: process/Dockerfile
+    # Behind a profile so `up -d` does not start it; it is a CLI, not a service.
+    profiles: ["tools"]
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - .env.prod
+    environment:
+      - HDF5_USE_FILE_LOCKING=FALSE
+      - UV_CACHE_DIR=/tmp/uv-cache
+      - OISST_NC_DIR=${OISST_NC_DIR:-/opt/data/sst}
+      - OISST_IMAGE_DIR=${OISST_IMAGE_DIR:-/opt/data/images}
+      - CRW_CLIM_DIR=${CRW_CLIM_DIR:-/opt/data/climatology}
+      - CRW_MHW_DIR=${CRW_MHW_DIR:-/opt/data/MHW}
+      # Hard-coded to the service name, overriding any host-IP value in
+      # .env.prod — same reason as dev.
+      - CH_HOST=db-ch
+      - CH_PORT=8123
+      - CH_USER=${CH_USER:-default}
+      - CH_PASSWORD=${CH_PASSWORD:-${CLICKHOUSE_PASSWORD:-}}
+      - CH_DATABASE=${CH_DATABASE:-enso}
+    volumes:
+      # Writable, unlike api's: this is the only service that downloads NetCDF,
+      # writes the image cache and prunes the retention window.
+      - ${DATA_DIR:-./data}:/opt/data
+    # `sleep infinity` so `up --profile tools -d` gives an `exec`-able container
+    # for a long backfill; the `run --rm` form above ignores it.
+    command: ["sleep", "infinity"]
+    depends_on:
+      db-ch:
+        condition: service_healthy

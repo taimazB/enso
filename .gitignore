@@ -39,7 +39,10 @@ yarn-error.log*
 # === Env files (secrets) ===
 .env
 .env.*
+# ...but the documented templates are tracked. `!.env.example` alone does not
+# cover .env.prod.example, which `.env.*` had been swallowing silently.
 !.env.example
+!*.example
 
 # === Docker / CI / Editor ===
 docker-compose.yml

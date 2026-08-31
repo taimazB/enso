@@ -19,8 +19,14 @@ CMD ["npm", "run", "dev"]
 
 # Production stage
 FROM base AS production
+# Both are also passed as runtime env by docker-compose.prod.yml — Nuxt reads
+# runtimeConfig.public from the environment per request (nuxt.config.ts), so the
+# build arg is what the client bundle falls back to and the env var is what
+# actually serves. They must agree.
 ARG NUXT_PUBLIC_API_BASE_URL
-ENV NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL}
+ARG NUXT_PUBLIC_VERSION
+ENV NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL} \
+	NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION}
 RUN npm install --legacy-peer-deps
 COPY . .
 RUN npm run build
