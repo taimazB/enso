@@ -6,6 +6,25 @@ import type { MonthlyRanking } from '~/utils/ranking'
 import { bucketStart } from '~/utils/periods'
 
 /**
+ * Turn a failed request into something worth showing the user.
+ *
+ * This exists because the alternative — rethrowing into a Mapbox click handler
+ * — fails *silently*: the panel keeps whatever series it last had, so the pin
+ * and the heading move while the numbers do not. That is exactly how a doubled
+ * slash in the API base URL hid for a whole deploy; it looked like the first
+ * click worked and every later one was ignored.
+ *
+ * The status code is named when there is one. A 404 here means the URL is
+ * wrong, not that the cell is missing, and saying so is what points at the
+ * deploy rather than at the data.
+ */
+function requestErrorMessage(error: unknown, subject: string): string {
+  const status = (error as { response?: { status?: number } }).response?.status
+  if (status) return `Could not load ${subject} — the API answered ${status}.`
+  return `Could not reach the API to load ${subject}.`
+}
+
+/**
  * The three things the map and chart can show. `anom` is derived rather than
  * stored; `mhw` is stored in its own sparse table and is **categorical**, which
  * changes how it is coloured, ranged and formatted throughout.
@@ -256,6 +275,8 @@ export const useMainStore = defineStore('main', {
     activeRegion: null as string | null,
     regionSeries: null as Series | null,
     loadingRegion: false,
+    /** Set when the region request failed outright. See `activeError`. */
+    regionError: null as string | null,
     /** Last clicked map point, or null before the first click. */
     selectedPoint: null as { lat: number, lon: number } | null,
     pointSeries: null as Series | null,
@@ -264,6 +285,14 @@ export const useMainStore = defineStore('main', {
     loadingPoint: false,
     /** Set when the clicked point falls outside the ingested box. */
     outsideDomain: null as string | null,
+    /**
+     * Set when the point request failed outright.
+     *
+     * Kept apart from `outsideDomain`, which is not a failure: a click in the
+     * Atlantic is a fact about the box and is shown as a neutral empty state,
+     * while this is something broken and is shown as one.
+     */
+    pointError: null as string | null,
     /**
      * Per-variable display range override; absent means domain.yml's vmin/vmax.
      *
@@ -343,6 +372,15 @@ export const useMainStore = defineStore('main', {
 
     activeSeriesLoading: state =>
       state.scope === 'region' ? state.loadingRegion : state.loadingPoint,
+
+    /**
+     * The current scope's failure, if it has one.
+     *
+     * Read through here for the same reason as `activeSeries`: the panels stay
+     * presentational and the scope keeps one definition.
+     */
+    activeError: (state): string | null =>
+      state.scope === 'region' ? state.regionError : state.pointError,
 
     /** Whether a variable is an ordinal class rather than a measurement. */
     isCategorical: state => (variable: VariableName): boolean =>
@@ -536,11 +574,19 @@ export const useMainStore = defineStore('main', {
       const key = this.activeRegion
       if (!key) return
       this.loadingRegion = true
+      this.regionError = null
       try {
         this.regionSeries = await api.get<Series>(`/region/${key}`, {
           period: this.period,
           variable: this.variable,
         })
+      }
+      catch (error: unknown) {
+        // Handled, not swallowed: the panel says so, and the console still
+        // carries the stack for whoever is debugging the deploy.
+        console.error(`[enso] /region/${key} failed`, error)
+        this.regionSeries = null
+        this.regionError = requestErrorMessage(error, `the ${key} series`)
       }
       finally {
         this.loadingRegion = false
@@ -652,6 +698,7 @@ export const useMainStore = defineStore('main', {
       // moves you back.
       if (enterScope) this.scope = 'point'
       this.outsideDomain = null
+      this.pointError = null
       this.loadingPoint = true
       try {
         const api = useApi()
@@ -673,7 +720,17 @@ export const useMainStore = defineStore('main', {
           this.monthlyRanking = null
           this.outsideDomain = body.detail ?? 'Outside the ingested domain'
         }
-        else { throw error }
+        else {
+          // NOT a rethrow. This runs from a Mapbox click handler, where a
+          // rejected promise is an unhandled rejection nobody sees — and the
+          // panel would go on showing the previously selected cell's numbers
+          // under the newly clicked cell's heading, which is worse than an
+          // error because it looks like data.
+          console.error('[enso] /timeseries or /monthlyRanking failed', error)
+          this.pointSeries = null
+          this.monthlyRanking = null
+          this.pointError = requestErrorMessage(error, 'this cell')
+        }
       }
       finally {
         this.loadingPoint = false

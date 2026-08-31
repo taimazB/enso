@@ -7,6 +7,12 @@
       class="flex size-full items-center justify-center px-6 text-center text-sm text-muted"
     >
       <UIcon v-if="loading" name="i-mdi-loading" class="size-5 animate-spin" />
+      <!-- An outright failure is not the same as nothing to show yet, so it
+           does not get the neutral hint's styling. -->
+      <span v-else-if="error" class="flex items-center gap-2 text-error">
+        <UIcon name="i-mdi-alert-circle-outline" class="size-4 shrink-0" />
+        {{ emptyMessage }}
+      </span>
       <span v-else>{{ emptyMessage }}</span>
     </div>
 
@@ -27,6 +33,8 @@ const props = defineProps<{
   series: Series | null
   loading?: boolean
   emptyMessage?: string
+  /** Render `emptyMessage` as a failure rather than as a neutral hint. */
+  error?: boolean
   title?: string
   /** Bucket currently on the map, marked on the x-axis. */
   selectedDate?: string | null

@@ -42,6 +42,7 @@
         :series="store.activeSeries"
         :loading="store.activeSeriesLoading"
         :empty-message="emptyPointMessage"
+        :error="!!store.activeError"
         :stops="store.activeStops"
         :categorical="store.activeIsCategorical"
         :unit="store.activeUnitLabel"
@@ -87,6 +88,7 @@
           :stops="store.activeStops"
           :loading="store.loadingPoint"
           :empty-message="emptyPointMessage"
+          :error="!!store.activeError"
           :selected-date="store.selectedDate"
           :unit="store.activeUnitLabel"
           :categorical="store.activeIsCategorical"
@@ -121,6 +123,7 @@
           :series="store.activeSeries"
           :loading="store.activeSeriesLoading"
           :empty-message="emptyPointMessage"
+          :error="!!store.activeError"
           :title="chartTitle"
           :selected-date="store.selectedDate"
           :stops="store.activeStops"
@@ -220,8 +223,15 @@ const chartTitle = computed(() =>
   store.scope === 'region' ? regionTitle.value : pointTitle.value,
 )
 
+/**
+ * What the three panels say when they have no series to draw, in priority
+ * order: a failure first, then the informational out-of-box case, then the
+ * hint. `activeError` is scope-aware, so a failed region load reads as one too.
+ */
 const emptyPointMessage = computed(
-  () => store.outsideDomain ?? 'Click anywhere on the map to read that cell’s full record.',
+  () => store.activeError
+    ?? store.outsideDomain
+    ?? 'Click anywhere on the map to read that cell’s full record.',
 )
 
 /**
