@@ -14,8 +14,14 @@ export const IMAGE_WIDTH = 2048
  */
 export function useApi() {
   const config = useRuntimeConfig()
-  const publicBase = config.public.apiBaseUrl
-  const requestBase = import.meta.server ? config.apiInternalBaseUrl : publicBase
+  // Trailing slashes are stripped because every URL below is built by plain
+  // concatenation with a leading-slash path. A base ending in `/` yields
+  // `//image/...`, and the API 404s a doubled slash on every route — which
+  // surfaces as a blank map and a chart that never updates, while SSR (on the
+  // internal base, which has no slash to trim) keeps working and hides it.
+  const publicBase = String(config.public.apiBaseUrl ?? '').replace(/\/+$/, '')
+  const internalBase = String(config.apiInternalBaseUrl ?? '').replace(/\/+$/, '')
+  const requestBase = import.meta.server ? internalBase : publicBase
 
   return {
     baseURL: publicBase,
