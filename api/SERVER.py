@@ -38,8 +38,35 @@ from modules.timeseries import (
 # query builder, and documents the choice in /docs.
 Variable = Literal["sst", "anom", "mhw"]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("enso.api")
+
+
+def _timestamp_uvicorn_logs() -> None:
+    """Put a datetime on uvicorn's own lines too, not just this module's.
+
+    Uvicorn installs its own handlers with a timestamp-less format, and its
+    loggers do not propagate, so `basicConfig` above never reaches them --
+    every request line and every startup/shutdown event lands undated. The
+    formatters are uvicorn subclasses (a colourised level name, and the access
+    line's own fields), so the existing format string is rebuilt on the same
+    class rather than replaced with a plain `Formatter`.
+
+    Safe to call at import time: uvicorn configures logging in `Config.__init__`,
+    before it imports the app.
+    """
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in logging.getLogger(name).handlers:
+            fmt = handler.formatter
+            if fmt is None or fmt._fmt is None:
+                handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            elif "%(asctime)s" not in fmt._fmt:
+                handler.setFormatter(type(fmt)("%(asctime)s " + fmt._fmt))
+
+
+_timestamp_uvicorn_logs()
 
 app = FastAPI(title="CoralTemp Pacific SST API", version="0.2.0")
 
