@@ -77,7 +77,7 @@ export const MONTHS = [
 // --- Shared look -------------------------------------------------------------
 
 /** Dark halo separating a dot from its neighbours without naming a theme token. */
-const RING = 'rgba(0, 0, 0, 0.55)'
+export const RING = 'rgba(0, 0, 0, 0.55)'
 /** The app's "where the map is" accent, same as TimeseriesChart's MAP markLine. */
 export const ACCENT = '#fbbf24'
 const ZERO_LINE = { color: '#94a3b8', type: 'dashed' as const, width: 1 }
@@ -375,5 +375,82 @@ export function detailOption({
         }
       },
     }],
+  }
+}
+
+// --- Reading guide -----------------------------------------------------------
+// The panel packs five separate encodings into one plot — dot, whisker, label
+// weight, ring, fill — and none of them is self-evident on a first look. The
+// copy lives here rather than in the SFC for the same reason `detailOption()`
+// does: it is a pure function of the ranking on screen, so what it claims about
+// the chart can be asserted on beside the option it describes.
+
+/** Which mark a guide line is about; the panel draws a matching glyph for it. */
+export type GuideGlyph = 'dot' | 'whisker' | 'top' | 'selected' | 'partial'
+
+export interface GuideItem { glyph: GuideGlyph, text: string }
+
+export interface ReadingGuide {
+  summary: string
+  items: GuideItem[]
+  footer: string
+}
+
+export interface ReadingGuideInput {
+  ranking: MonthlyRanking | null
+  /** 1-based calendar month on screen. */
+  month: number
+  rows: RankingRow[]
+  topN: number
+  /** What rank 1 means — 'warmest', or 'most severe' for the heatwave category. */
+  rankOrder?: string
+  /** Unit suffix, '' where the variable has none. */
+  unit?: string
+  /** What `sd` is the spread of; a region's is not a cell's. See `sdLabel`. */
+  sdLabel?: string
+}
+
+/** What the ranked number is, said in words rather than as a variable key. */
+function rankedQuantity(variable: MonthlyRanking['variable']): string {
+  if (variable === 'sst') return 'that month’s mean sea-surface temperature'
+  if (variable === 'mhw') {
+    return 'that month’s mean daily heatwave category — a severity index, '
+      + 'not a category of its own'
+  }
+  return 'that month’s mean anomaly against the 1991–2020 average'
+}
+
+export function readingGuide({
+  ranking, month, rows, topN, rankOrder = 'warmest', unit = '', sdLabel = 'sd',
+}: ReadingGuideInput): ReadingGuide {
+  const name = MONTHS[month - 1]
+  // A cell and a region are not comparable numbers — one is a point reading,
+  // the other an area mean — so the guide names which one is on screen.
+  const subject = ranking?.region
+    ? `${ranking.label ?? ranking.region} (area mean)`
+    : 'the selected cell'
+  const suffix = unit ? `, in ${unit}` : ''
+  const series = ranking?.areaMean ? 'daily area means' : 'daily values'
+
+  const items: GuideItem[] = [
+    { glyph: 'dot', text: `Dot — ${rankedQuantity(ranking?.variable)}${suffix}, coloured on the same scale as the map.` },
+    { glyph: 'whisker', text: `Bar — one ${sdLabel} either side of it, so a long bar is a month whose ${series} moved about.` },
+    { glyph: 'top', text: `Bold label on a tinted row — the top ${topN}.` },
+    { glyph: 'selected', text: 'Amber ring and label — the year the map is currently showing.' },
+  ]
+  // Only worth explaining when one is actually on screen; most months have none.
+  if (rows.some(r => r.partial)) {
+    items.push({
+      glyph: 'partial',
+      text: 'Hollow dot and a * — an edge month of the archive, ranked on only part '
+        + 'of its days, so its place will move.',
+    })
+  }
+
+  return {
+    summary: `Every ${name} on record at ${subject}, ranked ${rankOrder} first — `
+      + `one row per year, ${rows.length} of them.`,
+    items,
+    footer: `Click a row to move the map to that ${name}.`,
   }
 }

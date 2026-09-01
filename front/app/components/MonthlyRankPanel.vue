@@ -25,14 +25,71 @@
           <h3 class="shrink-0 text-sm font-semibold text-highlighted">{{ MONTHS[month - 1] }}</h3>
           <span class="truncate text-xs text-muted">
             {{ rows.length }} years, {{ rankOrder }} first{{ ranking?.areaMean ? ' · area mean' : '' }}
-            &middot; click a row to move the map
           </span>
+          <!-- Five encodings share this plot — dot, whisker, label weight, ring,
+               fill — and none of them is self-evident on a first look. On demand
+               rather than always on: it is read once and then in the way. -->
+          <UPopover :content="{ side: 'bottom', align: 'end' }">
+            <!-- The word is spent only where the dock is wide enough for it;
+                 dragged in, the icon alone carries it. Rendered as slot content
+                 rather than through `label`, so the responsive class is plain
+                 Tailwind on an element we own. -->
+            <UButton
+              icon="i-mdi-help-circle-outline"
+              variant="ghost"
+              color="neutral"
+              size="xs"
+              class="ml-auto shrink-0"
+              title="How to read this chart"
+              aria-label="How to read this chart"
+            >
+              <span class="hidden @[22rem]:inline">How to read</span>
+            </UButton>
+
+            <template #content>
+              <div class="w-72 p-3 text-xs">
+                <p class="mb-2 text-default">{{ guide.summary }}</p>
+                <ul class="space-y-1.5">
+                  <li v-for="item in guide.items" :key="item.glyph" class="flex gap-2">
+                    <svg viewBox="0 0 28 12" class="mt-px h-3 w-7 shrink-0" aria-hidden="true">
+                      <rect
+                        v-if="item.glyph === 'top'"
+                        x="0" y="0" width="28" height="12" rx="2"
+                        fill="rgba(148, 163, 184, 0.12)"
+                      />
+                      <template v-if="item.glyph === 'whisker'">
+                        <line x1="3" y1="6" x2="25" y2="6" :stroke="glyphColor" stroke-width="1.5" opacity="0.6" />
+                        <line x1="3" y1="2.5" x2="3" y2="9.5" :stroke="glyphColor" stroke-width="1.5" opacity="0.6" />
+                        <line x1="25" y1="2.5" x2="25" y2="9.5" :stroke="glyphColor" stroke-width="1.5" opacity="0.6" />
+                      </template>
+                      <text
+                        v-if="item.glyph === 'top'"
+                        x="14" y="9" text-anchor="middle"
+                        font-size="8" font-weight="bold" fill="#e2e8f0"
+                      >1.</text>
+                      <circle
+                        v-else
+                        cx="14" cy="6" r="4"
+                        :fill="item.glyph === 'partial' ? 'transparent' : glyphColor"
+                        :stroke="item.glyph === 'selected'
+                          ? ACCENT
+                          : (item.glyph === 'partial' ? glyphColor : RING)"
+                        :stroke-width="item.glyph === 'selected' ? 2 : 1.5"
+                      />
+                    </svg>
+                    <span class="text-muted">{{ item.text }}</span>
+                  </li>
+                </ul>
+                <p class="mt-2 text-dimmed">{{ guide.footer }}</p>
+              </div>
+            </template>
+          </UPopover>
           <UButton
             icon="i-mdi-download"
             variant="ghost"
             color="neutral"
             size="xs"
-            class="ml-auto shrink-0"
+            class="shrink-0"
             title="Download every month's ranking as CSV"
             aria-label="Download the rankings as CSV"
             @click="exportRanking()"
@@ -58,14 +115,18 @@ import type { MonthlyRanking } from '~/utils/ranking'
 import { cellSlug, downloadCsv, rankingCsv, slug } from '~/utils/csv'
 import { type Period, bucketStart, shiftBuckets } from '~/utils/periods'
 import {
+  ACCENT,
   MONTHS,
+  RING,
   detailHeightFor,
   detailOption,
   detailPitch,
   monthsOf,
   partialNote,
+  readingGuide,
   xDomainOf,
 } from '~/utils/ranking'
+import { NO_CLASS_COLOR, colorScale } from '~/utils/colorScale'
 
 const props = defineProps<{
   ranking: MonthlyRanking | null
@@ -160,6 +221,31 @@ const topN = computed(() => props.ranking?.top ?? 10)
 const domain = computed(() => xDomainOf([rows.value], props.zeroLine || props.categorical))
 /** Spells out the `*` on a truncated edge month, when this month has one. */
 const note = computed(() => partialNote(rows.value, month.value))
+
+/**
+ * What every mark on the plot means, built from the ranking on screen so the
+ * wording follows the variable and the scope rather than describing a chart
+ * that is not the one being looked at.
+ */
+const guide = computed(() => readingGuide({
+  ranking: props.ranking,
+  month: month.value,
+  rows: rows.value,
+  topN: topN.value,
+  rankOrder: props.rankOrder,
+  unit: props.unit,
+  sdLabel: sdLabel.value,
+}))
+
+/**
+ * A colour the guide's glyphs are drawn in: the active scale at the middle of
+ * the domain on screen, so the sample dot is a colour actually in play rather
+ * than a neutral grey that means "no class" on the heatwave scale.
+ */
+const glyphColor = computed(() => {
+  const scale = colorScale(props.stops, props.categorical ? NO_CLASS_COLOR : undefined)
+  return scale((domain.value.min + domain.value.max) / 2)
+})
 
 const pane = ref<HTMLElement | null>(null)
 const detail = ref<HTMLElement | null>(null)

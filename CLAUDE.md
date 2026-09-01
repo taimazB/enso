@@ -974,6 +974,19 @@ value on the active variable's scale — the same colour that cell has on the ma
 is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
 ringed in the plot.
 
+**None of those encodings is self-evident, so there is a `How to read` popover** in the
+panel's header, beside the CSV button. Its copy is `readingGuide()` in `utils/ranking.ts`,
+pure like `detailOption()` and for the same reason — what it *claims* about the chart can
+be asserted on beside the option it describes, which is the only thing that keeps a legend
+from drifting off the plot it explains. It is built from the ranking on screen rather than
+written once: it names the scope (`the selected cell` vs `Nino 3.4 (area mean)`), the
+variable (the anomaly's 1991-2020 baseline, or the heatwave category's "a severity index,
+not a category"), what the whisker's `sd` is the spread *of* — daily values at a cell,
+daily area means over a region — and the `partial` line only when that month actually has
+one. The panel draws a matching glyph per item from the `glyph` key, in the active scale's
+colour at the middle of the domain on screen, so the sample dot is a colour in play.
+On demand rather than always on: it is read once and then in the way.
+
 **A `partial` month is starred, not hidden.** The API ranks the archive's edge months
 with the rest, and the panel marks them twice: the row label reads `15. 2026 *`, and its
 dot is drawn **open** (no fill, its own colour as the stroke) so it reads on the same
