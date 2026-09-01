@@ -29,7 +29,10 @@
           <!-- Five encodings share this plot — dot, whisker, label weight, ring,
                fill — and none of them is self-evident on a first look. On demand
                rather than always on: it is read once and then in the way. -->
-          <UPopover :content="{ side: 'bottom', align: 'end' }">
+          <!-- `@update:open` rather than a click handler on the button: the
+               popover closes by the same event, and counting both would double
+               every read. -->
+          <UPopover :content="{ side: 'bottom', align: 'end' }" @update:open="onGuideToggle">
             <!-- The word is spent only where the dock is wide enough for it;
                  dragged in, the icon alone carries it. Rendered as slot content
                  rather than through `label`, so the responsive class is plain
@@ -110,6 +113,7 @@
 
 <script setup lang="ts">
 import * as echarts from 'echarts'
+import { trackEvent } from '~/composables/useAnalytics'
 import type { ColorStop } from '~/utils/colorScale'
 import type { MonthlyRanking } from '~/utils/ranking'
 import { cellSlug, downloadCsv, rankingCsv, slug } from '~/utils/csv'
@@ -175,6 +179,15 @@ const emit = defineEmits<{ select: [date: string] }>()
  * for the same reason they are not comparable numbers: one is a point reading,
  * the other an area mean.
  */
+/**
+ * Only the opening half of the popover's toggle is an event: closing it is not
+ * a second read, and the panel is where five encodings are explained, so how
+ * often this is opened is the measure of whether the plot reads on its own.
+ */
+function onGuideToggle(open: boolean) {
+  if (open) trackEvent('ranking_guide_opened', { scope: props.ranking?.region ? 'region' : 'point' })
+}
+
 function exportRanking() {
   const ranking = props.ranking
   if (!ranking) return
@@ -182,6 +195,12 @@ function exportRanking() {
   const subject = ranking.region
     ? slug(ranking.label ?? ranking.region)
     : ranking.cell ? cellSlug(ranking.cell) : 'selection'
+  trackEvent('csv_downloaded', {
+    kind: 'ranking',
+    variable,
+    scope: ranking.region ? 'region' : 'point',
+    months: 12,
+  })
   downloadCsv(
     `${variable}_monthly-ranks_${subject}.csv`,
     rankingCsv(ranking, props.precision ?? 2),

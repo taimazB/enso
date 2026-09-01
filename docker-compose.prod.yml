@@ -59,6 +59,10 @@ services:
       - API_INTERNAL_BASE_URL=${API_INTERNAL_BASE_URL:-http://api:4000}
       - NUXT_PUBLIC_MAPBOX_TOKEN=${NUXT_PUBLIC_MAPBOX_TOKEN:?set NUXT_PUBLIC_MAPBOX_TOKEN or the map renders blank}
       - NUXT_PUBLIC_VERSION=${NUXT_PUBLIC_VERSION:-unknown}
+      # Usage analytics. Blank is supported and is the default: the client-only
+      # plugin returns early without a key.
+      - NUXT_PUBLIC_POSTHOG_KEY=${NUXT_PUBLIC_POSTHOG_KEY:-}
+      - NUXT_PUBLIC_POSTHOG_HOST=${NUXT_PUBLIC_POSTHOG_HOST:-https://us.i.posthog.com}
     env_file:
       - .env.prod
     # `node .output/server/index.mjs` rather than `npm run start` (nuxt preview):
@@ -104,6 +108,9 @@ services:
       - CH_REMOTE_URL=${CH_REMOTE_URL:-}
       - CH_REMOTE_USER=${CH_REMOTE_USER:-}
       - CH_REMOTE_PASSWORD=${CH_REMOTE_PASSWORD:-}
+      # Usage analytics. Capture is a no-op without the key.
+      - POSTHOG_API_KEY=${POSTHOG_API_KEY:-}
+      - POSTHOG_HOST=${POSTHOG_HOST:-https://us.i.posthog.com}
     # No --reload (it watches the source that is no longer bind-mounted) and
     # multiple workers, which are separate processes — the per-thread ClickHouse
     # client in modules/clickhouse_helpers.py is unaffected by the count.

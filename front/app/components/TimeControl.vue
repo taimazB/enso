@@ -129,6 +129,7 @@
 </template>
 
 <script setup lang="ts">
+import { trackEvent } from '~/composables/useAnalytics'
 import { useMainStore } from '~/stores/main'
 import { PERIODS, bucketLabel, bucketStart, shiftBuckets } from '~/utils/periods'
 import { MAX_FPS, MIN_FPS, usePlayback } from '~/composables/usePlayback'
@@ -220,6 +221,16 @@ function exportSeries() {
     ? slug(store.activeRegionMeta?.label ?? store.activeRegion ?? 'region')
     : series.cell ? cellSlug(series.cell) : 'point'
   const span = `${series.dates[0]}_${series.dates[series.dates.length - 1]}`
+  // Worth knowing precisely because it is the feature least visible in the UI —
+  // one ghost icon — and the one whose removal nobody would notice until
+  // somebody complained.
+  trackEvent('csv_downloaded', {
+    kind: 'series',
+    variable: store.variable,
+    period: store.period,
+    scope: store.scope,
+    rows: series.dates.length,
+  })
   downloadCsv(
     `${store.variable}_${store.period}_${subject}_${span}.csv`,
     seriesCsv(series, {

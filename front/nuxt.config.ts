@@ -23,6 +23,11 @@ export default defineNuxtConfig({
       apiBaseUrl: process.env.NUXT_PUBLIC_API_BASE_URL || 'http://localhost:9021',
       mapboxToken: process.env.NUXT_PUBLIC_MAPBOX_TOKEN || '',
       version: process.env.NUXT_PUBLIC_VERSION || 'dev',
+      // Usage analytics. Empty by default: `app/plugins/posthog.client.ts`
+      // returns early without a key, so dev and any deploy that does not want
+      // analytics need no other change.
+      posthogKey: process.env.NUXT_PUBLIC_POSTHOG_KEY || '',
+      posthogHost: process.env.NUXT_PUBLIC_POSTHOG_HOST || 'https://us.i.posthog.com',
     },
   },
 

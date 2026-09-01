@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { trackEvent } from '~/composables/useAnalytics'
 import { useApi } from '~/composables/useApi'
 import type { ColorStop } from '~/utils/colorScale'
 import type { Period } from '~/utils/periods'
@@ -657,6 +658,17 @@ export const useMainStore = defineStore('main', {
      */
     selectRegion(key: string): Promise<void> | void {
       const changed = key !== this.activeRegion
+      // Captured in the store, not in ScopeControl, for the same reason the
+      // scope lives here: one definition, and every future call site is
+      // instrumented by construction.
+      //
+      // Reported on *every* call, not only when the key changes: this action is
+      // only ever reached from the region menu, so picking the region already
+      // active is still someone choosing to read it — and, from point scope, it
+      // is the gesture that enters region scope at all. Guarding it on `changed`
+      // (which the fetch below rightly does) made the commonest path of all —
+      // open the menu, pick the default region — report nothing.
+      trackEvent('region_selected', { region: key, enteredScope: this.scope === 'point' })
       this.activeRegion = key
       this.scope = 'region'
       if (changed || !this.regionSeries) return this.loadRegionSeries()
@@ -671,11 +683,14 @@ export const useMainStore = defineStore('main', {
      */
     setScope(scope: Scope): Promise<void> | void {
       if (scope === this.scope) return
+      trackEvent('scope_changed', { scope, from: this.scope })
       this.scope = scope
       if (scope === 'region' && !this.regionSeries) return this.loadRegionSeries()
       if (scope === 'point' && !this.pointSeries && this.selectedPoint) {
         const { lat, lon } = this.selectedPoint
-        return this.selectPoint(lat, lon)
+        // The scope change is already reported; the cell it returns to was
+        // chosen earlier and is not being chosen again.
+        return this.selectPoint(lat, lon, { track: false })
       }
     },
 
@@ -687,6 +702,7 @@ export const useMainStore = defineStore('main', {
     /** Switch averaging window; re-snaps the date and reloads the point series. */
     setPeriod(period: Period) {
       if (period === this.period) return
+      trackEvent('period_changed', { period, from: this.period, variable: this.variable, scope: this.scope })
       this.period = period
       if (this.selectedDate) this.setDate(this.selectedDate)
       // Both series are bucketed by the API, so both are stale. The inactive
@@ -699,7 +715,11 @@ export const useMainStore = defineStore('main', {
       this.regionSeries = null
       if (this.selectedPoint) {
         const { lat, lon } = this.selectedPoint
-        return this.selectPoint(lat, lon)
+        // `track: false` — this is a refetch of the cell already on screen, not
+        // a new selection. Without it a period toggle would report a
+        // `point_selected` as well, and a map click and a toggle would be
+        // indistinguishable in the numbers.
+        return this.selectPoint(lat, lon, { track: false })
       }
     },
 
@@ -714,6 +734,7 @@ export const useMainStore = defineStore('main', {
     // `this` inside `loadMetadata` and loses every state property.
     setVariable(variable: VariableName): Promise<void> | void {
       if (variable === this.variable) return
+      trackEvent('variable_changed', { variable, from: this.variable, scope: this.scope })
       this.variable = variable
       if (this.scope === 'region') {
         this.pointSeries = null
@@ -722,7 +743,8 @@ export const useMainStore = defineStore('main', {
       this.regionSeries = null
       if (this.selectedPoint) {
         const { lat, lon } = this.selectedPoint
-        return this.selectPoint(lat, lon)
+        // Not a selection either — same cell, different field. See `setPeriod`.
+        return this.selectPoint(lat, lon, { track: false })
       }
     },
 
@@ -733,8 +755,18 @@ export const useMainStore = defineStore('main', {
      * click means "look at this cell" and must move the app into point scope;
      * `loadMetadata()` calling this to populate the opening chart means nothing
      * of the sort and leaves the scope alone.
+     *
+     * `track` is the analytics half of the same question, and it is NOT the same
+     * flag: a variable or period toggle refetches the cell already on screen
+     * with the scope untouched, which is a request but not a choice of cell. It
+     * defaults to `enterScope` so the bootstrap stays silent, and the two
+     * refetch call sites pass `false` explicitly.
      */
-    async selectPoint(lat: number, lon: number, { enterScope = true }: { enterScope?: boolean } = {}) {
+    async selectPoint(
+      lat: number,
+      lon: number,
+      { enterScope = true, track = enterScope }: { enterScope?: boolean, track?: boolean } = {},
+    ) {
       // The ranking is period-independent, so a period toggle — which re-enters
       // here with the same cell — must not refetch it and flash the grid. It is
       // NOT variable-independent, though: ranking years by SST rather than by
@@ -745,6 +777,12 @@ export const useMainStore = defineStore('main', {
         && this.monthlyRanking.variable === this.variable
 
       this.selectedPoint = { lat, lon }
+      // `enterScope` is what separates a user gesture from `loadMetadata()`'s
+      // bootstrap — the same distinction the scope switch above turns on — so it
+      // is also what separates a click worth counting from the opening cell
+      // nobody chose. Without it every page load would report a point selection
+      // at DEFAULT_POINT.
+      if (track) trackEvent('point_selected', { lat, lon, variable: this.variable, scope: this.scope })
       // A map click in region scope means "look at this cell", so it moves the
       // app back to point scope; the control that moved you is visibly the one
       // that moves you back.

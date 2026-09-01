@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ from shared.domain import global_grid, regions, subset, variable, variables
 from modules import render
 from modules.clickhouse_helpers import client, reset
 from modules.periods import Period
+from modules.posthog_helpers import capture_event
 from modules.timeseries import (
     VARIABLES,
     OutsideDomainError,
@@ -78,6 +80,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _stamp_request_context(request: Request, call_next):
+    """Per-request state that `capture_event` reads if analytics is enabled.
+
+    `start_time` becomes the event's `duration_ms`; `distinct_id` is the
+    frontend's posthog-js identity, forwarded by the axios default header set in
+    `front/app/plugins/posthog.client.ts`, so a visitor's UI events and the API
+    calls they cause share one identity instead of being attributed by IP.
+
+    Doing it here rather than at each call site means neither concern is
+    repeated in seven endpoints, and it costs nothing when POSTHOG_API_KEY is
+    unset — `capture_event` returns immediately and this state is simply unread.
+    """
+    request.state.start_time = time.perf_counter()
+    request.state.distinct_id = request.headers.get("x-posthog-distinct-id", "").strip() or None
+    return await call_next(request)
 
 
 # --- Models -----------------------------------------------------------------
@@ -261,7 +281,7 @@ def _outside_domain(exc: OutsideDomainError) -> JSONResponse:
 
 
 @app.post("/timeseries")
-def timeseries(request: PointRequest):
+def timeseries(request: PointRequest, http_request: Request):
     """Full anomaly record at the grid cell nearest a point.
 
     `period` averages the daily values into weekly (Monday-start) or monthly
@@ -269,7 +289,7 @@ def timeseries(request: PointRequest):
     uses, so a chart point and the map frame for that date agree.
     """
     try:
-        return point_timeseries(
+        result = point_timeseries(
             request.lat,
             request.lon,
             request.start,
@@ -278,13 +298,32 @@ def timeseries(request: PointRequest):
             request.variable,
         )
     except OutsideDomainError as exc:
+        # Captured too: a point outside the box is a real thing people try, and
+        # a heat map of *where* they try it is the argument for widening the
+        # domain — which costs only a `domain.yml` edit, no re-ingest.
+        capture_event(http_request, "point_queried", {
+            "variable": request.variable,
+            "period": request.period,
+            "lat": request.lat,
+            "lon": request.lon,
+            "outside_domain": True,
+        })
         return _outside_domain(exc)
+    capture_event(http_request, "point_queried", {
+        "variable": request.variable,
+        "period": request.period,
+        "lat": request.lat,
+        "lon": request.lon,
+        "buckets": len(result.get("dates", [])),
+        "outside_domain": False,
+    })
+    return result
 
 
 @app.post("/regionTimeseries")
-def region_timeseries_endpoint(request: BoxRequest) -> dict:
+def region_timeseries_endpoint(request: BoxRequest, http_request: Request) -> dict:
     """cos(lat)-weighted mean anomaly over an arbitrary box, per `period` bucket."""
-    return region_timeseries(
+    result = region_timeseries(
         request.lat,
         request.lon,
         request.start,
@@ -292,11 +331,22 @@ def region_timeseries_endpoint(request: BoxRequest) -> dict:
         period=request.period,
         variable_name=request.variable,
     )
+    # An arbitrary box has no rollup and is the 3-12 s live aggregation, so this
+    # is also the event that says whether anyone actually uses the endpoint the
+    # frontend no longer exposes.
+    capture_event(http_request, "region_box_queried", {
+        "variable": request.variable,
+        "period": request.period,
+        "lat": list(request.lat),
+        "lon": list(request.lon),
+    })
+    return result
 
 
 @app.get("/region/{key}")
 def named_region(
     key: str,
+    http_request: Request,
     start: dt.date | None = None,
     end: dt.date | None = None,
     period: Period = "daily",
@@ -310,12 +360,19 @@ def named_region(
     """
     if key not in regions():
         raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
-    return named_region_timeseries(key, start, end, period, variable)
+    result = named_region_timeseries(key, start, end, period, variable)
+    capture_event(http_request, "region_queried", {
+        "region": key,
+        "variable": variable,
+        "period": period,
+    })
+    return result
 
 
 @app.get("/region/{key}/monthlyRanking")
 def named_region_ranking(
     key: str,
+    http_request: Request,
     top: int = Query(10, ge=1, le=100),
     variable: Variable = "anom",
 ) -> dict:
@@ -335,11 +392,16 @@ def named_region_ranking(
     """
     if key not in regions():
         raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
-    return region_monthly_ranking(key, top, variable)
+    result = region_monthly_ranking(key, top, variable)
+    capture_event(http_request, "region_ranking_queried", {
+        "region": key,
+        "variable": variable,
+    })
+    return result
 
 
 @app.post("/monthlyRanking")
-def monthly_ranking_endpoint(request: RankingRequest):
+def monthly_ranking_endpoint(request: RankingRequest, http_request: Request):
     """Each calendar month's years at one cell, ranked warmest-first.
 
     Always monthly regardless of the caller's `period`: ranking weekly buckets
@@ -352,11 +414,17 @@ def monthly_ranking_endpoint(request: RankingRequest):
     it stands on -- rather than left out.
     """
     try:
-        return monthly_ranking(
+        result = monthly_ranking(
             request.lat, request.lon, request.top, request.variable
         )
     except OutsideDomainError as exc:
         return _outside_domain(exc)
+    capture_event(http_request, "point_ranking_queried", {
+        "variable": request.variable,
+        "lat": request.lat,
+        "lon": request.lon,
+    })
+    return result
 
 
 # --- Map imagery ------------------------------------------------------------

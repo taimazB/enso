@@ -1,3 +1,4 @@
+import { trackEvent } from '~/composables/useAnalytics'
 import { useMainStore } from '~/stores/main'
 import { bucketStart, shiftBuckets } from '~/utils/periods'
 
@@ -125,6 +126,16 @@ export function usePlayback() {
       store.setDate(bucketStart(start, store.period))
     }
     playing.value = true
+    // One event per press, not per frame. `store.setDate()` runs up to ten
+    // times a second here, so instrumenting the playhead would bury every real
+    // decision under it — the same reason `/image` is not instrumented
+    // server-side, and the reason `setDate` carries no event at all.
+    trackEvent('playback_started', {
+      variable: store.variable,
+      period: store.period,
+      fps: fps.value,
+      from: store.selectedDate,
+    })
     void loop()
   }
 

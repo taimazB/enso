@@ -178,6 +178,7 @@
 </template>
 
 <script setup lang="ts">
+import { trackEvent } from '~/composables/useAnalytics'
 import { quantise, useMainStore } from '~/stores/main'
 
 const store = useMainStore()
@@ -259,18 +260,48 @@ const chips = computed(() => {
   ]
 })
 
-function applyChip(chip: { vmin: number, vmax: number, reset: boolean }) {
+function applyChip(chip: { label?: string, vmin: number, vmax: number, reset: boolean }) {
+  // The label, not just the numbers: whether people reach for `Coral 24-32` by
+  // name is the question the presets were added to answer, and a bare pair of
+  // bounds cannot distinguish a chip from a drag that landed on the same place.
+  trackEvent('color_range_changed', {
+    variable: store.variable,
+    source: chip.reset ? 'default' : 'preset',
+    preset: chip.label,
+    vmin: chip.vmin,
+    vmax: chip.vmax,
+  })
   if (chip.reset) store.resetScale(store.variable)
   else store.setScale(store.variable, chip.vmin, chip.vmax)
 }
 
+/**
+ * One event per gesture, not per frame.
+ *
+ * The slider emits on every pointer move, so capturing in `commit` directly
+ * would send a hundred events for one drag — the flooding `/image` and the
+ * playhead are excluded for. A trailing debounce collapses a drag into the
+ * range it came to rest on, which is the only part anybody would ask about; a
+ * typed value lands the same way one second later.
+ */
+let rangeTimer: ReturnType<typeof setTimeout> | undefined
+function trackRange(source: 'slider' | 'field') {
+  clearTimeout(rangeTimer)
+  rangeTimer = setTimeout(() => {
+    const { vmin, vmax } = scale.value
+    trackEvent('color_range_changed', { variable: store.variable, source, vmin, vmax })
+  }, 1000)
+}
+onBeforeUnmount(() => clearTimeout(rangeTimer))
+
 /** All clamping lives in the store, so slider and keyboard agree exactly. */
-function commit(vmin: unknown, vmax: unknown) {
+function commit(vmin: unknown, vmax: unknown, source: 'slider' | 'field' = 'field') {
   store.setScale(store.variable, Number(vmin), Number(vmax))
+  trackRange(source)
 }
 
 function onSlide(value: number | number[] | undefined) {
-  if (Array.isArray(value)) commit(value[0], value[1])
+  if (Array.isArray(value)) commit(value[0], value[1], 'slider')
 }
 
 /**

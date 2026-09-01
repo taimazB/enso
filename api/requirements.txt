@@ -9,3 +9,8 @@ PyYAML>=6.0
 # the retention window) directly from file — see modules/render.py. Historical
 # frames come from the image cache, never from ClickHouse.
 netCDF4>=1.7.0
+
+# Usage analytics (PostHog Cloud). The client is created only when
+# POSTHOG_API_KEY is set, so this import is the only cost in environments that
+# leave analytics off — see modules/posthog_helpers.py.
+posthog>=3.7
