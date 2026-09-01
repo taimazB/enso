@@ -31,6 +31,7 @@ from modules.timeseries import (
     monthly_ranking,
     named_region_timeseries,
     point_timeseries,
+    region_monthly_ranking,
     region_timeseries,
 )
 
@@ -303,6 +304,31 @@ def named_region(
     if key not in regions():
         raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
     return named_region_timeseries(key, start, end, period, variable)
+
+
+@app.get("/region/{key}/monthlyRanking")
+def named_region_ranking(
+    key: str,
+    top: int = Query(10, ge=1, le=100),
+    variable: Variable = "anom",
+) -> dict:
+    """Each calendar month's years over a named region, ranked warmest-first.
+
+    The cell endpoint's question asked of a box: the ranked value is the month's
+    mean of the region's daily cos(lat)-weighted area means, so a year that ranks
+    first here is the year whose month `/region/{key}` draws highest.
+
+    Served from `region_daily`, which makes this ~15k rows — the same order as
+    one cell's record. **Only named regions**: an arbitrary box through
+    `/regionTimeseries` has no rollup and would be the 3-12 s live aggregation.
+
+    `sd` is the spread of daily area means rather than of daily values, and is
+    much narrower than the same column at a cell; the response carries
+    `areaMean: true` so a client can say which it is showing.
+    """
+    if key not in regions():
+        raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
+    return region_monthly_ranking(key, top, variable)
 
 
 @app.post("/monthlyRanking")

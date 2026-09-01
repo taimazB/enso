@@ -35,7 +35,13 @@ the **max**, matching `shared/buckets.py` — so a chart point and the map frame
 carrying the same date still agree, which is the invariant the whole period
 mechanism exists to keep. The two places this deliberately does not apply are
 noted where they occur: a region area-mean, which is no longer a category, and
-`/monthlyRanking`, which is asking a different question.
+the monthly rankings, which are asking a different question.
+
+The rankings come in both shapes for the same reason the timeseries do — a cell
+and a named region — and share one definition of the ranking itself
+(`_ranked_months`) over two different daily series. A named region's is free:
+`region_daily` already holds its ~15k daily area means, the same order of rows as
+one cell's record. An arbitrary box has no rollup, so it has no ranking.
 """
 
 from __future__ import annotations
@@ -540,6 +546,131 @@ def _partial_months(lo: dt.date, hi: dt.date) -> set[tuple[int, int]]:
     return partial
 
 
+def _ranked_months(source: str, params: dict) -> dict:
+    """Rank one daily series' calendar months against each other, year by year.
+
+    `source` is any subquery yielding `(date, value)` — one cell's record, or a
+    named region's daily area means. **The ranking itself is defined once, here**,
+    so a region's ranks and a cell's cannot drift into meaning different things:
+    same grouping, same `stddevSamp`, same `row_number()`, same partial-month
+    flagging. Only the series underneath differs.
+
+    Returns the `months` mapping plus the archive edges the caller reports.
+    """
+    months: dict[str, list[dict]] = {str(m): [] for m in range(1, 13)}
+    edges = _archive_edges()
+    if edges is None:
+        return {"months": months, "edges": None}
+
+    partial = _partial_months(*edges)
+    rows = client().query(
+        f"""
+        SELECT toMonth(date) AS month,
+               toYear(date)  AS year,
+               avg(value)    AS mean_value,
+               stddevSamp(value) AS sd,
+               count()       AS n,
+               row_number() OVER (
+                   PARTITION BY toMonth(date) ORDER BY avg(value) DESC
+               ) AS rank
+        FROM ({source})
+        GROUP BY month, year
+        ORDER BY month, rank
+        """,
+        parameters=params,
+    ).result_rows
+
+    for month, year, mean_value, sd, n, rank in rows:
+        months[str(month)].append({
+            "year": int(year),
+            "mean": round(float(mean_value), 3),
+            "sd": None if sd is None else round(float(sd), 3),
+            "n": int(n),
+            "rank": int(rank),
+            # Truncated by the edge of the archive, so its mean is over a
+            # part-month and its rank will move as the rest lands.
+            "partial": (int(year), int(month)) in partial,
+        })
+
+    return {"months": months, "edges": edges}
+
+
+def _ranking_envelope(ranked: dict, top: int) -> dict:
+    """The span/through/top fields both ranking endpoints report identically."""
+    edges = ranked["edges"]
+    return {
+        "span": None if edges is None else {
+            "start": str(edges[0].replace(day=1)),
+            "end": str(_month_end(edges[1])),
+        },
+        "through": None if edges is None else str(edges[1]),
+        "top": top,
+        "months": ranked["months"],
+    }
+
+
+def _point_ranking_source(name: str) -> str:
+    """The daily `(date, value)` series at one cell, for `_ranked_months`."""
+    if name == "mhw":
+        # **Mean, not max** — the one place `mhw` is deliberately averaged.
+        # This ranks years against each other, and a max would put half the
+        # archive on Cat 1 and rank nothing. The mean daily category over a
+        # month is a severity-days index: it separates a month with one bad
+        # week from one that spent all of it at Cat 1.
+        return MHW_SOURCE.format(db=DATABASE, where="")
+    if name == "sst":
+        return f"""
+            SELECT date, sst AS value FROM {DATABASE}.sst_daily
+            WHERE gy = %(gy)s AND gx = %(gx)s
+        """
+    return f"""
+        SELECT d.date AS date, d.sst - c.clim AS value
+        FROM {DATABASE}.sst_daily AS d
+        INNER JOIN {DATABASE}.sst_clim AS c
+            ON c.gy = d.gy AND c.gx = d.gx
+           AND c.mmdd = {MMDD_SQL.format(d="d.date")}
+        WHERE d.gy = %(gy)s AND d.gx = %(gx)s
+    """
+
+
+def _region_ranking_source(name: str) -> str:
+    """The daily `(date, value)` series for a named region, from the rollups.
+
+    Same two tables `named_region_timeseries()` reads, and the same column choice
+    (`_ROLLUP_COLUMNS`): `anom` comes off `mean_sst_clim`, restricted on the daily
+    side to the `has_clim = 1` cells, because that is the precondition for
+    `mean(sst - clim) == mean(sst) - mean(clim)`. Serving it from `mean_sst`
+    would drift wherever the ice edge sits.
+
+    So this reads ~15k rows for a region, the same order as one cell's record —
+    which is the whole reason a named-region ranking costs nothing: the rollup
+    already exists. **An arbitrary box has none** and would be the 3-12 s live
+    aggregation, so `/regionTimeseries` gets no ranking.
+
+    `isFinite` drops the dates where a region has no climatology cells at all,
+    for which the rollup stores NaN rather than a 0 that would read as "exactly
+    at climatology" — and which would otherwise drag that month's mean.
+    """
+    value_col, _ = _ROLLUP_COLUMNS[name]
+    if name == "anom":
+        # 366 rows on the right, one per MMDD. The commuting-means identity is
+        # applied per day here rather than per month, so a month spanning the
+        # ice edge's seasonal move is still subtracting the matching climatology.
+        return f"""
+            SELECT d.date AS date, d.{value_col} - c.mean_clim AS value
+            FROM {DATABASE}.region_daily AS d FINAL
+            INNER JOIN {DATABASE}.region_clim AS c FINAL
+                ON c.region = d.region
+               AND c.mmdd = {MMDD_SQL.format(d="d.date")}
+            WHERE d.region = %(key)s AND isFinite(d.{value_col})
+        """
+    return f"""
+        SELECT date, {value_col} AS value
+        FROM {DATABASE}.region_daily FINAL
+        WHERE region = %(key)s AND isFinite({value_col})
+    """
+
+
 def monthly_ranking(
     lat: float, lon: float, top: int = 10, variable_name: str = "anom"
 ) -> dict:
@@ -550,8 +681,9 @@ def monthly_ranking(
     all years for that month, warmest first.
 
     `sd` is day-to-day spread at a single cell, so it is much wider than the same
-    statistic on an area mean -- spatial averaging cancels daily noise that one
-    cell keeps. That is signal about the cell, not error in the mean.
+    statistic on `region_monthly_ranking()`'s area means — spatial averaging
+    cancels daily noise that one cell keeps. That is signal about the cell, not
+    error in the mean.
 
     Reads only the ~15k rows for one cell: `ORDER BY (gy, gx, date)` puts the
     whole record for a point in one contiguous run, so all twelve months come
@@ -562,61 +694,7 @@ def monthly_ranking(
 
     grid = global_grid()
     gy, gx = int(grid.gy(lat)), int(grid.gx(lon))
-    months: dict[str, list[dict]] = {str(m): [] for m in range(1, 13)}
-    edges = _archive_edges()
-
-    if edges is not None:
-        lo, hi = edges
-        partial = _partial_months(lo, hi)
-        if name == "mhw":
-            # **Mean, not max** — the one place `mhw` is deliberately averaged.
-            # This ranks years against each other, and a max would put half the
-            # archive on Cat 1 and rank nothing. The mean daily category over a
-            # month is a severity-days index: it separates a month with one bad
-            # week from one that spent all of it at Cat 1.
-            source = MHW_SOURCE.format(db=DATABASE, where="")
-        elif name == "sst":
-            source = f"""
-                SELECT date, sst AS value FROM {DATABASE}.sst_daily
-                WHERE gy = %(gy)s AND gx = %(gx)s
-            """
-        else:
-            source = f"""
-                SELECT d.date AS date, d.sst - c.clim AS value
-                FROM {DATABASE}.sst_daily AS d
-                INNER JOIN {DATABASE}.sst_clim AS c
-                    ON c.gy = d.gy AND c.gx = d.gx
-                   AND c.mmdd = {MMDD_SQL.format(d="d.date")}
-                WHERE d.gy = %(gy)s AND d.gx = %(gx)s
-            """
-        rows = client().query(
-            f"""
-            SELECT toMonth(date) AS month,
-                   toYear(date)  AS year,
-                   avg(value)    AS mean_value,
-                   stddevSamp(value) AS sd,
-                   count()       AS n,
-                   row_number() OVER (
-                       PARTITION BY toMonth(date) ORDER BY avg(value) DESC
-                   ) AS rank
-            FROM ({source})
-            GROUP BY month, year
-            ORDER BY month, rank
-            """,
-            parameters={"gy": gy, "gx": gx},
-        ).result_rows
-
-        for month, year, mean_value, sd, n, rank in rows:
-            months[str(month)].append({
-                "year": int(year),
-                "mean": round(float(mean_value), 3),
-                "sd": None if sd is None else round(float(sd), 3),
-                "n": int(n),
-                "rank": int(rank),
-                # Truncated by the edge of the archive, so its mean is over a
-                # part-month and its rank will move as the rest lands.
-                "partial": (int(year), int(month)) in partial,
-            })
+    ranked = _ranked_months(_point_ranking_source(name), {"gy": gy, "gx": gx})
 
     return {
         "variable": name,
@@ -628,11 +706,44 @@ def monthly_ranking(
             "lat": float(grid.lat(gy)),
             "lon": float(grid.lon(gx)),
         },
-        "span": None if edges is None else {
-            "start": str(edges[0].replace(day=1)),
-            "end": str(_month_end(edges[1])),
-        },
-        "through": None if edges is None else str(edges[1]),
-        "top": top,
-        "months": months,
+        **_ranking_envelope(ranked, top),
+    }
+
+
+def region_monthly_ranking(
+    key: str, top: int = 10, variable_name: str = "anom"
+) -> dict:
+    """The same ranking over one of `domain.yml`'s named regions.
+
+    The ranked value is the month's mean of the region's **daily cos(lat)-weighted
+    area means** — the same numbers `/region/{key}` plots, folded by month instead
+    of by period bucket. So a year that ranks first here is the year whose month
+    the chart draws highest, which is the invariant worth keeping between the two.
+
+    Two things differ from a cell's ranking, and the response says so rather than
+    leaving the caller to infer it:
+
+    * **`sd` is the spread of daily area means**, not of daily values. Spatial
+      averaging cancels most day-to-day noise, so it is much narrower than the
+      same column at a point and is not comparable with it.
+    * **`mhw` is a mean of area means**, which was never a category — a region's
+      daily value is already continuous. At a point the mean is a deliberate
+      departure from the max everything else takes; here there is nothing ordinal
+      left to depart from.
+    """
+    region = regions()[key]
+    name = check_variable(variable_name)
+    ranked = _ranked_months(_region_ranking_source(name), {"key": key})
+
+    return {
+        "variable": name,
+        "units": variable(name).units,
+        "region": key,
+        "label": region.label,
+        "bounds": {"lat": list(region.lat), "lon": list(region.lon)},
+        # The area mean cancels daily noise, so `sd` here answers a different
+        # question than it does at a cell. Flagged rather than renamed: the
+        # column is the same statistic over a different series.
+        "areaMean": True,
+        **_ranking_envelope(ranked, top),
     }

@@ -523,7 +523,8 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region, using `region_clim` |
-| `POST /monthlyRanking` | every complete calendar month at a cell, ranked within its month-of-year |
+| `POST /monthlyRanking` | every calendar month at a cell, ranked within its month-of-year |
+| `GET /region/{key}/monthlyRanking` | the same ranking over a named region, from `region_daily` |
 | `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
 
 **`variable` — `sst` (default) / `anom` / `mhw`** — is accepted by every endpoint above.
@@ -540,10 +541,11 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
   cos(lat)-weighted area mean — continuous, and no longer a category — so there is nothing
   ordinal left for a max to preserve, and a max of daily area means would be a spike
   detector for each week's worst day.
-- **`/monthlyRanking` takes the MEAN**, and it is the one place `mhw` is deliberately
-  averaged at a point. It ranks years against each other, and a max would put most of the
-  archive on Cat 1 and rank nothing; the mean daily category over a month is a
-  severity-days index that separates one bad week from a whole month at Cat 1.
+- **The monthly rankings take the MEAN**, and the point one is the place `mhw` is
+  deliberately averaged at a cell. They rank years against each other, and a max would put
+  most of the archive on Cat 1 and rank nothing; the mean daily category over a month is a
+  severity-days index that separates one bad week from a whole month at Cat 1. The region
+  ranking is a mean of daily area means, which was never a category to begin with.
 
 **`period` — `daily` (default) / `weekly` / `monthly`** — buckets are defined once in
 `shared/periods.py`: weeks start on **Monday** (`toMonday`), months are calendar months, and
@@ -560,12 +562,38 @@ plain-string `detail` and a structured `error` object** (`code: "outside_domain"
 working; `error.code` is what lets the frontend show this as an informational empty state
 rather than a red failure.
 
-**`/monthlyRanking` is always monthly, whatever the caller's `period`**, and it ranks
+**The monthly rankings are always monthly, whatever the caller's `period`**, and they rank
 `anom` by default because ranking years by absolute SST is a different question. Every
 month is ranked including the archive's truncated edge months, which carry `partial: true`
 — the month in progress is the one people most want to look at, so it is starred rather
 than hidden. A month missing an *interior* day is **not** partial: it is as complete as it
 will ever be.
+
+**There are two of them — a cell and a named region — and the ranking itself is defined
+once.** `_ranked_months()` takes any subquery yielding `(date, value)` and does the
+grouping, the `stddevSamp` and the `row_number()`; only the series underneath differs, so
+the two cannot drift into meaning different things. A cell's series is the ~15k-row
+primary-key read the point timeseries makes; a **named region's is `region_daily`**, folded
+by month instead of by period bucket — the same numbers `/region/{key}` plots, so the year
+that ranks first is the year whose month the chart draws highest. Measured, that is **15 ms**
+for Nino 3.4, because the rollup already exists.
+
+Two things about the region ranking are not the cell ranking, and the response says so
+rather than leaving them to be inferred:
+
+- **`sd` is the spread of daily *area* means**, not of daily values. Spatial averaging
+  cancels the noise one cell keeps — Nino 3.4's August 2015 is 0.176 against the same
+  month's 0.308 at a cell inside it — so the two columns are not comparable. `areaMean:
+  true` is what the frontend reads to label it (`sd of daily means`) rather than renaming
+  the field.
+- **`anom` comes off `mean_sst_clim`, not `mean_sst`** — `_ROLLUP_COLUMNS`, same choice
+  `named_region_timeseries()` makes, because the `mean(sst - clim) == mean(sst) - mean(clim)`
+  identity needs both sides averaging the `has_clim = 1` cells. The subtraction is per day
+  against `region_clim`'s MMDD, not per month, so a month spanning the ice edge's seasonal
+  move still subtracts the matching climatology.
+
+**Only named regions get one.** An arbitrary box through `/regionTimeseries` has no rollup
+and would be the 3–12 s live aggregation, so there is no ranking endpoint for one.
 
 ### Map imagery (`shared/render.py`)
 
@@ -711,13 +739,15 @@ same stack as the ocean-acidification dashboard.
 
 ```
 app/app.vue                        header + coverage badge; awaits store.loadMetadata()
-app/pages/index.vue                map + point chart rail on the left, ranks dock on the right
+app/pages/index.vue                numbers + ranks dock on the left, map over the chart
 app/components/AnomalyMap.vue      MapboxGL + the field image source
 app/components/TimeControl.vue     variable + period toggles, date stepper, playback
 app/components/ColorLegend.vue     gradient + the colour range control (popover)
 app/components/TimeseriesChart.vue ECharts line with dataZoom
-app/components/MonthlyRankingBrowser.vue  month rail + one month's year ranking
-app/components/SideDock.vue        resizable right-hand dock (drag handle, remembered width)
+app/components/ScopeControl.vue    point / named-region switch, over the map
+app/components/StatsPanel.vue      the dock's headline value and stat cards
+app/components/MonthlyRankPanel.vue  the map's month, every year ranked (under the cards)
+app/components/SideDock.vue        resizable left-hand dock (drag handle, remembered width)
 app/composables/useApi.ts          axios wrapper
 app/composables/usePlayback.ts     play/stop loop + frame prefetch for the map animation
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
@@ -742,16 +772,17 @@ and `stats.ts` are pure.
   saying only `date` invites reading it as that Monday's reading. On a daily series the two
   are equal, which is honest rather than redundant. A null value is an **empty field**; any
   placeholder would read back as a reading.
-- **`MonthlyRankingBrowser`'s button saves all twelve months**, not the one the rail has
-  open — the rail shows one at a time because 45 rows twelve times over is unreadable on
+- **`MonthlyRankPanel`'s button saves all twelve months**, not the one on screen — the
+  panel shows the map's month because 45 rows twelve times over is unreadable on
   screen, which is not a limit a file has, and a `month` column is what makes the table
   filterable. `partial` is carried as a boolean: it is the difference between a settled rank
   and one that will move.
 
 Filenames carry everything that decides what the numbers are —
 `anom_weekly_nino-3-4_1984-12-31_2026-08-24.csv`,
-`anom_monthly-ranks_47-98n_127-98w.csv` — because a folder of `timeseries.csv` files
-is indistinguishable a week later, and a cell and a region are not comparable numbers.
+`anom_monthly-ranks_47-98n_127-98w.csv`, `anom_monthly-ranks_nino-3-4.csv` — because a
+folder of `timeseries.csv` files is indistinguishable a week later, and a cell and a region
+are not comparable numbers: one is a point reading, the other an area mean.
 Cells are slugged as hemispheres for the same reason `index.vue` prints them that way: the
 0-360 longitudes the API returns would name 128 W as `232.00`.
 
@@ -848,65 +879,76 @@ Persistence follows `SideDock`'s convention — `localStorage`, key `enso.scale.
 read once from `ColorLegend`'s `onMounted` (**not** `loadMetadata()`, which runs under SSR)
 and re-clamped on read, since the encoding may have moved since it was written.
 
-**The monthly-ranking browser lives in a dock beside the map**, not over it. It needs
-full page height — one month of ~45 years is already taller than the chart rail — but it
-was a fullscreen modal first, and that made picking a cell cost close / click / reopen
-every time, which is unusable if you want to compare ten cells. `SideDock.vue` is a plain
-right-hand column: the map keeps its clicks, the store updates, and the panel follows.
+**The numbers and the monthly ranking are one panel, not two tabs.** They were a
+`Numbers | Monthly ranks` pair in the same dock, which made two halves of one answer about
+one cell take turns — and the ranking's own month rail then asked the same "which month"
+question the numbers above had already answered. So the tabs are gone, `StatsPanel` takes
+its natural height at the top, and `MonthlyRankPanel` is spent out of whatever the dock has
+left below it. **Both scopes fill it**: `store.activeRanking` picks the cell's ranking or
+the region's exactly as `activeSeries` picks the series, so the panel stays presentational
+and the scope keeps one definition. The honest "monthly ranks are per cell" empty state
+that used to sit there is gone with the endpoint that made it true.
+
+The region ranking is fetched **alongside the region series**, in `loadRegionSeries()`'s
+one `Promise.all`, and guarded the same way `selectPoint`'s `sameCell` is: a **period**
+toggle re-enters with the same region and must not refetch a ranking that is always monthly
+(it would flash the grid), while a **variable** toggle must — ranking years by absolute SST
+is a different question from ranking them by anomaly. Verified in Chromium: Daily / Weekly /
+Monthly issue only the series request, and switching variable issues only the ranking one.
+
+**The ranking's month is the map's** (`selectedDate`'s), with no local state beside it —
+the rail of twelve thumbnails that used to pick it is gone, and `thumbOption()` with it.
+One consequence worth knowing: clicking a *row* still moves the map, so the panel would
+follow the map straight off the month just clicked, because the store snaps to a bucket
+start and the Monday of the week containing the 1st sits in the previous month. `dateFor()`
+emits the first Monday *inside* the month on a weekly period for exactly that reason; on
+daily and monthly the 1st already snaps to itself.
+
+**The panel lives in a dock beside the map**, not over it. It needs full page height —
+one month of ~45 years is already taller than the chart below the map — but it was a
+fullscreen modal first, and that made picking a cell cost close / click / reopen every
+time, which is unusable if you want to compare ten cells. `SideDock.vue` is a plain
+column on the **left** (the map's own controls — projection, scope, legend, time bar —
+grew on the right and below): the map keeps its clicks, the store updates, and the panel
+follows.
 
 Its width is the user's, not a constant — the dock and the map want the same pixels, so
-there is a drag handle on its left edge (arrow keys too) and the width is remembered in
-`localStorage` under `enso.ranksDock.width`. The floor is **420px**, which is where the
-rail plus the panel's fixed 66px of rank labels stop leaving a readable plot; the ceiling
-leaves 380px for the map. `MonthlyRankingBrowser` is therefore sized by **container
-queries** (`@container` on its root, `@md`/`@lg` variants) rather than viewport
-breakpoints — the rail narrows, and the "warmest YYYY" captions and the panel's colour
-legend drop out, when the dock is dragged in. Its `ResizeObserver` redraw is debounced
-100ms because a drag fires it every frame and one redraw is twelve thumbnails plus a
-45-row panel.
+there is a drag handle on its edge (arrow keys too) and the width is remembered in
+`localStorage` under `enso.dock.width`. The floor is **420px**, which is where the panel's
+fixed 74px of rank labels stop leaving a readable plot; the ceiling is 1000px and leaves
+380px for the map. Both panels are therefore sized by **container queries** (`@container`
+on their roots) rather than viewport breakpoints — the stat cards drop from two columns to
+one when the dock is dragged in. `MonthlyRankPanel`'s `ResizeObserver` redraw is debounced
+100ms because a drag fires it every frame and one redraw is a 45-row panel.
 
-Inside the dock it is **master–detail, not a grid**: a scrollable left rail of twelve
-thumbnails, and the selected month drawn full size beside it. Twelve panels at once was
-the first shape and was legible only by scrolling ~1800px, which is what killed it.
-
-Both ECharts options are built by `utils/ranking.ts` rather than inside the SFC, for the
-same reason `periods.ts` exists: being pure functions of their inputs they can be rendered
+`detailOption()` is built by `utils/ranking.ts` rather than inside the SFC, for the same
+reason `periods.ts` exists: being a pure function of its inputs it can be rendered
 head-lessly with echarts' SSR mode and asserted on, which is much cheaper than driving a
 browser for chart maths.
 
-- **The rail's thumbnails are marks only** — no axes, no labels. A month's name is HTML
-  next to its canvas, where it stays crisp, focusable and selectable; the card is the
-  click target. At ~1.4px per year, whiskers and tick labels would be mush, so what
-  survives the size is the spine's shape and its colour, which is what the rail is
-  scanned for.
-- **The rail shares one x-domain across all twelve; the open month scales to itself.**
-  Comparability is the rail's job now, so the detail is free to spend its full width on
-  the month being read — at a cell whose August reaches +6 °C, a shared domain left
-  January using a third of the pane. `xDomainOf()` serves both: pass all twelve months
-  for the rail, the one month for the detail.
-- **The detail's row pitch is spent out of the pane's height** (`detailPitch()`, clamped
-  to 9–22px), so 45 years normally fit with no scrolling at all. Only a short pane hits
-  the floor and lets the panel overflow. Measure the scroll container, not the section —
-  the heading sits outside it deliberately.
-- **Picking a month in the rail does not move the map.** `activeMonth` is seeded from
-  `selectedDate`'s month and re-seeded whenever the map moves to another month, but it is
-  local state; only clicking a *row* emits `select`.
+- **The month scales to itself.** `xDomainOf()` still takes a list of months — it shared
+  one domain across the rail's twelve — but is now called with the one month on screen,
+  which is what lets it spend the full width on the month being read. At a cell whose
+  August reaches +6 °C, a domain covering the whole year left January using a third of
+  the pane.
+- **The row pitch is spent out of the pane's height** (`detailPitch()`, clamped to
+  9–40px), so 45 years normally fit with no scrolling at all. Only a short pane hits the
+  floor and lets the panel overflow. Measure the scroll container, not the section — the
+  heading sits outside it deliberately.
 
 Three encodings, three separate jobs, deliberately not overlapping: **dot colour** is the
 value on the active variable's scale — the same colour that cell has on the map;
 **label weight and ink** mark the top N (never hue, which already means anomaly); **amber**
 is "where the map is", matching `TimeseriesChart`'s `MAP` markLine — the map's year is
-ringed in the detail and in every thumbnail, and the map's month name is amber in the rail.
+ringed in the plot.
 
 **A `partial` month is starred, not hidden.** The API ranks the archive's edge months
-with the rest, and the browser marks them in three places: the detail's row label reads
-`15. 2026 *`, its dot is drawn **open** (no fill, its own colour as the stroke) so it
-reads on the same scale without looking like a settled datum, and the rail's dot for it
-is faint (`opacity 0.45`) since there is no label out there to carry a star. The star is
-cashed in by `partialNote()` — one dimmed line above the plot, "August 2026 is incomplete
-— ranked on 24 of 31 days" — which sits *outside* the scroll pane, so it costs the pitch
-a row's worth of height and nothing else. The rail's "warmest YYYY" caption gets the star
-only when the partial month is actually rank 1.
+with the rest, and the panel marks them twice: the row label reads `15. 2026 *`, and its
+dot is drawn **open** (no fill, its own colour as the stroke) so it reads on the same
+scale without looking like a settled datum. The star is cashed in by `partialNote()` —
+one dimmed line above the plot, "August 2026 is incomplete — ranked on 24 of 31 days" —
+which sits *outside* the scroll pane, so it costs the pitch a row's worth of height and
+nothing else.
 
 **Playback (`usePlayback.ts`) is a paced loop over `store.setDate()`, not a second
 clock.** The play button steps the map one bucket at a time until stopped — past the end of
@@ -1139,6 +1181,15 @@ Verified working end to end on the CoralTemp pipeline:
   across eight days.
 - **The region identity.** `/region/nino34?variable=anom` equals a direct cell-wise
   `avg(sst - clim)` over the same box to three decimals, on 201,392 cells.
+- **The region ranking.** `/region/nino34/monthlyRanking?variable=anom` puts August 2015 at
+  rank 2 with a mean of **1.980**, which is exactly the mean of the 31 daily values
+  `/region/nino34?start=2015-08-01&end=2015-08-31` returns — the fold and the chart agree
+  because they read the same rollup. 15 ms. January's rank 1 is 2016 at +2.51 and August's
+  top three are 2026 (partial), 2015, 1997, which are the El Nino years they should be.
+  In the browser: the panel draws in region scope with an "area mean" caption, the tooltip
+  reads `sd of daily means`, the CSV downloads as `anom_monthly-ranks_nino-3-4.csv` with
+  500 rows, and `mhw` ranks the region without printing a category name. No console
+  errors.
 - **Imagery.** Land transparent, ice-fringe grey, ocean coloured — checked by pixel, not by
   eye. `bounds()` returns west 100 / east 290. `/image` 404s with an explanatory message
   for a bucket with neither cache nor NetCDF.

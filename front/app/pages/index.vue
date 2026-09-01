@@ -22,81 +22,54 @@
         <p class="truncate text-xs text-muted">{{ subjectSubtitle }}</p>
       </template>
 
-      <!-- Tabs choose a VIEW of the current scope, never a second scope: both
-           read whatever the switch above names. -->
-      <UFieldGroup size="xs" class="mb-2 w-full shrink-0">
-        <UButton
-          v-for="t in TABS"
-          :key="t.value"
-          class="grow justify-center"
-          :color="tab === t.value ? 'primary' : 'neutral'"
-          :variant="tab === t.value ? 'solid' : 'subtle'"
-          :icon="t.icon"
-          :label="t.label"
-          @click="tab = t.value"
-        />
-      </UFieldGroup>
-
-      <StatsPanel
-        v-if="tab === 'numbers'"
-        :series="store.activeSeries"
-        :loading="store.activeSeriesLoading"
-        :empty-message="emptyPointMessage"
-        :error="!!store.activeError"
-        :stops="store.activeStops"
-        :categorical="store.activeIsCategorical"
-        :unit="store.activeUnitLabel"
-        :precision="store.domain?.variables?.[store.variable]?.precision"
-        :signed="store.variable === 'anom'"
-        :variable-label="variableLabel"
-        :period="store.period"
-        :selected-date="store.selectedDate"
-      />
-
-      <!-- Ranks are a per-cell question and there is no region equivalent yet,
-           so region scope gets an honest empty state that offers the switch
-           rather than a disabled tab or, worse, a cell's ranking shown under a
-           region's heading. -->
-      <div
-        v-else-if="store.scope === 'region'"
-        class="flex grow flex-col items-center justify-center gap-3 px-6 text-center text-sm text-muted"
-      >
-        <p>Monthly ranks are per cell — there is no region ranking yet.</p>
-        <UButton size="xs" color="neutral" variant="subtle" icon="i-mdi-map-marker" label="Show the clicked cell" @click="store.setScope('point')" />
-      </div>
-
-      <template v-else>
-        <!-- Clamped, because the detail panel wants every pixel of height it can
-             get; the whole caption is one click away for anyone who needs it. -->
-        <button
-          v-if="ranksDescription"
-          type="button"
-          class="mb-2 shrink-0 cursor-pointer text-left text-xs leading-snug text-muted hover:text-default"
-          :class="captionOpen ? '' : 'line-clamp-2'"
-          :title="captionOpen ? 'Show less' : 'Show more'"
-          @click="captionOpen = !captionOpen"
-        >
-          {{ ranksDescription }}
-        </button>
-
-        <!-- `min-h-0 grow` rather than the component's own height: the caption
-             above it is a sibling of variable height, so the plot has to take
-             what is left over rather than a fixed share of the dock. -->
-        <MonthlyRankingBrowser
-          class="min-h-0 grow"
-          :ranking="store.monthlyRanking"
+      <!-- Numbers and the monthly ranking are one view, not two: the tab pair
+           that used to switch between them made two halves of the same answer
+           about the same cell take turns. The ranking is the calendar month the
+           map is on — the rail of twelve is gone, since the numbers above
+           already say which bucket is being described. -->
+      <div class="flex min-h-0 grow flex-col gap-3 overflow-y-auto">
+        <StatsPanel
+          :series="store.activeSeries"
+          :loading="store.activeSeriesLoading"
+          :empty-message="emptyPointMessage"
+          :error="!!store.activeError"
           :stops="store.activeStops"
-          :loading="store.loadingPoint"
+          :categorical="store.activeIsCategorical"
+          :unit="store.activeUnitLabel"
+          :precision="store.domain?.variables?.[store.variable]?.precision"
+          :signed="store.variable === 'anom'"
+          :variable-label="variableLabel"
+          :period="store.period"
+          :selected-date="store.selectedDate"
+        />
+
+        <!-- One panel, both scopes. A region's ranking is the same question over
+             a different daily series — the API defines the ranking once and
+             feeds it either a cell's record or `region_daily`'s area means — so
+             this is `activeRanking`, not a second component.
+
+             `min-h-0 grow`: the numbers above take their natural height, and the
+             plot is spent out of whatever the dock has left — `detailPitch()`
+             measures this pane, so 45 years normally fit without scrolling. -->
+        <MonthlyRankPanel
+          v-if="store.activeRanking || store.activeSeriesLoading"
+          class="min-h-0 grow border-t border-default pt-3"
+          :ranking="store.activeRanking"
+          :stops="store.activeStops"
+          :loading="store.activeSeriesLoading"
           :empty-message="emptyPointMessage"
           :error="!!store.activeError"
           :selected-date="store.selectedDate"
           :unit="store.activeUnitLabel"
           :categorical="store.activeIsCategorical"
+          :zero-line="store.variable === 'anom'"
           :precision="store.domain?.variables?.[store.variable]?.precision"
           :rank-order="rankOrder"
+          :period="store.period"
           @select="store.setDate($event)"
         />
-      </template>
+      </div>
+
     </SideDock>
 
     <!-- Closed, the dock leaves a strip rather than vanishing: a panel with no
@@ -142,19 +115,12 @@ import { useMainStore } from '~/stores/main'
 
 const store = useMainStore()
 
-const TABS = [
-  { value: 'numbers' as const, label: 'Numbers', icon: 'i-mdi-numeric' },
-  { value: 'ranks' as const, label: 'Monthly ranks', icon: 'i-mdi-podium-gold' },
-]
-
 /**
- * Opens on Numbers, and open. The panel needs no selection to have something to
- * say — the app lands in region scope for exactly that reason — so there is
- * nothing to be gained by making the first thing a user sees an empty dock.
+ * Open. The panel needs no selection to have something to say — the app lands in
+ * region scope for exactly that reason — so there is nothing to be gained by
+ * making the first thing a user sees a closed dock.
  */
-const tab = ref<'numbers' | 'ranks'>('numbers')
 const dockOpen = ref(true)
-const captionOpen = ref(false)
 
 const periodLabel = computed(
   () => ({ daily: 'daily', weekly: 'weekly mean', monthly: 'monthly mean' })[store.period],
@@ -241,21 +207,4 @@ const emptyPointMessage = computed(
  */
 const rankOrder = computed(() => (store.variable === 'mhw' ? 'most severe' : 'warmest'))
 
-const ranksDescription = computed(() => {
-  const span = store.monthlyRanking?.span
-  if (!span) return ''
-  const top = store.monthlyRanking?.top ?? 10
-  // Edge months included, hence the star — the month in progress is ranked
-  // alongside the rest rather than waiting for its last day.
-  return `Every month from ${span.start.slice(0, 7)} to ${span.end.slice(0, 7)}, `
-    + `ranked within its calendar month, ${rankOrder.value} first. `
-    + (store.variable === 'mhw'
-      ? 'A month is scored by its MEAN daily heatwave category, not its worst day — '
-      + 'a max would put most years on Cat 1 and rank nothing. '
-      : '')
-    + `Pick a month on the left; bars are `
-    + `±1 SD of that month's daily values and the top ${top} are bold. A * marks a month `
-    + `truncated by the edge of the archive, drawn as an open dot — its mean is over a `
-    + `part-month. Click a row to move the map to it.`
-})
 </script>

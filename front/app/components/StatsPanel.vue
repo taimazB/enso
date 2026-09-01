@@ -1,5 +1,5 @@
 <template>
-  <div v-if="!stats.n" class="flex grow items-center justify-center px-6 text-center text-sm text-muted">
+  <div v-if="!stats.n" class="flex min-h-32 grow items-center justify-center px-6 text-center text-sm text-muted">
     <UIcon v-if="loading" name="i-mdi-loading" class="size-5 animate-spin" />
     <!-- An outright failure is not the same as nothing to show yet, so it
          does not get the neutral hint's styling. -->
@@ -12,7 +12,10 @@
 
   <!-- `@container`, not viewport breakpoints: the dock is dragged between 420px
        and 1000px, so how many cards fit is a question about this element. -->
-  <div v-else class="@container flex min-h-0 grow flex-col gap-4 overflow-y-auto px-1">
+  <!-- Not a scroll pane and not `grow`: the monthly ranking sits directly under
+       these numbers now, and it is the part that wants whatever height the dock
+       has. So this takes its natural height and the ranking takes the rest. -->
+  <div v-else class="@container flex shrink-0 flex-col gap-3 px-1">
     <!-- The headline is the bucket the map is on, not the latest one: the panel
          describes the frame on screen, so stepping the date moves this. -->
     <section class="shrink-0">
@@ -32,14 +35,13 @@
     <!-- Cards rather than a definition list. The strip chart that used to sit
          here was a decoy: the full series with its axes, tooltip and dataZoom is
          already on screen to the right, and a second silent copy of it competed
-         for attention with the numbers, which are the reason to open this tab.
+         for attention with the numbers, which are what this panel is opened for.
          The space it freed goes to the labels, which now read at the same size
          as the rest of the app instead of shrinking away from their values. -->
-    <!-- The cards take the height the panel has, up to a cap. Five numbers
-         cannot honestly fill a 900px dock — past this the boxes stop reading as
-         a set of figures and start reading as empty panels — so what is left
-         over is left over, with the basis note pinned to the bottom of it. -->
-    <div class="grid max-h-92 grow auto-rows-fr grid-cols-1 gap-2 @xs:grid-cols-2">
+    <!-- The cards are as tall as their contents. They used to stretch to fill
+         the dock, which was right when numbers were the whole tab; with the
+         ranking below them, height spent here is height taken from the plot. -->
+    <div class="grid grid-cols-1 gap-2 @xs:grid-cols-2">
       <div
         v-for="(row, i) in rows"
         :key="row.label"
@@ -61,7 +63,7 @@
     <!-- The area-mean note goes ABOVE the basis line and is not folded into it:
          one says what the numbers are computed over, the other says what a
          decimal category is, and the second is only ever shown in region scope. -->
-    <div class="mt-auto shrink-0 pt-2 text-xs leading-snug text-dimmed">
+    <div class="shrink-0 text-xs leading-snug text-dimmed">
       <p v-if="areaMeanNote" class="mb-1.5 text-muted">{{ areaMeanNote }}</p>
       <p>{{ basisNote }}</p>
     </div>

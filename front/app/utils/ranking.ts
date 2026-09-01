@@ -1,14 +1,12 @@
 /**
- * The monthly-ranking browser's data shapes, layout maths, and ECharts options.
+ * The monthly ranking's data shapes, layout maths, and ECharts option.
  *
  * Kept out of the component for the same reason `periods.ts` is: it is pure
- * arithmetic over the API's response, so both charts can be rendered and checked
- * without a browser, and `MonthlyRankingBrowser.vue` stays presentational.
+ * arithmetic over the API's response, so the chart can be rendered and checked
+ * without a browser, and `MonthlyRankPanel.vue` stays presentational.
  *
- * Two options are built here, and they are deliberately the same picture at two
- * sizes: `thumbOption()` is the rail's 12 miniatures (marks only — the month name
- * is HTML beside it, where it stays crisp and selectable), `detailOption()` is
- * the one month the rail has selected, at a legible pitch.
+ * `detailOption()` builds the one chart there is: the calendar month the map is
+ * on, one row per year, ranked.
  */
 
 import type {
@@ -26,7 +24,7 @@ interface GridRect { x: number, y: number, width: number, height: number }
 /** One item's tooltip payload — our own data row. */
 interface ItemParams { value: number[] }
 
-/** One year's showing in a given calendar month, at one cell. */
+/** One year's showing in a given calendar month, at one cell or over a region. */
 export interface RankingRow {
   year: number
   /** Mean daily anomaly over the month, degC. */
@@ -46,7 +44,18 @@ export interface RankingRow {
 }
 
 export interface MonthlyRanking {
-  cell: { gy: number, lat: number, lon: number }
+  /** Present on a cell's ranking; absent on a region's, which has bounds instead. */
+  cell?: { gy: number, lat: number, lon: number }
+  /** Present on a named region's ranking. The two are mutually exclusive. */
+  region?: string
+  label?: string
+  /**
+   * True when the ranked value is a mean of daily *area* means. `sd` is then the
+   * spread of those means rather than of daily values — spatial averaging cancels
+   * most day-to-day noise, so it is much narrower and is not comparable with a
+   * cell's. Said in the tooltip rather than left for the reader to infer.
+   */
+  areaMean?: boolean
   /** Which field the years are ranked by. */
   variable?: 'sst' | 'anom' | 'mhw'
   units?: string
@@ -136,87 +145,31 @@ export function partialNote(rows: RankingRow[], month: number): string | null {
 export interface XDomain { min: number, max: number }
 
 /**
- * One x-domain across all twelve months, used by the rail and the detail alike.
+ * The x-domain a set of months shares.
  *
- * Per-month autoscaling would make a mild month look as violent as an extreme
- * one. Sharing it is what lets the rail be read as a rail: the diagonals lean
- * differently because the months differ, not because each was drawn to fit.
+ * Called with the single month on screen, which therefore scales to itself: the
+ * rail of twelve thumbnails this used to keep comparable is gone, and one month
+ * drawn against the whole year's spread would use a third of the pane. It still
+ * takes a list, so a future rail can put several months on one domain.
+ *
+ * `includeZero` is the same question the chart's y-axis asks with `scale: true`,
+ * and it has the same two answers. Zero is the anomaly's baseline and the
+ * heatwave category's floor ("no heatwave"), so those hold it; an absolute SST
+ * has no meaningful zero, and anchoring there draws a cell whose August runs
+ * 6-8 degC as forty dots stacked against the right edge of an empty pane.
  */
-export function xDomainOf(months: RankingRow[][]): XDomain {
-  let lo = 0
-  let hi = 0
+export function xDomainOf(months: RankingRow[][], includeZero = true): XDomain {
+  let lo = includeZero ? 0 : Infinity
+  let hi = includeZero ? 0 : -Infinity
   for (const rows of months) {
     for (const r of rows) {
       lo = Math.min(lo, r.mean - (r.sd ?? 0))
       hi = Math.max(hi, r.mean + (r.sd ?? 0))
     }
   }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return { min: 0, max: 1 }
   const pad = (hi - lo) * 0.04 || 0.5
   return { min: lo - pad, max: hi + pad }
-}
-
-// --- Rail thumbnail ----------------------------------------------------------
-
-export interface ThumbOptionInput {
-  rows: RankingRow[]
-  /** `/domain`'s diverging stops, so a dot here is the colour that cell has on the map. */
-  stops: ColorStop[]
-  domain: XDomain
-  /** Year on the map; ringed amber here too, so the rail shows where it sits every month. */
-  selectedYear?: number | null
-  /**
-   * Whether the ranked value is a mean over an ordinal class. Below the first
-   * class it is drawn neutral rather than clamped: a mean heatwave category of
-   * 0.0 is "no heatwave all month", and painting it Cat 1's yellow says exactly
-   * the opposite of what happened.
-   */
-  categorical?: boolean
-}
-
-/**
- * A month reduced to its ranked spine: one dot per year, no axes, no labels.
- *
- * Deliberately not a shrunken copy of the detail panel — at ~1.4px per year the
- * whiskers would be mush and the tick labels unreadable. What survives the size
- * is the shape (how far the diagonal leans, where it crosses zero) and the
- * colour, which is exactly what the rail is being scanned for.
- */
-export function thumbOption({ rows, stops, domain, selectedYear, categorical }: ThumbOptionInput): EChartsOption {
-  const scale = colorScale(stops, categorical ? NO_CLASS_COLOR : undefined)
-  return {
-    animation: false,
-    backgroundColor: 'transparent',
-    grid: { left: 5, right: 5, top: 4, bottom: 4 },
-    xAxis: { type: 'value', min: domain.min, max: domain.max, show: false },
-    // A value axis rather than a category one: with no labels to place there is
-    // nothing a category buys, and this keeps the spine's spacing exact.
-    yAxis: { type: 'value', min: 0, max: Math.max(1, rows.length - 1), inverse: true, show: false },
-    series: [{
-      type: 'scatter',
-      silent: true,
-      data: rows.map((r, i) => ({
-        value: [r.mean, i],
-        symbolSize: selectedYear != null && r.year === selectedYear ? 6 : 3.5,
-        itemStyle: {
-          color: scale(r.mean),
-          // No labels here to carry a star, so a truncated month's dot is drawn
-          // faint instead — the rail is scanned for the spine's shape, and this
-          // says "provisional" without changing where the dot sits.
-          opacity: r.partial ? 0.45 : 1,
-          ...(selectedYear != null && r.year === selectedYear
-            ? { borderColor: ACCENT, borderWidth: 1.5 }
-            : {}),
-        },
-      })),
-      markLine: {
-        silent: true,
-        symbol: 'none',
-        animation: false,
-        label: { show: false },
-        data: [{ xAxis: 0, lineStyle: ZERO_LINE }],
-      },
-    }],
-  }
 }
 
 // --- Detail panel ------------------------------------------------------------
@@ -240,21 +193,35 @@ export interface DetailOptionInput {
    */
   unit?: string
   /**
+   * What the `sd` row is the spread OF. A cell's is day-to-day spread of daily
+   * values; a region's is the spread of daily area means, which is much narrower
+   * because spatial averaging cancels the noise one cell keeps. Same statistic,
+   * different series — so it is labelled rather than renamed.
+   */
+  sdLabel?: string
+  /**
    * Whether the ranked value is a mean over an ordinal class. `/monthlyRanking`
    * averages the daily category deliberately — a max would put half the archive
    * on Cat 1 and rank nothing — so the number is a severity index rather than a
    * category, and it is signed only when the underlying scale is.
    */
   categorical?: boolean
+  /**
+   * Whether the scale is centred at zero, which is what a leading '+' means.
+   * The anomaly is; an absolute SST and a mean heatwave category are not — one
+   * has no meaningful zero and the other cannot go below it. Defaults to the
+   * old rule so a caller that does not say keeps its behaviour.
+   */
+  signedScale?: boolean
 }
 
 export function detailOption({
   rows, month, stops, domain, pitch, topN, selectedYear, unit = '\u00B0C', categorical = false,
+  sdLabel = 'sd', signedScale,
 }: DetailOptionInput): EChartsOption {
-  // A leading '+' only means something on a scale centred at zero. The anomaly
-  // is; a mean heatwave category, which cannot go below zero, is not.
+  const isSigned = signedScale ?? !categorical
   const scale = colorScale(stops, categorical ? NO_CLASS_COLOR : undefined)
-  const value = (n: number) => (categorical ? n.toFixed(2) : signed(n))
+  const value = (n: number) => (isSigned ? signed(n) : n.toFixed(2))
   const suffix = unit ? ` ${unit}` : ''
   const panelH = pitch * Math.max(1, rows.length)
   const labelSize = pitch >= 14 ? 11 : 9
@@ -271,7 +238,7 @@ export function detailOption({
         const lines = [
           `<b>${MONTHS[month - 1]} ${year}${partial ? ' *' : ''}</b>`,
           `mean&nbsp;&nbsp;<b>${value(mean!)}${suffix}</b>`,
-          `sd&nbsp;&nbsp;${sd!.toFixed(2)}${suffix} over ${n} days`,
+          `${sdLabel}&nbsp;&nbsp;${sd!.toFixed(2)}${suffix} over ${n} days`,
           `rank&nbsp;&nbsp;${rank} of ${rows.length}`,
         ]
         if (partial) {
@@ -343,13 +310,20 @@ export function detailOption({
         r.mean - (r.sd ?? 0), r.mean, r.mean + (r.sd ?? 0), i, r.year, r.sd ?? 0, r.n, r.rank,
         r.partial ? 1 : 0,
       ]),
-      markLine: {
-        silent: true,
-        symbol: 'none',
-        animation: false,
-        label: { show: false },
-        data: [{ xAxis: 0, lineStyle: ZERO_LINE }],
-      },
+      // Drawn only where zero is actually inside the pane. On the anomaly it is
+      // the baseline every dot is read against; on an absolute SST it is far
+      // off the left of a domain that no longer reaches down to it, and ECharts
+      // would pin it to the axis edge, where it reads as a real gridline at the
+      // wrong value.
+      markLine: domain.min <= 0 && domain.max >= 0
+        ? {
+            silent: true,
+            symbol: 'none',
+            animation: false,
+            label: { show: false },
+            data: [{ xAxis: 0, lineStyle: ZERO_LINE }],
+          }
+        : undefined,
       renderItem: (params: CustomSeriesRenderItemParams, api: CustomSeriesRenderItemAPI) => {
         const cs = params.coordSys as unknown as GridRect
         const cat = api.value(3) as number

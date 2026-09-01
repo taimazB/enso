@@ -263,17 +263,25 @@ export const useMainStore = defineStore('main', {
     /**
      * Whether the chart and the numbers panel read a point or a region.
      *
-     * Opens on `region`, and that is a first-run decision rather than a
-     * preference: a point panel has nothing to show until someone clicks the
-     * map, so opening there means opening on an empty "click something" state —
-     * the tutorial this app is trying not to need. A region needs no selection,
-     * so the app can land showing a named number beside the map. Clicking the
-     * map then moves to `point`, which is what teaches the toggle.
+     * Opens on `point`. The empty "click something" state that used to argue
+     * for opening on a region is not reachable: `loadMetadata()` seeds
+     * DEFAULT_POINT before anything renders, so the app lands with a real cell
+     * charted and its monthly ranks populated rather than showing their own
+     * empty state. Both scopes now have a ranking — a region's is folded from
+     * `region_daily`'s area means — so the panel no longer goes blank on a
+     * scope switch either.
      */
-    scope: 'region' as Scope,
+    scope: 'point' as Scope,
     /** Named region the region scope is reading. Seeded by `loadMetadata()`. */
     activeRegion: null as string | null,
     regionSeries: null as Series | null,
+    /**
+     * Per-calendar-month year rankings over the active region. Always monthly.
+     *
+     * Kept beside `monthlyRanking` rather than replacing it, exactly as the two
+     * series are: switching scope back and forth must not refetch either.
+     */
+    regionRanking: null as MonthlyRanking | null,
     loadingRegion: false,
     /** Set when the region request failed outright. See `activeError`. */
     regionError: null as string | null,
@@ -374,6 +382,17 @@ export const useMainStore = defineStore('main', {
       state.scope === 'region' ? state.loadingRegion : state.loadingPoint,
 
     /**
+     * The ranking the panel draws, for whichever scope is active.
+     *
+     * A cell's and a region's are the same shape and the same question — the API
+     * defines the ranking once over two different daily series — so the panel
+     * stays presentational and the scope keeps one definition, as with
+     * `activeSeries`.
+     */
+    activeRanking: (state): MonthlyRanking | null =>
+      state.scope === 'region' ? state.regionRanking : state.monthlyRanking,
+
+    /**
      * The current scope's failure, if it has one.
      *
      * Read through here for the same reason as `activeSeries`: the panels stay
@@ -454,8 +473,9 @@ export const useMainStore = defineStore('main', {
         ? null
         // Non-fatal: a failure here costs the opening chart, not the whole page.
         // Not a user gesture: this populates the chart for the first click that
-        // has not happened yet, and must leave the app in its region-first
-        // opening state.
+        // has not happened yet. `enterScope: false` because the scope is not
+        // this call's to decide either way — it is already `point` on a fresh
+        // load, and a bootstrap must not move it if something else set it.
         : this.selectPoint(DEFAULT_POINT.lat, DEFAULT_POINT.lon, { enterScope: false }).catch(() => {})
 
       const [domain, coverage] = await Promise.all([
@@ -573,19 +593,35 @@ export const useMainStore = defineStore('main', {
     async loadRegionSeries(api = useApi()) {
       const key = this.activeRegion
       if (!key) return
+      // The ranking is period-independent — it is always monthly — so a period
+      // toggle, which re-enters here with the same region, must not refetch it
+      // and flash the grid. It is NOT variable-independent: ranking years by
+      // absolute SST is a different question from ranking them by anomaly. Same
+      // rule as `selectPoint`'s `sameCell`.
+      const sameRanking = this.regionRanking?.region === key
+        && this.regionRanking.variable === this.variable
+
       this.loadingRegion = true
       this.regionError = null
       try {
-        this.regionSeries = await api.get<Series>(`/region/${key}`, {
-          period: this.period,
-          variable: this.variable,
-        })
+        const [series, ranking] = await Promise.all([
+          api.get<Series>(`/region/${key}`, {
+            period: this.period,
+            variable: this.variable,
+          }),
+          sameRanking
+            ? Promise.resolve(this.regionRanking!)
+            : api.get<MonthlyRanking>(`/region/${key}/monthlyRanking`, { variable: this.variable }),
+        ])
+        this.regionSeries = series
+        this.regionRanking = ranking
       }
       catch (error: unknown) {
         // Handled, not swallowed: the panel says so, and the console still
         // carries the stack for whoever is debugging the deploy.
         console.error(`[enso] /region/${key} failed`, error)
         this.regionSeries = null
+        this.regionRanking = null
         this.regionError = requestErrorMessage(error, `the ${key} series`)
       }
       finally {
@@ -678,9 +714,7 @@ export const useMainStore = defineStore('main', {
      * `enterScope` is what separates a *user gesture* from a *bootstrap*. A map
      * click means "look at this cell" and must move the app into point scope;
      * `loadMetadata()` calling this to populate the opening chart means nothing
-     * of the sort, and letting it switch scope silently landed the app in point
-     * scope on every load — defeating the region-first opening state, whose
-     * whole purpose is to have something to show before the first click.
+     * of the sort and leaves the scope alone.
      */
     async selectPoint(lat: number, lon: number, { enterScope = true }: { enterScope?: boolean } = {}) {
       // The ranking is period-independent, so a period toggle — which re-enters
@@ -693,9 +727,9 @@ export const useMainStore = defineStore('main', {
         && this.monthlyRanking.variable === this.variable
 
       this.selectedPoint = { lat, lon }
-      // What makes the Point/Region toggle self-teaching: you land in Region,
-      // click the map, and the control that moved you is visibly the one that
-      // moves you back.
+      // A map click in region scope means "look at this cell", so it moves the
+      // app back to point scope; the control that moved you is visibly the one
+      // that moves you back.
       if (enterScope) this.scope = 'point'
       this.outsideDomain = null
       this.pointError = null
