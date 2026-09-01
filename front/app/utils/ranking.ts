@@ -117,8 +117,8 @@ export function detailHeightFor(rowCount: number, pitch: number): number {
   return TOP_PAD + AXIS_H + pitch * Math.max(1, rowCount)
 }
 
-function signed(value: number): string {
-  return `${value > 0 ? '+' : ''}${value.toFixed(2)}`
+function signed(value: number, digits: number): string {
+  return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`
 }
 
 /** Days in a 1-based calendar month — day 0 of the next one. */
@@ -221,7 +221,13 @@ export function detailOption({
 }: DetailOptionInput): EChartsOption {
   const isSigned = signedScale ?? !categorical
   const scale = colorScale(stops, categorical ? NO_CLASS_COLOR : undefined)
-  const value = (n: number) => (isSigned ? signed(n) : n.toFixed(2))
+  // One decimal for a temperature, matching `StatsPanel` and the series
+  // tooltip: these are read at a glance off a plot, and the axis ticks share
+  // the formatter, so a second decimal only crowds them. A mean heatwave
+  // category keeps two — it never leaves 0..2, where one decimal flattens the
+  // whole ranking.
+  const digits = categorical ? 2 : 1
+  const value = (n: number) => (isSigned ? signed(n, digits) : n.toFixed(digits))
   const suffix = unit ? ` ${unit}` : ''
   const panelH = pitch * Math.max(1, rows.length)
   const labelSize = pitch >= 14 ? 11 : 9
@@ -238,7 +244,7 @@ export function detailOption({
         const lines = [
           `<b>${MONTHS[month - 1]} ${year}${partial ? ' *' : ''}</b>`,
           `mean&nbsp;&nbsp;<b>${value(mean!)}${suffix}</b>`,
-          `${sdLabel}&nbsp;&nbsp;${sd!.toFixed(2)}${suffix} over ${n} days`,
+          `${sdLabel}&nbsp;&nbsp;${sd!.toFixed(digits)}${suffix} over ${n} days`,
           `rank&nbsp;&nbsp;${rank} of ${rows.length}`,
         ]
         if (partial) {

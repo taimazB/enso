@@ -208,7 +208,9 @@ const isWholeClasses = computed(() => wholeClasses(props.series))
 function formatValue(value: unknown): string {
   if (value == null) return '—'
   const n = Number(value)
-  if (!props.categorical) return `${n.toFixed(2)}${props.unit ? ` ${props.unit}` : ''}`
+  // One decimal for a temperature — the same the dock's cards print, so the
+  // tooltip and the headline for a bucket read identically.
+  if (!props.categorical) return `${n.toFixed(1)}${props.unit ? ` ${props.unit}` : ''}`
   // A region's number is a mean of classes and must not be named as one — nor
   // printed raw, where a float lands as `0.20200000000000001`.
   if (!Number.isInteger(n)) return n.toFixed(2)

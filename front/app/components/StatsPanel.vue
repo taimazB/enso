@@ -114,7 +114,16 @@ function fmt(value: number): string {
   // archive mean as `0`, destroying exactly the signal a region series carries.
   // The chart next door already prints these to two decimals; this keeps the
   // panel agreeing with it.
-  const digits = isAreaMeanOfClasses.value ? 2 : props.precision ?? 2
+  //
+  // A temperature is capped at ONE decimal here, below whatever `precision`
+  // declares. This panel is read at a glance — a headline at 48px and a column
+  // of cards — and the second decimal of an SST is noise at that size, while
+  // the exports and the chart tooltip still carry the variable's full
+  // precision. `mhw` is exempt in both of its shapes: 0 for a whole class, 2
+  // for an area mean of classes, which never leaves 0..2.
+  const digits = isAreaMeanOfClasses.value
+    ? 2
+    : Math.min(props.precision ?? 2, 1)
   const text = value.toFixed(digits)
   return props.signed && value > 0 ? `+${text}` : text
 }
