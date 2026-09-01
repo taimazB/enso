@@ -29,7 +29,12 @@ const FRAME_TIMEOUT_MS = 3000
  * The loop is paced by frame readiness rather than a bare `setInterval`, because
  * a Mapbox `ImageSource` never retries a failed image and silently keeps showing
  * the previous frame — a fixed interval would turn that into an unexplained
- * stutter. Reaching the end of coverage wraps back to the first bucket.
+ * stutter.
+ *
+ * Reaching the end of coverage stops playback rather than wrapping: the archive
+ * is a record with an end, and looping back to 1985 mid-watch reads as a glitch.
+ * Pressing play again while parked on the last bucket restarts from the first,
+ * since the button would otherwise do nothing.
  */
 export function usePlayback() {
   const store = useMainStore()
@@ -68,13 +73,11 @@ export function usePlayback() {
     return Promise.race([decoded, sleep(FRAME_TIMEOUT_MS)])
   }
 
-  /** The next bucket, wrapping to the start of coverage past its end. */
-  function next(from: string): string {
+  /** The next bucket, or null once the end of coverage is past. */
+  function next(from: string): string | null {
     const stepped = shiftBuckets(from, store.period, 1)
-    const { start, end } = store.coverage ?? {}
-    if (end && start && stepped > bucketStart(end, store.period)) {
-      return bucketStart(start, store.period)
-    }
+    const end = store.coverage?.end
+    if (end && stepped > bucketStart(end, store.period)) return null
     return stepped
   }
 
@@ -87,6 +90,7 @@ export function usePlayback() {
     while (playing.value && mine === run && store.selectedDate) {
       const began = performance.now()
       const target = next(store.selectedDate)
+      if (!target) break
 
       await ready(api.imageUrl(target, store.period, store.variable))
       if (!playing.value || mine !== run) return
@@ -95,9 +99,10 @@ export function usePlayback() {
 
       // Queue the window in front of the frame just shown. Cheap: these are
       // ~78 KB each and already rendered to disk on the API side.
-      let ahead = target
+      let ahead: string | null = target
       for (let i = 0; i < AHEAD; i++) {
         ahead = next(ahead)
+        if (!ahead) break
         warm(api.imageUrl(ahead, store.period, store.variable))
       }
 
@@ -105,10 +110,20 @@ export function usePlayback() {
       const wait = 1000 / fps.value - (performance.now() - began)
       if (wait > 0) await sleep(wait)
     }
+    // Ran off the end of coverage. Guarded on `mine`, so a loop that exited
+    // because a newer one took over does not stop the one now running.
+    if (mine === run) playing.value = false
   }
 
   function play() {
     if (!canPlay.value || playing.value) return
+    // Parked on the last bucket, there is nothing forward to play — rewind
+    // rather than start a loop that exits on its first tick.
+    if (store.selectedDate && !next(store.selectedDate)) {
+      const start = store.coverage?.start
+      if (!start) return
+      store.setDate(bucketStart(start, store.period))
+    }
     playing.value = true
     void loop()
   }

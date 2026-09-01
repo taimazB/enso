@@ -79,7 +79,7 @@
 
     <!-- Playback runs until stopped: the playhead is just repeated store.setDate(),
          so stepping or clicking the chart mid-run relocates it rather than fighting
-         it, and the end of coverage wraps round to the start. Typing in the date
+         it, and reaching the end of coverage stops it. Typing in the date
          field does stop it — otherwise the value being typed into is a moving
          target. -->
     <div class="flex items-center gap-2">

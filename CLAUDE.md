@@ -996,8 +996,11 @@ which sits *outside* the scroll pane, so it costs the pitch a row's worth of hei
 nothing else.
 
 **Playback (`usePlayback.ts`) is a paced loop over `store.setDate()`, not a second
-clock.** The play button steps the map one bucket at a time until stopped — past the end of
-coverage it wraps to the first bucket — and because each tick advances from whatever
+clock.** The play button steps the map one bucket at a time until stopped — reaching the
+end of coverage stops it rather than wrapping (the archive is a record with an end, and
+looping back to 1985 mid-watch reads as a glitch; pressing play again while parked on the
+last bucket rewinds to the first, since it would otherwise do nothing) — and because each
+tick advances from whatever
 `store.selectedDate` currently is, stepping or clicking the chart mid-run just relocates the
 playhead. Typing in the date field stops it, since otherwise the field is a moving target.
 Speed is a 1–10 fps slider read *per frame*, so it takes effect on the next one.
