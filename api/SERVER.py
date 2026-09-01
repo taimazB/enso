@@ -143,6 +143,13 @@ def domain() -> dict:
                 "vmin": v.vmin,
                 "vmax": v.vmax,
                 "colormap": v.colormap,
+                # Named one-click display ranges. The default is NOT among them:
+                # it is `vmin`/`vmax` above, and the control builds its chip from
+                # those, so the default has one definition. Empty for a
+                # categorical variable, whose range is not the user's to move.
+                "presets": [
+                    {"label": p.label, "vmin": p.vmin, "vmax": p.vmax} for p in v.presets
+                ],
                 # `anom` is computed as sst - climatology, not stored.
                 "derived": v.derived,
                 # An ordinal class rather than a measurement. The frontend needs

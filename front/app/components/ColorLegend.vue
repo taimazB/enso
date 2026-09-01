@@ -3,11 +3,13 @@
     v-if="stops.length"
     class="rounded-lg border border-default bg-elevated/90 px-3 py-2 shadow-lg backdrop-blur"
   >
-    <div class="mb-1 flex items-center gap-1.5">
+    <!--
+      A categorical key has no range to edit, so its title is a plain label. The
+      continuous case moves the title inside the popover trigger instead, so the
+      whole block — title, Customize chip, bar and ticks — is one hit target.
+    -->
+    <div v-if="categorical" class="mb-1 flex items-center gap-1.5">
       <span class="text-[11px] font-medium text-muted">{{ title }}</span>
-      <!-- Marks a range that is not domain.yml's, so a map read at ±1 is never
-           mistaken for one read at the default ±3. -->
-      <span v-if="isCustom && !categorical" class="text-[11px] text-primary">custom</span>
     </div>
 
     <!--
@@ -36,15 +38,32 @@
       <!--
         A real button, not the bar with a click handler: this is the only way to
         reach the range control, so it has to be focusable and it has to say what
-        it does.
+        it does. It also has to *look* editable — a gradient reads as a legend,
+        which is a thing you consult, not a thing you press — so the affordance
+        is spelled out in a chip beside the title rather than left to the cursor.
       -->
       <button
         type="button"
-        class="block w-48 cursor-pointer rounded ring-offset-2 ring-offset-elevated focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+        class="group block w-48 cursor-pointer rounded ring-offset-2 ring-offset-elevated focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
         :aria-label="`Adjust the ${meta?.shortName ?? ''} colour range`"
         title="Adjust the colour range"
       >
-        <span class="block h-2.5 w-full rounded" :style="{ background: gradient }" />
+        <span class="mb-1 flex items-center gap-1.5">
+          <span class="text-[11px] font-medium text-muted">{{ title }}</span>
+          <!-- Marks a range that is not domain.yml's, so a map read at ±1 is never
+               mistaken for one read at the default ±3. -->
+          <span v-if="isCustom" class="text-[11px] text-primary">custom</span>
+          <span
+            class="ml-auto flex items-center gap-0.5 rounded px-1 py-px text-[10px] text-muted ring-1 ring-default transition-colors group-hover:text-default group-hover:ring-primary group-focus-visible:text-default"
+          >
+            <UIcon name="i-mdi-tune-variant" class="size-3" />
+            Customize
+          </span>
+        </span>
+        <span
+          class="block h-2.5 w-full rounded ring-offset-1 ring-offset-elevated transition-shadow group-hover:ring-1 group-hover:ring-primary"
+          :style="{ background: gradient }"
+        />
         <span class="mt-1 flex justify-between text-[11px] text-muted">
           <span v-for="(tick, i) in ticks" :key="i">{{ formatTick(tick) }}</span>
         </span>
@@ -61,6 +80,31 @@
               variant="subtle"
               color="neutral"
               @click="store.resetScale(store.variable)"
+            />
+          </div>
+
+          <!--
+            Named bands, one click each. They exist because the slider and the
+            number fields say *that* the range is adjustable without saying what
+            range is worth asking for — "where is the ocean between 20 and 32" is
+            a question people have, and typing two numbers is not how they ask
+            it. Narrowing CLAMPS the rest of the ocean to the end colours rather
+            than hiding it; the band gets all 256 ramp entries, which is what
+            makes it readable.
+
+            A plain wrapping row rather than the `UFieldGroup` the toggles
+            elsewhere use: five labels do not fit one 232px line as a joined pill
+            strip, and a popover is the wrong place for horizontal overflow.
+          -->
+          <div v-if="chips.length > 1" class="mb-3 flex flex-wrap gap-1">
+            <UButton
+              v-for="chip in chips"
+              :key="chip.label"
+              :label="chip.label"
+              size="xs"
+              :color="chip.active ? 'primary' : 'neutral'"
+              :variant="chip.active ? 'solid' : 'subtle'"
+              @click="applyChip(chip)"
             />
           </div>
 
@@ -134,7 +178,7 @@
 </template>
 
 <script setup lang="ts">
-import { useMainStore } from '~/stores/main'
+import { quantise, useMainStore } from '~/stores/main'
 
 const store = useMainStore()
 
@@ -185,6 +229,40 @@ const ticks = computed(() => {
   const mid = (vmin + vmax) / 2
   return [vmin, (vmin + mid) / 2, mid, (mid + vmax) / 2, vmax]
 })
+
+/**
+ * The band chips: `domain.yml`'s presets, with the default range prepended.
+ *
+ * The default is synthesised from `vmin`/`vmax` rather than declared alongside
+ * the others, so the file holds one definition of it instead of two that drift
+ * apart the first time one is edited. It is also the only chip that *clears*
+ * the override rather than setting one — which is what makes the `custom` badge
+ * and the Reset button agree with the chips without a third rule.
+ *
+ * A preset is active on the range in force, compared through the same
+ * quantisation `setScale` applied on the way in. Every declared band is a step
+ * multiple today, so a bare `===` would work by luck; this keeps working when
+ * someone adds one at 24.05.
+ */
+const chips = computed(() => {
+  const custom = isCustom.value
+  const { vmin, vmax } = scale.value
+  const same = (a: number, b: number) =>
+    quantise(a, step.value) === quantise(b, step.value)
+  return [
+    { label: 'Default', ...defaults.value, reset: true, active: !custom },
+    ...store.presetsFor(store.variable).map(preset => ({
+      ...preset,
+      reset: false,
+      active: custom && same(vmin, preset.vmin) && same(vmax, preset.vmax),
+    })),
+  ]
+})
+
+function applyChip(chip: { vmin: number, vmax: number, reset: boolean }) {
+  if (chip.reset) store.resetScale(store.variable)
+  else store.setScale(store.variable, chip.vmin, chip.vmax)
+}
 
 /** All clamping lives in the store, so slider and keyboard agree exactly. */
 function commit(vmin: unknown, vmax: unknown) {

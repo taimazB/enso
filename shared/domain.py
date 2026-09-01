@@ -105,6 +105,25 @@ class Category:
 
 
 @dataclass(frozen=True)
+class Preset:
+    """A named display range for the colour-range control.
+
+    A shortcut, not a mode: clicking one is exactly the range the user could
+    have typed, so it goes through the same clamping and is remembered the same
+    way. Narrowing to a band CLAMPS everything outside it to the end colours
+    rather than hiding it — the band is emphasised, not isolated.
+
+    The default range is deliberately NOT one of these. It is the variable's own
+    `vmin`/`vmax`, and the control synthesises its chip from them, so there is
+    one definition of it rather than two that can drift apart.
+    """
+
+    label: str
+    vmin: float
+    vmax: float
+
+
+@dataclass(frozen=True)
 class Variable:
     name: str
     long_name: str
@@ -146,6 +165,12 @@ class Variable:
     # its travel above the boiling point. `anom` has no such gap, so it can and
     # does simply omit this.
     limits: tuple[float, float] | None = None
+    # Named shortcuts offered by the colour-range control. Same family as
+    # `limits` — about the control, not about the data — and optional for the
+    # same reason: `mhw` is categorical, its range is not the user's to move,
+    # and the control does not exist for it. Validated against `range_limits()`
+    # by the loader; see `Preset`.
+    presets: tuple[Preset, ...] = ()
 
     def range_limits(self) -> tuple[float, float]:
         """Bounds for a user-chosen display range, clipped to what is encodable."""
@@ -259,8 +284,27 @@ def variables() -> dict[str, Variable]:
         if cfg.get("limits") is not None:
             cfg["limits"] = tuple(cfg["limits"])
         cfg["colors"] = tuple(Category(**c) for c in cfg.get("colors", ()))
+        cfg["presets"] = tuple(Preset(**p) for p in cfg.get("presets", ()))
         out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
+        _check_presets(out[name])
     return out
+
+
+def _check_presets(v: Variable) -> None:
+    """Reject a declared preset the control could not honour.
+
+    Raised rather than clipped, and rather than asserted (`assert` vanishes
+    under `-O`). The frontend's `setScale` clamps every range it is given, so a
+    preset past `range_limits()` has no loud symptom at all — it just lands
+    somewhere other than where its label says, which is a chip that lies.
+    """
+    lo, hi = v.range_limits()
+    for p in v.presets:
+        if not lo <= p.vmin < p.vmax <= hi:
+            raise ValueError(
+                f"{v.name}: preset {p.label!r} spans {p.vmin}..{p.vmax}, "
+                f"outside the adjustable range {lo}..{hi}"
+            )
 
 
 def variable(name: str) -> Variable:

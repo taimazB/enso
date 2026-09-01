@@ -836,11 +836,43 @@ is period-independent by construction.
 #### The colour range control
 
 **The displayed range is a user setting, per variable, and this is what the value-encoded
-imagery is for.** Clicking the legend's gradient opens a popover (`ColorLegend.vue`) with a
-two-handle slider, exact min/max number fields, and Reset. Narrowing `sst` to 20–30 recolours
+imagery is for.** Clicking the legend opens a popover (`ColorLegend.vue`) with a
+two-handle slider, exact min/max number fields, and Reset. **The affordance is
+spelled out rather than left to the cursor** — a gradient reads as a legend, a
+thing you consult, so the trigger carries a `Customize` chip beside the title and
+the whole block (title, chip, bar, ticks) is one button. Categorical variables
+keep a plain title: there is no range to edit. Narrowing `sst` to 20–30 recolours
 the map instantly and **issues no network request at all** — verified in Chromium, zero
 `/image` fetches — because the frame on screen carries the value and Mapbox re-applies the
 ramp. Nothing in the cache is invalidated, and the range is not part of the image URL's key.
+
+**Named bands make that adjustability legible**, which the slider alone did not: it says
+*that* the range moves without saying what range is worth asking for. `domain.yml` declares
+a `presets` list per continuous variable — sst `Coral 24-32 / Tropical 20-32 / Temperate
+10-25 / Cold -2-12`, anom `Fine ±1 / Wide ±5` — served through `/domain` beside `vmin`,
+`limits` and the stops, so **the numbers are never mirrored in TypeScript**. Three things
+about them:
+
+- **The default is not declared as a preset.** It is `vmin`/`vmax`, and `ColorLegend`
+  synthesises its chip from those, so the file holds one definition of the default rather
+  than two that drift apart the first time one is edited. It is also the only chip that
+  calls `resetScale` rather than `setScale`, which is what makes it agree with the `custom`
+  badge and the Reset button without a third rule. Every other chip is `setScale` and
+  nothing else — no `activePreset` state, so `colorRangeFor`/`stopsFor`/`activeScale` needed
+  no changes, and a preset click is indistinguishable from a drag once persisted (verified:
+  pick Tropical, reload, it reopens on 20-32 with the chip marked).
+- **A band is clipped by nobody, and validated by `shared/domain.py`.** `_check_presets()`
+  raises on one outside `range_limits()` rather than clamping it — the frontend's `setScale`
+  would clamp it silently, and a chip that lands somewhere other than its label is worse
+  than an import that fails. Raised, not asserted: `assert` vanishes under `-O`.
+- **Narrowing clamps; it does not isolate.** On 20-32 the band gets all 256 ramp entries,
+  which is the point, but colder water still paints the bottom colour rather than dropping
+  out. "Show me only the 15-20 water" is a different feature (out-of-band drawn neutral) and
+  is deliberately not built.
+
+Chip membership is compared through the same `quantise` `setScale` applies on the way in —
+exported from the store for that one caller. Every declared band is a step multiple today,
+so `===` would work by luck; this keeps working when someone adds one at 24.05.
 
 The range lives in `store.scales` and everything reads it through one getter, so the map,
 the legend and the ranking dots cannot disagree about what a colour means:

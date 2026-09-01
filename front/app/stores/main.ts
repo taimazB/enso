@@ -59,6 +59,13 @@ export interface DomainMeta {
     colormap: string | null
     derived: boolean
     /**
+     * Named one-click display ranges for the colour-range control. The default
+     * range is NOT among them — it is `vmin`/`vmax` above, and the control
+     * builds its chip from those, so there is one definition of it. Empty for a
+     * categorical variable, which has no adjustable range at all.
+     */
+    presets: Array<{ label: string, vmin: number, vmax: number }>
+    /**
      * An ordinal class rather than a measurement. Three consequences, all
      * handled by reading this rather than by testing `name === 'mhw'`: the map
      * ramp is a `step` instead of an `interpolate`, the colour-range control is
@@ -171,7 +178,7 @@ function rangeStep(encoding: { scale: number }): number {
  * disagree about a value — and round off the float dust the division leaves,
  * which would otherwise reach the slider as a min of -12.700000000000001.
  */
-function quantise(value: number, step: number): number {
+export function quantise(value: number, step: number): number {
   return Number((Math.round(value / step) * step).toFixed(6))
 }
 
@@ -452,6 +459,17 @@ export const useMainStore = defineStore('main', {
      */
     scaleBoundsFor: state => (variable: VariableName): ColorScaleRange =>
       scaleBounds(state.domain, variable),
+
+    /**
+     * The variable's named display ranges, straight from `/domain`.
+     *
+     * The numbers live in `domain.yml` and are not mirrored here — a band is
+     * oceanography, and a second copy of it in TypeScript is the drift the
+     * colour stops and `limits` are already served this way to avoid. Empty for
+     * a categorical variable.
+     */
+    presetsFor: state => (variable: VariableName): Array<{ label: string, vmin: number, vmax: number }> =>
+      state.domain?.variables?.[variable]?.presets ?? [],
 
     /** The increment the range control moves in. See `rangeStep`. */
     scaleStepFor: state => (variable: VariableName): number => stepFor(state.domain, variable),

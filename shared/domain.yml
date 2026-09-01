@@ -67,6 +67,23 @@ variables:
     vmin: -2.0
     vmax: 32.0
     colormap: turbo
+    # Named bands the colour-range control offers as one-click shortcuts.
+    #
+    # The DEFAULT range is deliberately not listed here — it is `vmin`/`vmax`
+    # above, and the control synthesises its chip from them, so there is one
+    # definition of it rather than two that drift apart the first time one is
+    # edited. Every band must lie inside `limits` below; `shared/domain.py`
+    # raises on one that does not, because the frontend would otherwise clamp it
+    # silently and the chip would land somewhere other than its label.
+    #
+    # Narrowing to a band CLAMPS the rest of the ocean to the end colours rather
+    # than hiding it: the band gets all 256 ramp entries, which is what makes it
+    # readable, but water outside it is still coloured.
+    presets:
+      - {label: Coral, vmin: 24.0, vmax: 32.0}
+      - {label: Tropical, vmin: 20.0, vmax: 32.0}
+      - {label: Temperate, vmin: 10.0, vmax: 25.0}
+      - {label: Cold, vmin: -2.0, vmax: 12.0}
     # How far the user may drag the displayed range, which is NOT the encoding's
     # limit: two bytes at 0.01 degC reach 650 degC, and a control bounded by that
     # would be almost entirely above the boiling point. -2 is the freezing point
@@ -100,6 +117,13 @@ variables:
     vmin: -3.0
     vmax: 3.0
     colormap: RdBu_r
+    # See `presets` under `sst`. Two bands rather than four: an anomaly is
+    # already centred on zero, so the only question is how much of it to spend
+    # on an ordinary day (+/-1, where a quiet basin still has structure) versus
+    # an ENSO peak (+/-5, which is where the daily extremes actually reach).
+    presets:
+      - {label: Fine, vmin: -1.0, vmax: 1.0}
+      - {label: Wide, vmin: -5.0, vmax: 5.0}
     # Not stored. Computed as `sst - climatology(mmdd)` at query and render
     # time; see `sst_clim` in shared/ch.py. About 3.2% of the box's ocean cells
     # have SST but no climatology (the seasonal ice fringe, which the source
