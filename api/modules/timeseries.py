@@ -47,6 +47,7 @@ one cell's record. An arbitrary box has no rollup, so it has no ranking.
 from __future__ import annotations
 
 import datetime as dt
+import math
 
 from shared.domain import global_grid, regions, subset, variable
 
@@ -546,6 +547,14 @@ def _partial_months(lo: dt.date, hi: dt.date) -> set[tuple[int, int]]:
     return partial
 
 
+def _finite(value) -> float | None:
+    """Round for the response, or `None` if the value is not a real number."""
+    if value is None:
+        return None
+    value = float(value)
+    return round(value, 3) if math.isfinite(value) else None
+
+
 def _ranked_months(source: str, params: dict) -> dict:
     """Rank one daily series' calendar months against each other, year by year.
 
@@ -584,7 +593,11 @@ def _ranked_months(source: str, params: dict) -> dict:
         months[str(month)].append({
             "year": int(year),
             "mean": round(float(mean_value), 3),
-            "sd": None if sd is None else round(float(sd), 3),
+            # `stddevSamp` of a single day is NaN, not NULL — which is what a
+            # month at the edge of the archive is on the day it opens. Starlette
+            # serialises with `allow_nan=False`, so letting one through is a 500
+            # for the whole ranking rather than one missing field.
+            "sd": _finite(sd),
             "n": int(n),
             "rank": int(rank),
             # Truncated by the edge of the archive, so its mean is over a
