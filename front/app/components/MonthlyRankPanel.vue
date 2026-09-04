@@ -1,7 +1,7 @@
 <template>
   <!-- `@container`: this lives in a dock the user can drag narrower or wider, so
        what fits is a question about this element, not the viewport. -->
-  <div class="@container flex w-full min-h-0 flex-col">
+  <div class="@container relative flex w-full min-h-0 flex-col">
     <div
       v-if="!hasData"
       class="flex min-h-32 w-full items-center justify-center px-6 text-center text-sm text-muted"
@@ -108,6 +108,20 @@
         </div>
       </section>
     </ClientOnly>
+
+    <!-- A refetch keeps the previous series on screen rather than blanking it —
+         the axes and the zoom window stay put, which is what makes toggling
+         variable or period readable. But then nothing said a request was in
+         flight, and the stale line was indistinguishable from the answer. So
+         the spinner above covers "nothing yet" and this covers "something, but
+         not this one": the plot is dimmed rather than hidden, since the point is
+         that what you are looking at is about to be replaced. -->
+    <div
+      v-if="loading && hasData"
+      class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-default/40"
+    >
+      <UIcon name="i-mdi-loading" class="size-5 animate-spin text-muted" />
+    </div>
   </div>
 </template>
 
