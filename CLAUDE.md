@@ -1168,7 +1168,7 @@ guards at the call sites.
 Events, all fired from the store or the component that owns the gesture rather than from
 each call site: `point_selected`, `region_selected` (with `enteredScope`), `scope_changed`,
 `variable_changed`, `period_changed`, `playback_started`, `color_range_changed`,
-`csv_downloaded` (`kind: series | ranking`), `ranking_guide_opened`. Server-side:
+`csv_downloaded` (`kind: series | ranking`), `ranking_guide_opened`, `about_opened`. Server-side:
 `point_queried` (including the out-of-domain 400 — where people click outside the box is
 the argument for widening it, which costs only a `domain.yml` edit), `point_ranking_queried`,
 `region_queried`, `region_box_queried`, `region_ranking_queried`.

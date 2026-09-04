@@ -2,7 +2,15 @@
   <UApp>
     <div class="flex h-screen flex-col bg-default text-default">
       <header class="flex shrink-0 items-center gap-3 border-b border-default px-4 py-2">
-        <UIcon name="i-mdi-waves" class="size-6 text-primary" />
+        <a
+          href="https://cioospacific.ca"
+          target="_blank"
+          rel="noopener"
+          class="mr-4 shrink-0 opacity-90 transition-opacity hover:opacity-100"
+          aria-label="CIOOS Pacific"
+        >
+          <img src="/cioospacific-logo.svg" alt="CIOOS Pacific" class="h-8 w-auto" >
+        </a>
         <div>
           <h1 class="text-sm font-semibold leading-tight">Pacific Sea Surface Temperature</h1>
           <p class="text-xs text-muted leading-tight">
@@ -11,10 +19,11 @@
           </p>
         </div>
         <div class="grow" />
-        <UBadge v-if="store.coverage" variant="subtle" color="neutral">
+        <!-- <UBadge v-if="store.coverage" variant="subtle" color="neutral">
           {{ store.coverage.start }} &ndash; {{ store.coverage.end }}
-        </UBadge>
+        </UBadge> -->
         <UBadge variant="subtle" color="neutral">v{{ version }}</UBadge>
+        <AboutDialog />
       </header>
 
       <NuxtPage class="grow overflow-hidden" />
