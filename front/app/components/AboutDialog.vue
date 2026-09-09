@@ -69,6 +69,12 @@
               >IOS-OSD-DPG/Pacific_SST_Monitoring</ULink>.
           </p>
           <p class="text-muted">
+            This tool builds off of an earlier version of the Marine Heatwave
+            Monitor tool developed by
+            <ULink to="https://hakai.org" target="_blank" class="text-primary"
+              >The Hakai Institute</ULink>.
+          </p>
+          <p class="text-muted">
             Published by
             <ULink to="https://cioospacific.ca" target="_blank" class="text-primary"
               >CIOOS Pacific</ULink>.
