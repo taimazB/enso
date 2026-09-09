@@ -265,7 +265,11 @@ function fieldLayers(): Array<{ layer: string, source: string, offset: number }>
 }
 
 /**
- * The active region's box, as a densified GeoJSON polygon.
+ * A BOX region's outline, as a densified GeoJSON polygon.
+ *
+ * Not used for a masked region — `regionOutline()` above fetches the real ring
+ * for those. This stays the only definition of a rectangle's outline, which is
+ * why `/region/{key}/geometry` 404s for a box rather than synthesising one.
  *
  * TWO THINGS HERE ARE NOT DECORATION.
  *
@@ -299,6 +303,36 @@ const EDGE_STEP = 2
 function densify(from: number, to: number, at: (v: number) => [number, number]): Array<[number, number]> {
   const steps = Math.max(1, Math.ceil(Math.abs(to - from) / EDGE_STEP))
   return Array.from({ length: steps }, (_, i) => at(from + ((to - from) * i) / steps))
+}
+
+/**
+ * A polygon region's real outline, fetched once and kept.
+ *
+ * Only a masked region has one — `/domain`'s `masked` flag says which — and
+ * `/region/{key}/geometry` 404s for a box, whose outline is `regionPolygon()`
+ * below. The ring is 120 KB for the BC EEZ, which is why it is not in `/domain`:
+ * most sessions never select it, and the ones that do pay for it once.
+ *
+ * Longitudes arrive UNWRAPPED on the 0-360 frame, like every other region bound
+ * here, and are handed to Mapbox as they are. See `regionPolygon` for why.
+ */
+const outlines = new Map<string, GeoJSON.Feature>()
+
+async function regionOutline(key: string): Promise<GeoJSON.Feature | null> {
+  const held = outlines.get(key)
+  if (held) return held
+  try {
+    const feature = await api.get<GeoJSON.Feature>(`/region/${key}/geometry`)
+    outlines.set(key, feature)
+    return feature
+  }
+  catch {
+    // A missing outline must not take the map down with it. The region's numbers
+    // are unaffected — they come off the rollup, which was built from the mask —
+    // so the honest failure is no box rather than a rectangle that says the
+    // region is something it is not.
+    return null
+  }
 }
 
 function regionPolygon(region: { lat: [number, number], lon: [number, number] }) {
@@ -338,7 +372,25 @@ function syncRegionBox() {
     return
   }
 
-  const data = regionPolygon(region)
+  if (region.masked) {
+    // Nothing is drawn until the real outline is in. Drawing the bounding box
+    // first and swapping it for the zone a moment later reads as a bug, and the
+    // box is 2.3x the zone's area for the BC EEZ — it would be claiming the
+    // numbers cover Alaskan and high-seas water they do not.
+    void regionOutline(region.key).then((feature) => {
+      // The selection can move while this is in flight.
+      if (feature && store.scope === 'region' && store.activeRegion === region.key) {
+        drawRegion(feature)
+      }
+    })
+    return
+  }
+  drawRegion(regionPolygon(region))
+}
+
+/** Put one GeoJSON outline on the map, creating the source and layers once. */
+function drawRegion(data: GeoJSON.Feature) {
+  if (!map) return
   const existing = map.getSource(REGION_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined
   if (existing) {
     existing.setData(data)

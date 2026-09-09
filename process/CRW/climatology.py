@@ -41,6 +41,8 @@ from shared.ch import DATABASE
 from shared.domain import global_grid, regions, subset
 from shared.fields import CLIM_DIR, clim_path, read_clim_raw, valid_mask
 
+from .regions import mask_filter
+
 log = logging.getLogger(__name__)
 
 COLUMNS = ["mmdd", "gy", "gx", "clim_raw"]
@@ -173,8 +175,15 @@ def build_region_clim(client, keys: list[str] | None = None) -> int:
     selected = regions() if keys is None else {k: regions()[k] for k in keys}
 
     for key, region in selected.items():
-        gy0, gy1 = sorted(int(grid.gy(v)) for v in region.lat)
-        gx0, gx1 = sorted(int(grid.gx(v)) for v in region.lon)
+        gy0, gy1 = region.gy_range(grid)
+        gx0, gx1 = region.gx_range(grid)
+        # The SAME mask the daily side applies. The commuting-means identity
+        # `mean(sst - clim) == mean(sst) - mean(clim)` holds only when both sides
+        # average the same cells, so a polygon region masked on one side and not
+        # the other would put the zone's anomaly against the bounding box's
+        # climatology — off by whatever the Alaskan and high-seas water in the
+        # corners is worth, and wrong in a way no column here could reveal.
+        mask = mask_filter(region)
         result = client.query(
             f"""
             SELECT mmdd,
@@ -182,11 +191,13 @@ def build_region_clim(client, keys: list[str] | None = None) -> int:
                    count() AS n_cells
             FROM {DATABASE}.sst_clim
             WHERE gy BETWEEN %(gy0)s AND %(gy1)s
-              AND gx BETWEEN %(gx0)s AND %(gx1)s
+              AND gx BETWEEN %(gx0)s AND %(gx1)s{mask}
             GROUP BY mmdd
             ORDER BY mmdd
             """,
-            parameters={"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1},
+            parameters={
+                "gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1, "region": key,
+            },
         ).result_rows
         for mmdd, mean_clim, n_cells in result:
             rows.append([key, int(mmdd), float(mean_clim), int(n_cells)])

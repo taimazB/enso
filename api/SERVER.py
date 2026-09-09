@@ -243,6 +243,13 @@ def domain() -> dict:
         # 3.2% of the box. Drawn flat so it reads as "no anomaly here" rather
         # than as land or as zero.
         "noClimColor": "#%02x%02x%02x" % render.NO_CLIM_RGBA[:3],
+        # `lat`/`lon` are the region's BOUNDING BOX on every entry, masked or
+        # not, because that is what the camera frames and what a caller needs to
+        # place it. `masked` says the box is not the region: a polygon region's
+        # numbers cover only the cells inside its outline, and the outline itself
+        # is at `/region/{key}/geometry` rather than here — it is 120 KB for the
+        # BC EEZ against ~2 KB for this whole payload, and most sessions never
+        # select it.
         "regions": [
             {
                 "key": r.key,
@@ -250,6 +257,7 @@ def domain() -> dict:
                 "lat": list(r.lat),
                 "lon": list(r.lon),
                 "partial": r.partial,
+                "masked": r.masked,
             }
             for r in regions().values()
         ],
@@ -412,6 +420,43 @@ def named_region(
         "period": period,
     })
     return result
+
+
+@app.get("/region/{key}/geometry")
+def named_region_geometry(key: str) -> dict:
+    """The outline of a polygon region, as a GeoJSON Feature.
+
+    Served separately from `/domain` rather than inlined in it: the BC EEZ ring
+    is 120 KB against ~2 KB for the whole domain payload, and it is needed only
+    once someone selects that region. `/domain`'s `masked` flag is what tells a
+    client this endpoint has something to give.
+
+    404 for a box region rather than a synthesised rectangle. A client that can
+    draw a rectangle from `lat`/`lon` already has one, and returning a ring here
+    would put a second definition of "the region's outline" in the codebase —
+    the frontend's `densify()` bows the edges along their parallels, which a
+    four-corner ring from these bounds would not.
+
+    Longitudes are UNWRAPPED 0-360, like every other region bound the API
+    reports: Mapbox places them correctly across the antimeridian and
+    normalising into -180..180 is what collapses a crossing polygon.
+    """
+    region = regions().get(key)
+    if region is None:
+        raise HTTPException(404, f"unknown region {key!r}; known: {sorted(regions())}")
+    if region.polygon is None:
+        raise HTTPException(
+            404,
+            f"region {key!r} is a plain box; its outline is its lat/lon bounds",
+        )
+    return {
+        "type": "Feature",
+        "properties": {"key": region.key, "label": region.label},
+        "geometry": {
+            "type": "MultiPolygon",
+            "coordinates": [[[list(p) for p in ring]] for ring in region.polygon],
+        },
+    }
 
 
 @app.get("/region/{key}/monthlyRanking")

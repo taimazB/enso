@@ -9,6 +9,7 @@ which also documents the two orientation conventions this file assumes.
 from __future__ import annotations
 
 import functools
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,11 +278,42 @@ class Quantity:
 
 @dataclass(frozen=True)
 class Region:
+    """A named area for the rollups: a lat/lon box, optionally cut by a polygon.
+
+    `lat`/`lon` are always present and always the region's bounding box, because
+    that box is what makes a region cheap: `ORDER BY (gy, gx, date)` turns it
+    into a set of contiguous key ranges rather than a scan. For a polygon region
+    the box is derived from the ring rather than written by hand, so the two
+    cannot drift, and it is a PREFILTER — `region_cells` narrows it to the cells
+    actually inside the zone. See `shared/mask.py`.
+    """
+
     key: str
     label: str
     lat: tuple[float, float]
     lon: tuple[float, float]
     partial: bool = False
+    # Outer rings, longitudes 0-360, or None for a plain box. No interior rings:
+    # the islands inside a maritime zone are land, and land is excluded by
+    # `sst_daily` holding ocean cells only, not by the geometry.
+    polygon: tuple[tuple[tuple[float, float], ...], ...] | None = None
+
+    @property
+    def masked(self) -> bool:
+        """Whether this region needs `region_cells` to mean what it says."""
+        return self.polygon is not None
+
+    def gy_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive `(first, last)` global row index of the bounding box."""
+        return tuple(sorted(int(grid.gy(v)) for v in self.lat))
+
+    def gx_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive `(first, last)` global column index of the bounding box.
+
+        Contiguous, not wrapping, for the reason `Subset.gx_range` documents:
+        `lon0` is on the 0-360 convention precisely so a Pacific box is one range.
+        """
+        return tuple(sorted(int(grid.gx(v)) for v in self.lon))
 
 
 @functools.lru_cache(maxsize=1)
@@ -357,15 +389,60 @@ def quantity(name: str) -> Quantity:
         raise KeyError(f"unknown quantity {name!r}; known: {sorted(quantities())}") from None
 
 
+_REGION_DIR = Path(__file__).with_name("regions")
+
+
+def _load_polygon(filename: str) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Outer rings of a stored region polygon, longitudes on the 0-360 frame.
+
+    Plain `json` rather than a geometry library: the file is read once per
+    process and nothing here needs an operation on it beyond point-in-polygon,
+    which `shared/mask.py` gets from matplotlib.
+    """
+    with (_REGION_DIR / filename).open() as fh:
+        feature = json.load(fh)
+    geom = feature["geometry"]
+    polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+    rings = tuple(
+        tuple((float(x), float(y)) for x, y in poly[0])
+        for poly in polys
+        if len(poly[0]) >= 4
+    )
+    if not rings:
+        raise ValueError(f"{filename}: no usable ring")
+    return rings
+
+
 @functools.lru_cache(maxsize=1)
 def regions() -> dict[str, Region]:
-    return {
-        key: Region(
+    """The named regions, boxes and polygons alike.
+
+    A polygon region declares `polygon:` and NO bounds: its box is derived from
+    the ring here, so widening or replacing the geometry cannot leave a stale
+    hand-written box behind quietly selecting the wrong key ranges. A box region
+    declares bounds and no polygon. Declaring both is an error rather than a
+    precedence rule — there would be no way to tell which one a stored row meant.
+    """
+    out = {}
+    for key, cfg in _raw()["regions"].items():
+        polygon = _load_polygon(cfg["polygon"]) if cfg.get("polygon") else None
+        if polygon is not None and ("lat" in cfg or "lon" in cfg):
+            raise ValueError(
+                f"region {key!r}: declares both a polygon and explicit bounds; "
+                "a polygon's box is derived from its ring"
+            )
+        if polygon is not None:
+            xs = [x for ring in polygon for x, _ in ring]
+            ys = [y for ring in polygon for _, y in ring]
+            lat, lon = (min(ys), max(ys)), (min(xs), max(xs))
+        else:
+            lat, lon = tuple(cfg["lat"]), tuple(cfg["lon"])
+        out[key] = Region(
             key=key,
             label=cfg["label"],
-            lat=tuple(cfg["lat"]),
-            lon=tuple(cfg["lon"]),
+            lat=lat,
+            lon=lon,
             partial=cfg.get("partial", False),
+            polygon=polygon,
         )
-        for key, cfg in _raw()["regions"].items()
-    }
+    return out

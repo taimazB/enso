@@ -87,6 +87,7 @@ python -m CRW.cli verify-clim                             # full-read all 366 cl
 python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested, per archive
 python -m CRW.cli backfill [--start|--end] [--product sst|mhw] [--reverse] [--fresh] [--delete-nc]
 python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
+python -m CRW.cli mask     [--region KEY]                  # region_cells, for polygon regions
 python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh] [--clim]  # region_daily
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
@@ -275,6 +276,34 @@ entirely plausible when wrong, which is why `check_orientation()` raises rather 
 Widening it needs no re-ingest: `gy`/`gx` index the *global* grid, so only `domain.yml`'s
 `subset` block changes.
 
+#### One named region is a polygon, not a box
+
+Every named region is a lat/lon rectangle except **`bc_eez`**, which declares a
+`polygon:` and no bounds — `shared/domain.py` derives its box from the ring, so a
+hand-written box cannot go stale behind a changed geometry, and `shared/mask.py` cuts that
+box down to the 26,158 cells actually in the zone. See `region_cells` below for the cost
+of not doing this, and `shared/mask.py` for how a cell is decided.
+
+**Provenance matters here in a way it does not for a Niño box.** A Niño index box is a
+convention anyone can write down; a maritime limit is a legal instrument, and Canada and
+the United States do not agree about two pieces of this one — the Dixon Entrance A–B line
+in the north and the wedge off Juan de Fuca in the south. The geometry is the **Flanders
+Marine Institute's (VLIZ) Marine Regions v12** `Canadian Exclusive Economic Zone`
+(mrgid 8493), Pacific component only, and the file records its own source, retrieval date
+and simplification. That is the widely cited marine-science rendering and **not** the
+Canadian authority. **DFO's Open Maps does not publish the limit as a standalone vector**:
+its catalogue carries only products *clipped* to the zone, and the `DFO Regions 2021`
+"Pacific" polygon is land — checked by point-in-polygon, the Strait of Georgia and
+everything offshore fall outside it. A cross-check that the footprint is right anyway:
+this ring's bounding box (`−138.795…−122.836`, `46.568…56.012`) matches the extent DFO's
+own BC-EEZ raster climatologies are published on to three decimals.
+
+Two things about the stored file. It carries **outer rings only** — the 2,588 interior
+rings are islands, and land is cut by `sst_daily` holding ocean cells, not by the
+geometry, which also keeps the outline clean on the map. And it is **Douglas–Peucker
+simplified at 0.002°**, a twenty-fifth of a grid cell: measured, that moves **21 of 26,155
+cells** against the unsimplified ring, and takes 37,875 vertices to 6,001 (120 KB).
+
 #### The third state: ocean with no anomaly
 
 About **3.2% of the box's ocean has SST but no climatology** — the seasonal ice fringe,
@@ -289,7 +318,7 @@ Transparent would read as land; any scale colour would read as a real near-zero 
 
 ### `shared/` — the contract between `api` and `process`
 
-Both containers mount `./shared` at `/app/shared`. Six modules:
+Both containers mount `./shared` at `/app/shared`. Seven modules:
 
 - **`domain.py` + `domain.yml`** — grid geometry, variable metadata, named region boxes.
   Describes **two** grids and the distinction matters: `global` is the full 7200×3600
@@ -301,6 +330,18 @@ Both containers mount `./shared` at `/app/shared`. Six modules:
   There is one — `mhw_extent`, what `mhw` means over a region — and every timeseries
   response names its quantity in `quantity` (null at a point) so no client infers it
   from the scope.
+- **`mask.py` + `regions/*.geojson`** — the one region that is **not a box**. A region is
+  normally a lat/lon rectangle; the BC EEZ is a 200-nautical-mile arc closed by two
+  negotiated lateral boundaries, and its bounding box is 60,990 cells against the zone's
+  26,158 — so 57% of what a box query would average is Alaskan, American or high-seas
+  water. The box survives as the **prefilter** (`ORDER BY (gy, gx, date)` makes it
+  contiguous key ranges) and this rasterises the polygon into `region_cells`, which the
+  two rollup builders intersect it with. **A cell is in the region when its centre is
+  inside the ring** — no partial weighting, because a fractional-coverage weight would be
+  a second, subtler definition of "in the region" that `n_cells` could not describe.
+  Nothing here decides what is *ocean*: the mask is pure geometry and includes the land
+  inside the zone, which `sst_daily` then excludes — which is also why the stored polygon
+  carries no interior rings for the islands.
 - **`fields.py`** — NetCDF reading, and the single home of both orientation rules above.
 - **`render.py`** — field array → Web-Mercator WebP. **Takes arrays, never a DB client.**
 - **`periods.py`** — daily/weekly/monthly buckets, shared by query and render.
@@ -361,6 +402,36 @@ consequences, both load-bearing:
    reached, not a gap — so `/coverage` carries `mhw.complete` and the frontend refuses to
    offer the variable until it is true. This is the same shape as `climatology.complete`
    gating `anom`, but sharper: there is no value that could signal the difference.
+
+**`region_cells`** — which grid cells a **polygon** region covers: one row per (region,
+cell), and rows only for the `domain.yml` regions that declare a `polygon`. **26,158 rows
+today**, all of them the BC EEZ.
+
+A plain box needs none — its `BETWEEN` says everything there is to say about which cells
+it holds. A maritime zone is not a rectangle: the BC EEZ's bounding box is 60,990 cells
+against the zone's 26,158, so **57% of what a box query would average is Alaskan, American
+or high-seas water**. Measured on 2021-06-28, the heat dome: the zone's SST mean is
+13.98 °C against the box's 13.66, and its anomaly +1.58 against +1.46 — the box dilutes
+the thing the region exists to show.
+
+**Materialised rather than evaluated.** Point-in-polygon over 60,990 cells is
+milliseconds, but it would sit inside the rollup's 113-billion-row scan and be re-decided
+on every pass. Written once by `CRW.cli mask`, read thereafter as a set membership —
+`AND (gy, gx) IN (SELECT gy, gx FROM region_cells WHERE region = ...)`, appended after the
+`gy`/`gx` BETWEEN that still does the primary-key work.
+
+**It is applied by `process`, never by `api`.** A named region is served entirely from
+`region_daily` and `region_clim`, so the mask reaches the API only in the numbers those
+tables already hold. Nothing in `api/` reads this table, and nothing should: adding a live
+masked path would be a second definition of what the region covers.
+
+**Both sides or neither.** `regions.mask_filter()` is appended to the SST half *and* the
+MHW half of the daily rollup, and to `region_clim`'s query. Masking one only would divide
+a zone numerator by a bounding-box denominator, or put the zone's anomaly against the
+box's climatology — the `mean(sst - clim) == mean(sst) - mean(clim)` identity needs both
+sides averaging the same cells. Verified: `/region/bc_eez?variable=anom` for 2021-06-28
+returns **1.578** against a direct cell-wise `avg(sst - clim)` over the polygon of
+**1.5785**, on the same 23,814 cells.
 
 **`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The climatology side of a
 region anomaly.
@@ -557,6 +628,7 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region, using `region_clim` |
+| `GET /region/{key}/geometry` | a polygon region's outline as GeoJSON; 404 for a plain box |
 | `POST /monthlyRanking` | every calendar month at a cell, ranked within its month-of-year |
 | `GET /region/{key}/monthlyRanking` | the same ranking over a named region, from `region_daily` |
 | `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
@@ -1213,6 +1285,18 @@ chords bowing off it.
 plainly on screen. This is the same lesson as `preserveDrawingBuffer: false`: take a
 screenshot and look at it.
 
+**A polygon region draws its real outline, fetched on demand.** `/domain` carries
+`masked` per region and the ring itself lives at `/region/{key}/geometry` — 120 KB against
+~2 KB for the whole domain payload, and most sessions never select it — so `AnomalyMap`
+fetches it once, keeps it in a module-level `Map`, and guards the response against the
+selection having moved while it was in flight. **Nothing is drawn until it arrives**:
+showing the bounding box first and swapping it for the zone a moment later reads as a bug,
+and for the BC EEZ the box is 2.3× the zone's area, so it would be claiming the numbers
+cover water they do not. If the fetch fails, the region draws no box at all rather than a
+rectangle that misstates it — the numbers beside it are unaffected, since they come off a
+rollup built from the mask. `frameRegion()` still flies to the **bounding box**, which is
+what a camera wants.
+
 **Only one box is ever drawn, and only in region scope.** The box is the visual half of what
 the numbers panel is reading, so the two are one selection seen twice rather than a layer
 with a toggle of its own.
@@ -1401,6 +1485,15 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   or `toLocaleString` with `undefined` formats against Node's container locale on the
   server and the visitor's in the browser: a silent hydration mismatch, visible only as a
   console warning. Pin `'en-GB'`, as `utils/periods.ts` does.
+- **A polygon region is only the zone once `region_cells` is current.** Change the
+  geometry and the mask, `region_daily` and `region_clim` are all stale, in that order and
+  silently: the rollup keeps serving the cells the *old* ring covered, which is a real
+  area mean of the wrong water. `CRW.cli mask` rewrites the mask alone (seconds, and it
+  prints the cell count against the bounding box, which is the number that says whether
+  the new ring is plausible); `rollup --clim --region <key> --fresh` is what actually
+  rebuilds the numbers. `build_region_cells` **deletes before inserting** for the same
+  reason — replacing collapses rows that are still there, so a ring that *shrank* would
+  leave the cells it no longer covers behind.
 - **Adding a region to `domain.yml` after `init` leaves it with no `region_clim`**, so its
   `anom` series comes back empty with nothing to say why. `CRW.cli rollup --clim` rebuilds
   that side out of `sst_clim` in seconds — it does not touch the 366 NetCDF files, which is
@@ -1563,5 +1656,34 @@ Verified on the state ribbon, the extent quantity, deep links and the point cont
   round-trips; the region MHW view reads "45.6% · 2nd most widespread of 500 months ·
   trend +6.12% per decade" while the map legend beside it stays NOAA's five categories;
   both CSVs export as `mhw_extent_*` with a `mhw_extent_pct` column.
+
+Verified on the BC EEZ (the first polygon region):
+
+- **The mask is the zone, not its box.** 26,158 cells of a 60,990-cell bounding box, and
+  point-in-polygon spot checks land where they should: Puget Sound and SE Alaska outside,
+  the Strait of Georgia, offshore Haida Gwaii and the water off Tofino inside, the high
+  seas 250 nm out excluded.
+- **The rollup agrees with the geometry, end to end.** For 2021-06-28,
+  `/region/bc_eez?variable=anom` returns **1.578** on **23,814** cells; recomputing the
+  same day in Python — pull the 43,040 bounding-box rows out of ClickHouse, test each
+  cell centre against the ring, take the cos(lat)-weighted `avg(sst − clim)` — gives
+  **1.5785** on **23,814** cells. So the SQL mask and `shared/mask.py` select the same
+  cells, and the commuting-means identity survives the mask.
+- **The box would have been a different number**: 1.4558 over the same day, on 43,040
+  cells. The mask is worth 0.12 °C on the heat dome's peak day and 0.08–0.32 °C on the
+  days spot-checked.
+- **Cost.** `mask` is seconds; `rollup --clim --region bc_eez --fresh` builds
+  `region_cells`, all 366 `region_clim` rows and all 15,217 `region_daily` rows in
+  **7.7 s** — it is a small region, and the bounding box still does the key-range work.
+- **`mhw` and the ranking come through it.** The extent series reads 45.1 → 69.5% across
+  25–29 June 2021, and `monthlyRanking` puts June 2015 first (the Blob) and August 2004,
+  2014, 2015 at the top — 42 years, `areaMean: true`.
+- **Browser** (Chromium, per the recipe above): the zone's real outline draws — the
+  200 nm arc, the Dixon Entrance line, the Juan de Fuca boundary — the dock reads
+  `BC EEZ / Area mean over the region`, the chart and the 42-year June ranking populate,
+  and `/region/bc_eez/geometry` is fetched exactly once. One console error appears and is
+  **pre-existing and unrelated**: Mapbox's own marker fog-opacity evaluation
+  (`Marker._evaluateOpacity` → `transform.getOpacityAtLatLng`) throws on the globe at
+  northern latitudes for `gulf_of_alaska` and `ne_pacific` too, and not for `nino34`.
 
 Not built yet: a cron entry for `run`, tests.

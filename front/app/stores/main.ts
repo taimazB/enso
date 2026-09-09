@@ -125,7 +125,20 @@ export interface DomainMeta {
   defaultVariable: VariableName
   /** Ocean with SST but no climatology — the seasonal ice fringe. */
   noClimColor: string
-  regions: Array<{ key: string, label: string, lat: [number, number], lon: [number, number], partial: boolean }>
+  /**
+   * `lat`/`lon` are the BOUNDING BOX on every entry. `masked` says that box is
+   * not the region: a polygon region (the BC EEZ) covers only the cells inside
+   * its outline, and the outline is fetched from `/region/{key}/geometry` by
+   * whoever draws it rather than shipped in this payload.
+   */
+  regions: Array<{
+    key: string
+    label: string
+    lat: [number, number]
+    lon: [number, number]
+    partial: boolean
+    masked: boolean
+  }>
 }
 
 export interface Coverage {

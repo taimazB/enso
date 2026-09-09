@@ -239,6 +239,37 @@ DDL: tuple[str, ...] = (
     ENGINE = ReplacingMergeTree(updated_at)
     ORDER BY (region, date)
     """,
+    # Which grid cells a POLYGON region actually covers: one row per (region,
+    # cell), and rows only for the regions in `domain.yml` that declare a
+    # `polygon`. A plain box region has none and needs none — its `BETWEEN` says
+    # everything there is to say about which cells it holds.
+    #
+    # This exists because a maritime zone is not a rectangle. The BC EEZ's
+    # bounding box is 60,990 cells against the zone's 26,158, so 57% of what a
+    # box query would average is Alaskan, American or high-seas water. The box
+    # survives as the PREFILTER — `ORDER BY (gy, gx, date)` makes it a set of
+    # contiguous key ranges rather than a scan — and this table narrows it.
+    #
+    # MATERIALISED RATHER THAN EVALUATED. Point-in-polygon on 60,990 cells is
+    # milliseconds, but it would sit inside the rollup's 113-billion-row scan and
+    # be re-decided on every pass. Written once by `CRW.cli mask`, read as a
+    # subquery set thereafter.
+    #
+    # PURE GEOMETRY: the mask includes the land inside the zone, because
+    # `sst_daily` holds ocean cells only and the aggregation that reads this
+    # table intersects the two. That is also why the stored polygon carries no
+    # interior rings for the islands.
+    f"""
+    CREATE TABLE IF NOT EXISTS {DATABASE}.region_cells
+    (
+        region      LowCardinality(String),
+        gy          UInt16,
+        gx          UInt16,
+        updated_at  DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY (region, gy, gx)
+    """,
     # NOAA CRW Marine Heatwave category, one row per (date, cell) — but ONLY for
     # cells actually in a heatwave.
     #
