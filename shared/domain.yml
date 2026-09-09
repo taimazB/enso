@@ -197,6 +197,26 @@ variables:
 # Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
 # degrees_east (0-360) / degrees_north, and all of them fit inside `subset`.
 regions:
+  # --- The whole ingested box, as a region.
+  #
+  # Bounds are `subset` above, repeated rather than referenced: YAML has no way
+  # to say "the same numbers" that survives `shared/domain.py` reading the two
+  # blocks independently, and a region that silently tracked a widened subset
+  # would change what every stored `region_daily` row means without changing its
+  # key. Widening the box is therefore a deliberate two-line edit and a rebuild
+  # of this one region, which is the right amount of friction.
+  #
+  # It exists because the basin-wide numbers the header ribbon reports — how much
+  # of the Pacific is in a marine heatwave today, against what is normal for the
+  # date — are exactly a region rollup over this box. Adding it here rather than
+  # writing a second aggregation path means `region_daily`, `region_clim`,
+  # `/region/{key}`, the monthly ranking and the CSV export all serve it with no
+  # new code. The one cost is the rollup: 113.8 B rows for this key alone,
+  # measured at ~3 minutes, against seconds for any of the named boxes.
+  pacific:
+    label: Whole Pacific
+    lat: [-59.975, 64.975]
+    lon: [100.025, 289.975]
   # --- ENSO indices, computable for the first time now the domain reaches
   # south of the equator.
   nino34:
@@ -233,3 +253,42 @@ regions:
     # The conventional PDO domain runs to 70N; clipped to the subset's 65N.
     lat: [20.0, 65.0]
     lon: [180.0, 250.0]
+
+# Quantities a timeseries can report that are NOT fields on the map.
+#
+# Everything in `variables` above is something `/image` can draw, and the
+# frontend's variable toggle is built from that block — so a quantity that has no
+# raster cannot live there without appearing as a fourth map layer that renders
+# nothing. This block is the other kind: presentation metadata (name, unit,
+# precision, colour ramp) for a number that only exists once cells have been
+# aggregated over an area.
+#
+# There is one, and it is what `mhw` means over a REGION. A box's marine-heatwave
+# value used to be `sum(cat * cos(lat)) / sum(cos(lat))` — an area mean of
+# NOAA's five ordinal classes, which is not a class and mixes severity with
+# extent so thoroughly that half a box at Cat 1 and a tenth of it at Cat 5 both
+# come to about 0.5. The panel carried four sentences of warning to that effect.
+# The share of the box's ocean area that is in a heatwave at all answers the
+# question people actually ask of a region, needs no warning, and is the number
+# the ribbon reports for the basin.
+#
+# A POINT is untouched: there the value is a class, `mhw` names it, and an
+# "extent" at one cell would be 0% or 100%.
+quantities:
+  mhw_extent:
+    long_name: Share of the region in a marine heatwave
+    short_name: MHW extent
+    units: '%'
+    # One decimal. The basin moves by a few tenths of a percent a day and the
+    # ribbon reports it against a day-of-year normal, so a whole number would
+    # round away the change the ribbon is there to show.
+    precision: 1
+    # 0..100 is the whole possible range, not a display choice: the ramp is
+    # spread over it and nothing can land outside.
+    vmin: 0.0
+    vmax: 100.0
+    # Sequential, and warm: this is an amount of something bad, with no
+    # meaningful midpoint for a diverging map to invent. Deliberately not the
+    # five NOAA category colours — an extent is not a category, and reusing that
+    # palette is precisely the confusion this quantity exists to end.
+    colormap: YlOrRd

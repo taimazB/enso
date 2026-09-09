@@ -227,17 +227,22 @@ function exportSeries() {
   trackEvent('csv_downloaded', {
     kind: 'series',
     variable: store.variable,
+    quantity: store.activeQuantity,
     period: store.period,
     scope: store.scope,
     rows: series.dates.length,
   })
   downloadCsv(
-    `${store.variable}_${store.period}_${subject}_${span}.csv`,
+    `${store.activeQuantity ?? store.variable}_${store.period}_${subject}_${span}.csv`,
     seriesCsv(series, {
-      variable: store.variable,
+      // The column header names what the numbers ARE, which in region scope is
+      // not the variable: `mhw` there is a percentage of area, and a column
+      // headed `mhw` would read back as a category. Same reason the filename
+      // below carries it.
+      variable: store.activeQuantity ?? store.variable,
       period: store.period,
-      unit: store.activeUnitLabel,
-      precision: store.domain?.variables?.[store.variable]?.precision,
+      unit: store.seriesUnitLabel,
+      precision: store.seriesPrecision,
     }),
   )
 }

@@ -90,9 +90,15 @@ export interface SeriesCsvOptions {
  */
 export function seriesCsv(series: Series, opts: SeriesCsvOptions): string {
   const period = series.period ?? opts.period
-  const variable = series.variable ?? opts.variable
+  // The quantity where the series has one: over a region `mhw` is a percentage
+  // of area, and a column headed `mhw` reads back as a category. Same rule as
+  // `rankingCsv`, and the caller's `opts.variable` is the fallback rather than
+  // the authority — the series is what was actually plotted.
+  const variable = series.quantity ?? series.variable ?? opts.variable
   const precision = opts.precision ?? 2
-  const column = opts.unit === '°C' ? `${variable}_degC` : variable
+  const column = opts.unit === '°C'
+    ? `${variable}_degC`
+    : opts.unit === '%' ? `${variable}_pct` : variable
   const rows: Cell[][] = [['start_date', 'end_date', column]]
   for (const [i, date] of series.dates.entries()) {
     rows.push([date, bucketEnd(date, period), number(series.values[i], precision)])
@@ -111,8 +117,12 @@ export function seriesCsv(series: Series, opts: SeriesCsvOptions): string {
  * the archive's edge month as an ordinary datum.
  */
 export function rankingCsv(ranking: MonthlyRanking, precision = 2): string {
-  const variable = ranking.variable ?? 'anom'
-  const column = ranking.units === 'degC' ? `mean_${variable}_degC` : `mean_${variable}`
+  // The quantity where there is one: over a region `mhw` is a percentage of
+  // area, and a column headed `mean_mhw` would read back as a category.
+  const variable = ranking.quantity ?? ranking.variable ?? 'anom'
+  const column = ranking.units === 'degC'
+    ? `mean_${variable}_degC`
+    : ranking.units === '%' ? `mean_${variable}_pct` : `mean_${variable}`
   const rows: Cell[][] = [['month', 'month_name', 'year', 'rank', column, 'sd', 'days', 'partial']]
   for (let m = 1; m <= 12; m++) {
     for (const row of ranking.months[String(m)] ?? []) {

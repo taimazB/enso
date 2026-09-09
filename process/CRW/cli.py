@@ -302,6 +302,13 @@ def cmd_rollup(args) -> int:
     """
     ensure_schema()
     with get_client() as client:
+        if args.clim:
+            # Read out of `sst_clim`, not off the 366 files, so this is seconds
+            # rather than the 20 minutes `init` spends loading them. A region
+            # added to `domain.yml` after `init` has no climatology row and its
+            # `anom` series would come back empty with nothing to say why.
+            n = climatology.build_region_clim(client, keys=args.region)
+            print(f"region_clim: {n:,} row(s)")
         if args.fresh:
             regions_mod.truncate(client, args.region)
         counts = regions_mod.build_region_daily(
@@ -543,6 +550,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="repeatable; default every named region")
     p_roll.add_argument("--fresh", action="store_true",
                         help="truncate the selected regions first")
+    p_roll.add_argument(
+        "--clim",
+        action="store_true",
+        help="rebuild region_clim for the same regions first (needed for a newly added region)",
+    )
     p_roll.set_defaults(func=cmd_rollup)
 
     p_rend = with_selection(sub.add_parser("render", help="render images in bulk"))

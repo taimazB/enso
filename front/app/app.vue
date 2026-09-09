@@ -26,6 +26,12 @@
         <AboutDialog />
       </header>
 
+      <!-- Under the header and above everything else, because it describes the
+           basin rather than the current selection: it must not move when the
+           map does. `shrink-0` so it keeps its one line and the page below it
+           takes the rest. -->
+      <StateRibbon class="shrink-0" />
+
       <NuxtPage class="grow overflow-hidden" />
     </div>
   </UApp>

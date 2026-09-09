@@ -101,10 +101,27 @@ export interface DomainMeta {
     }
   }>
   /**
-   * Keyed by variable: sst's scale is sequential, anom's diverging, and mhw's
-   * five discrete classes.
+   * Numbers a timeseries can report that are not fields the map can draw, keyed
+   * the way a series' `quantity` names them. Deliberately NOT in `variables`
+   * above: the variable toggle is built from that block, and an entry there with
+   * no raster would appear as a map layer that renders nothing.
    */
-  colorStops: Record<VariableName, ColorStop[]>
+  quantities: Record<string, {
+    longName: string
+    shortName: string
+    units: string
+    precision: number
+    vmin: number
+    vmax: number
+    colormap: string
+  }>
+  /**
+   * Keyed by variable AND by quantity: sst's scale is sequential, anom's
+   * diverging, mhw's five discrete classes, and mhw_extent's a sequential warm
+   * ramp over 0-100%. One mapping rather than two, since a consumer looks up
+   * whichever key the series named and the namespaces do not collide.
+   */
+  colorStops: Record<string, ColorStop[]>
   defaultVariable: VariableName
   /** Ocean with SST but no climatology — the seasonal ice fringe. */
   noClimColor: string
@@ -134,13 +151,102 @@ export interface Coverage {
   mhw: { rows: number, days: number, start: string | null, end: string | null, complete: boolean } | null
 }
 
+/**
+ * A run of consecutive marine-heatwave days at one cell, from `/timeseries`.
+ * Days, not buckets: a weekly series has already taken a max over seven of them.
+ */
+export interface MhwRun {
+  start: string
+  end: string
+  days: number
+  /** Worst category reached during the run. */
+  peak: number
+}
+
+/**
+ * What the Pacific is doing today, from `/state` — the header ribbon's payload.
+ *
+ * The one thing in this app that decides what is worth saying rather than
+ * serving what was asked for, which is why it is a single fetch on load and not
+ * derived from anything already in the store.
+ */
+export interface PacificState {
+  enso: {
+    region: string
+    label: string
+    phase: 'el_nino' | 'la_nina' | 'neutral'
+    strength: string | null
+    /** 3-month running mean of the Nino 3.4 anomaly, ONI-style. */
+    index: number
+    /** e.g. "JJA 2026" — the season that running mean covers. */
+    season: string
+    seasonEnd: string
+    /** Consecutive overlapping seasons past the threshold, same sign. */
+    seasons: number
+    /** NOAA's five-season rule: below it these are conditions, not an episode. */
+    episode: boolean
+    latestMonth: { month: string, value: number, days: number, partial: boolean }
+    threshold: number
+    baseline: string
+    /**
+     * False, always. NOAA's ONI uses a shifting 30-year base period and this
+     * archive has one fixed climatology, so the numbers do not agree to the
+     * tenth. The ribbon says so rather than publishing under the ONI's name.
+     */
+    official: boolean
+  } | null
+  heatwave: {
+    region: string
+    label: string
+    date: string
+    /** Share of the basin's ocean area in a heatwave, %. */
+    extent: number
+    /** The same for this day-of-year over the baseline, or null. */
+    normal: number | null
+    ratio: number | null
+    rank: number
+    of: number
+    baseline: string
+    windowDays: number
+  } | null
+}
+
 export interface Series {
   dates: string[]
   values: Array<number | null>
   period?: Period
   variable?: VariableName
+  /**
+   * What these values ARE, when that is not simply the variable.
+   *
+   * Set to `mhw_extent` on a region's marine-heatwave series, whose value is the
+   * share of the box's ocean area in a heatwave (a percentage) rather than a
+   * NOAA category. Null at a point, where the value is the variable itself. The
+   * API decides and says so in the response; nothing here infers it from the
+   * scope, which is what keeps the two from disagreeing.
+   */
+  quantity?: string | null
+  /** The series' own unit, which for a quantity is not the variable's. */
+  units?: string
   label?: string | null
   cell?: { lat: number, lon: number }
+  /**
+   * The 1991-2020 normal for each bucket, on a point `sst` series only. Null
+   * entries are the ice fringe, which has SST and no climatology. Drawn as a
+   * reference under the line: an absolute temperature says little without the
+   * normal it is departing from, and this is what lets the SST view answer that
+   * without switching to the anomaly.
+   */
+  climatology?: Array<number | null>
+  climatologyBaseline?: string
+  /** Heatwave runs at this cell, on a point `mhw` series only. */
+  events?: {
+    current: MhwRun | null
+    longest: MhwRun | null
+    days: number
+    events: number
+    through: string | null
+  }
 }
 
 /**
@@ -248,6 +354,12 @@ export const useMainStore = defineStore('main', {
   state: () => ({
     domain: null as DomainMeta | null,
     coverage: null as Coverage | null,
+    /**
+     * The header ribbon's two findings. Null until `/state` lands, and null
+     * either half if the archive cannot support it — the ribbon renders what it
+     * gets rather than waiting for both.
+     */
+    pacific: null as PacificState | null,
     /**
      * Bucket shown on the map, as its first day. Always snapped to `period`, so
      * the map frame and the chart's x-value refer to the same span of days.
@@ -413,6 +525,73 @@ export const useMainStore = defineStore('main', {
     isCategorical: state => (variable: VariableName): boolean =>
       state.domain?.variables?.[variable]?.categorical ?? false,
 
+    /**
+     * The quantity the active SERIES reports, when that is not the variable.
+     *
+     * `mhw_extent` in region scope, null everywhere else. Read off the series
+     * the API returned rather than derived from `scope` and `variable`, so the
+     * formatting can never describe a series that is no longer on screen — a
+     * scope switch and its refetch are two ticks apart, and in between the panel
+     * is still drawing the old numbers.
+     */
+    activeQuantity: (state): string | null => {
+      const series = state.scope === 'region' ? state.regionSeries : state.pointSeries
+      return series?.quantity ?? null
+    },
+
+    /**
+     * The three presentation facts a series needs, resolved through its quantity
+     * where it has one and through its variable otherwise.
+     *
+     * Kept apart from the `active*` getters above, which describe the MAP: the
+     * map still draws NOAA's five categories in region scope, so its legend must
+     * stay categorical and in category colours while the chart beside it plots a
+     * percentage. The two genuinely disagree, and one getter serving both is how
+     * the legend ends up labelling the chart.
+     */
+    seriesStops(state): ColorStop[] {
+      const key = this.activeQuantity
+      if (key) return state.domain?.colorStops?.[key] ?? []
+      return this.activeStops
+    },
+
+    seriesIsCategorical(state): boolean {
+      // A quantity is continuous by construction — it only exists once cells
+      // have been averaged over an area, and an area mean of classes is not one.
+      if (this.activeQuantity) return false
+      return state.domain?.variables?.[state.variable]?.categorical ?? false
+    },
+
+    seriesUnitLabel(state): string {
+      const key = this.activeQuantity
+      const units = key
+        ? state.domain?.quantities?.[key]?.units
+        : state.domain?.variables?.[state.variable]?.units
+      // 'degC' is the only unit that is written differently than it is declared.
+      return units === 'degC' ? '\u00B0C' : (units ?? '')
+    },
+
+    seriesPrecision(state): number {
+      const key = this.activeQuantity
+      return (key
+        ? state.domain?.quantities?.[key]?.precision
+        : state.domain?.variables?.[state.variable]?.precision) ?? 2
+    },
+
+    /**
+     * What the series is called in a heading or a CSV filename — "MHW extent"
+     * rather than "MHW" once the value is a percentage of area.
+     */
+    seriesLabel(state): string {
+      const key = this.activeQuantity
+      if (key) {
+        const q = state.domain?.quantities?.[key]
+        return q?.shortName || q?.longName || key
+      }
+      const meta = state.domain?.variables?.[state.variable]
+      return meta?.shortName || meta?.longName || state.variable
+    },
+
     activeIsCategorical: state =>
       state.domain?.variables?.[state.variable]?.categorical ?? false,
 
@@ -497,12 +676,19 @@ export const useMainStore = defineStore('main', {
         // load, and a bootstrap must not move it if something else set it.
         : this.selectPoint(DEFAULT_POINT.lat, DEFAULT_POINT.lon, { enterScope: false }).catch(() => {})
 
-      const [domain, coverage] = await Promise.all([
+      const [domain, coverage, pacific] = await Promise.all([
         api.get<DomainMeta>('/domain'),
         api.get<Coverage>('/coverage'),
+        // Non-fatal, and deliberately not awaited separately: the ribbon is the
+        // first thing on the page and a serial fetch would show the header
+        // twitching into place after everything else had drawn. A failure costs
+        // the ribbon and nothing more — `/state` is two rollup reads, so if it
+        // is down the panels below it are too and they say so themselves.
+        api.get<PacificState>('/state').catch(() => null),
       ])
       this.domain = domain
       this.coverage = coverage
+      this.pacific = pacific
       if (!this.selectedDate && coverage.end) this.setDate(coverage.end)
       // Seeded from /domain rather than assumed: the default key is only used
       // if the API actually offers it, so removing a region from domain.yml

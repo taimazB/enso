@@ -29,6 +29,13 @@
         <span v-if="unit" class="text-xl text-muted">{{ unit }}</span>
         <span v-if="valueGloss" class="text-base text-muted">{{ valueGloss }}</span>
       </p>
+      <!-- The normal for this same bucket, where the API sent one. A single
+           absolute temperature says almost nothing on its own — 16.7 °C is warm
+           or cold entirely depending on where and when — and this is the
+           smallest thing that fixes it without making the reader switch to the
+           anomaly. Signed, because "0.2 above" and "0.2 below" are the whole
+           point. -->
+      <p v-if="normalLine" class="mt-1 text-sm text-muted">{{ normalLine }}</p>
       <p v-if="rankLine" class="mt-2 text-sm text-dimmed">{{ rankLine }}</p>
     </section>
 
@@ -95,6 +102,14 @@ const props = defineProps<{
   variableLabel: string
   period: Period
   selectedDate?: string | null
+  /**
+   * What rank 1 means — "warmest", "most severe", "most widespread". Passed in
+   * rather than derived from `categorical`, because that test cannot tell a
+   * region's heatwave EXTENT (continuous, ranked by how much of the box was
+   * affected) from a temperature. `index.vue` owns the word, and the ranking
+   * panel below reads the same one.
+   */
+  rankOrder?: string
 }>()
 
 const stats = computed(() => summarise(props.series, props.selectedDate))
@@ -105,6 +120,50 @@ const currentColor = computed(() =>
 
 const currentLabel = computed(() =>
   stats.value.current ? bucketLabel(stats.value.current.date, props.period) : 'no value for this bucket')
+
+/**
+ * The 1991-2020 normal for the bucket on the map, if the series carries one.
+ *
+ * Point `sst` only. Found by date rather than by index so it cannot slip when a
+ * series is refetched mid-render and the two arrays are momentarily different
+ * lengths.
+ */
+const normalForCurrent = computed<number | null>(() => {
+  const clim = props.series?.climatology
+  const date = stats.value.current?.date
+  if (!clim || !date) return null
+  const i = props.series!.dates.indexOf(date)
+  return i < 0 ? null : (clim[i] ?? null)
+})
+
+const normalLine = computed(() => {
+  const normal = normalForCurrent.value
+  const value = stats.value.current?.value
+  if (normal == null || value == null) return ''
+  const gap = value - normal
+  const word = Math.abs(gap) < 0.05 ? 'at' : (gap > 0 ? 'above' : 'below')
+  const baseline = props.series?.climatologyBaseline ?? '1991-2020'
+  if (word === 'at') return `At the ${baseline} normal of ${normal.toFixed(1)}${props.unit ?? ''}`
+  return `${Math.abs(gap).toFixed(1)}${props.unit ?? ''} ${word} the ${baseline} `
+    + `normal of ${normal.toFixed(1)}${props.unit ?? ''}`
+})
+
+/**
+ * Heatwave runs at this cell, from `/timeseries`. Point `mhw` only: a region's
+ * value is an extent, and "the region has been in a heatwave for 34 days" is not
+ * a thing an area fraction can say.
+ */
+const events = computed(() => props.series?.events ?? null)
+
+/** "9 Dec 2014 – 2 May 2015", for a run's note line. */
+function runSpan(run: { start: string, end: string }): string {
+  // 'en-GB', matching `utils/periods.ts` — see `StateRibbon`'s note on why the
+  // visitor's own locale is the wrong choice for anything rendered under SSR.
+  const fmt = (iso: string) => new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', {
+    day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+  })
+  return `${fmt(run.start)} – ${fmt(run.end)}`
+}
 
 function fmt(value: number): string {
   // `/domain`'s `precision` for `mhw` is 0, which is right for the thing it
@@ -173,7 +232,7 @@ const rankLine = computed(() => {
   const { rank, n } = stats.value
   if (rank == null) return null
   const noun = { daily: 'days', weekly: 'weeks', monthly: 'months' }[props.period]
-  return `${ordinal(rank)} ${props.categorical ? 'most severe' : 'warmest'} of ${n.toLocaleString()} ${noun}`
+  return `${ordinal(rank)} ${props.rankOrder ?? 'warmest'} of ${n.toLocaleString()} ${noun}`
 })
 
 /**
@@ -210,6 +269,28 @@ const rows = computed(() => {
         value: `${s.activeRecent.hits} of ${s.activeRecent.of}`,
         unit: '',
         note: 'last 12 months',
+      })
+    }
+    // How long, not just how bad. A category answers "how bad is it today" and
+    // a reader's next question is always "how long has this been going on" —
+    // which the daily line answers only by being counted along by eye, and
+    // which a weekly line has already destroyed by taking a max over seven
+    // days. Both runs come off the cell's own daily record; see `mhw_events`.
+    const e = events.value
+    if (e?.current) {
+      out.push({
+        label: 'In a heatwave for',
+        value: `${e.current.days}`,
+        unit: e.current.days === 1 ? 'day' : 'days',
+        note: `since ${runSpan(e.current).split(' – ')[0]}, peak Cat ${e.current.peak}`,
+      })
+    }
+    if (e?.longest) {
+      out.push({
+        label: 'Longest heatwave',
+        value: `${e.longest.days}`,
+        unit: 'days',
+        note: `${runSpan(e.longest)}, peak Cat ${e.longest.peak}`,
       })
     }
   }

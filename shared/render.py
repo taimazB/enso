@@ -31,7 +31,7 @@ import matplotlib
 import numpy as np
 from PIL import Image
 
-from .domain import subset, variable
+from .domain import quantity, subset, variable
 from .periods import Period, start_of
 
 log = logging.getLogger(__name__)
@@ -319,9 +319,31 @@ def colormap_stops(variable_name: str = "sst", n: int = 33) -> list[dict]:
             {"value": float(c.value), "color": c.color, "label": c.label}
             for c in var.colors
         ]
-    cmap = matplotlib.colormaps[var.colormap]
-    values = np.linspace(var.vmin, var.vmax, n)
-    norm = matplotlib.colors.Normalize(vmin=var.vmin, vmax=var.vmax)
+    return _sampled_stops(var.colormap, var.vmin, var.vmax, n)
+
+
+def quantity_stops(name: str, n: int = 33) -> list[dict]:
+    """The same, for a series-only `quantities` entry.
+
+    A quantity has no categories and no adjustable range, so this is always the
+    sampled path. It exists so the colormap stays evaluated in exactly one place
+    — matplotlib, server-side — for a region's marine-heatwave extent as much as
+    for a map variable.
+    """
+    q = quantity(name)
+    return _sampled_stops(q.colormap, q.vmin, q.vmax, n)
+
+
+def _sampled_stops(colormap: str, vmin: float, vmax: float, n: int) -> list[dict]:
+    """`n` evenly spaced values across `vmin..vmax`, with their hex colours.
+
+    Evenly spaced is load-bearing, not incidental: it is what lets the frontend
+    re-label the same colours onto a narrower display range by index alone
+    (`stopsFor`), without evaluating a colormap of its own.
+    """
+    cmap = matplotlib.colormaps[colormap]
+    values = np.linspace(vmin, vmax, n)
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     return [
         {"value": round(float(v), 3), "color": matplotlib.colors.to_hex(cmap(norm(v)))}
         for v in values

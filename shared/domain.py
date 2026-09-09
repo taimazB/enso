@@ -249,6 +249,33 @@ class Encoding:
 
 
 @dataclass(frozen=True)
+class Quantity:
+    """A number a timeseries can report that is not a field on the map.
+
+    Deliberately NOT a `Variable`, and the difference is the whole point: a
+    variable is something `/image` can draw and the frontend's toggle is built
+    from the list of them, so a quantity with no raster would appear there as a
+    map layer that renders nothing. A quantity exists only once cells have been
+    aggregated over an area — `mhw_extent` is the share of a box's ocean in a
+    heatwave, which at a single cell would only ever be 0% or 100%.
+
+    It carries just enough for a chart and a stat card to present it honestly:
+    a name, a unit, a precision and a colour ramp. No `encoding` (nothing packs
+    it into an image), no `presets` or `limits` (its range is the whole of what
+    it can be), and no `categorical` — a quantity is continuous by construction.
+    """
+
+    name: str
+    long_name: str
+    short_name: str
+    units: str
+    precision: int
+    vmin: float
+    vmax: float
+    colormap: str
+
+
+@dataclass(frozen=True)
 class Region:
     key: str
     label: str
@@ -312,6 +339,22 @@ def variable(name: str) -> Variable:
         return variables()[name]
     except KeyError:
         raise KeyError(f"unknown variable {name!r}; known: {sorted(variables())}") from None
+
+
+@functools.lru_cache(maxsize=1)
+def quantities() -> dict[str, Quantity]:
+    """Series-only quantities from `domain.yml`. Empty if the block is absent."""
+    return {
+        name: Quantity(name=name, **cfg)
+        for name, cfg in (_raw().get("quantities") or {}).items()
+    }
+
+
+def quantity(name: str) -> Quantity:
+    try:
+        return quantities()[name]
+    except KeyError:
+        raise KeyError(f"unknown quantity {name!r}; known: {sorted(quantities())}") from None
 
 
 @functools.lru_cache(maxsize=1)

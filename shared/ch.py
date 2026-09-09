@@ -203,7 +203,36 @@ DDL: tuple[str, ...] = (
         n_cells_clim   UInt32,
 
         -- sum(cat * cos(lat)) over mhw_daily / sum(cos(lat)) over sst_daily.
+        --
+        -- An area mean of NOAA's five ORDINAL classes, so it is not a class and
+        -- it is not readable as one: it folds severity and extent into a single
+        -- number, and half a box at Cat 1 and a tenth of it at Cat 5 both come
+        -- to about 0.5. Kept, because it is the only column that carries
+        -- severity at all -- the panel shows it as a secondary card -- but it is
+        -- no longer what a region's `mhw` series plots. See `mhw_area_frac`.
         mean_mhw       Float32,
+
+        -- The share of the box's OCEAN AREA that is in a heatwave at all:
+        -- sumIf(cos(lat), cat >= 1) over mhw_daily / sum(cos(lat)) over
+        -- sst_daily. A fraction in 0..1; the API serves it as a percentage.
+        --
+        -- This is what a region's `mhw` series plots now, because it is the
+        -- question a box is actually asked -- "how much of it is in a heatwave"
+        -- -- and unlike `mean_mhw` it needs no warning to be read correctly.
+        -- Area-weighted for the same reason every other mean here is: at 60N a
+        -- 0.05-degree cell covers half the area of one at the equator, and the
+        -- PDO box is 45 degrees tall.
+        --
+        -- Same denominator as `mean_mhw`, and it has to be: only `sst_daily`
+        -- knows which cells are ocean on a given date. A date with no heatwave
+        -- anywhere in the box is a real 0, not a gap.
+        mhw_area_frac  Float32,
+
+        -- Cell count behind that fraction, unweighted. Not used to compute
+        -- anything -- the weighted sums above are the mean -- but it is what
+        -- says whether a small fraction is a genuine sliver or one stray cell,
+        -- and it costs 4 bytes on a 137k-row table.
+        n_cells_mhw    UInt32,
 
         updated_at     DateTime DEFAULT now()
     )

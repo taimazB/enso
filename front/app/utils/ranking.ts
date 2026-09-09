@@ -58,6 +58,13 @@ export interface MonthlyRanking {
   areaMean?: boolean
   /** Which field the years are ranked by. */
   variable?: 'sst' | 'anom' | 'mhw'
+  /**
+   * What the ranked number IS, where that is not simply the variable —
+   * `mhw_extent` on a region's marine-heatwave ranking, whose value is the share
+   * of the box's area in a heatwave rather than a category. The API says so;
+   * nothing here infers it from `region` being set.
+   */
+  quantity?: string | null
   units?: string
   /** Every month ranked, edge months included — first of the first to last of the last. */
   span: { start: string, end: string } | null
@@ -411,7 +418,15 @@ export interface ReadingGuideInput {
 }
 
 /** What the ranked number is, said in words rather than as a variable key. */
-function rankedQuantity(variable: MonthlyRanking['variable']): string {
+function rankedQuantity(ranking: MonthlyRanking | null | undefined): string {
+  // The quantity wins where there is one: over a region `mhw` is not a category
+  // at all, and describing it as one is the exact confusion the extent quantity
+  // was introduced to end.
+  if (ranking?.quantity === 'mhw_extent') {
+    return 'the share of the region’s ocean area in a marine heatwave, '
+      + 'averaged over that month’s days'
+  }
+  const variable = ranking?.variable
   if (variable === 'sst') return 'that month’s mean sea-surface temperature'
   if (variable === 'mhw') {
     return 'that month’s mean daily heatwave category — a severity index, '
@@ -433,7 +448,7 @@ export function readingGuide({
   const series = ranking?.areaMean ? 'daily area means' : 'daily values'
 
   const items: GuideItem[] = [
-    { glyph: 'dot', text: `Dot — ${rankedQuantity(ranking?.variable)}${suffix}, coloured on the same scale as the map.` },
+    { glyph: 'dot', text: `Dot — ${rankedQuantity(ranking)}${suffix}, coloured on the same scale as the map.` },
     { glyph: 'whisker', text: `Bar — one ${sdLabel} either side of it, so a long bar is a month whose ${series} moved about.` },
     { glyph: 'top', text: `Bold label on a tinted row — the top ${topN}.` },
     { glyph: 'selected', text: 'Amber ring and label — the year the map is currently showing.' },

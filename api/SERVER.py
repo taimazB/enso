@@ -20,9 +20,9 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from shared.domain import global_grid, regions, subset, variable, variables
+from shared.domain import global_grid, quantities, regions, subset, variable, variables
 
-from modules import render
+from modules import render, state
 from modules.clickhouse_helpers import client, reset
 from modules.periods import Period
 from modules.posthog_helpers import capture_event
@@ -209,9 +209,35 @@ def domain() -> dict:
             }
             for name, v in variables().items()
         },
+        # Series-only quantities: numbers a timeseries can report that are not
+        # fields the map can draw, so they are NOT in `variables` above — the
+        # frontend's variable toggle is built from that block, and an entry there
+        # with no raster would appear as a fourth map layer that renders nothing.
+        #
+        # There is one, `mhw_extent`: what `mhw` means over a REGION, where the
+        # value is the share of the box's ocean area in a heatwave rather than a
+        # category. A timeseries response names its quantity in `quantity`, and
+        # the client formats from this block when it is set.
+        "quantities": {
+            name: {
+                "longName": q.long_name,
+                "shortName": q.short_name,
+                "units": q.units,
+                "precision": q.precision,
+                "vmin": q.vmin,
+                "vmax": q.vmax,
+                "colormap": q.colormap,
+            }
+            for name, q in quantities().items()
+        },
         # Per variable: `sst`'s scale is sequential and `anom`'s diverging, so
-        # there is no single legend that serves both.
-        "colorStops": {name: render.colormap_stops(name) for name in VARIABLES},
+        # there is no single legend that serves both. Quantities are in the same
+        # mapping rather than a second one — a consumer looks up whichever key
+        # the series named, and the two namespaces do not collide.
+        "colorStops": {
+            **{name: render.colormap_stops(name) for name in VARIABLES},
+            **{name: render.quantity_stops(name) for name in quantities()},
+        },
         "defaultVariable": "sst",
         # Ocean with SST but no climatology — the seasonal ice fringe, about
         # 3.2% of the box. Drawn flat so it reads as "no anomaly here" rather
@@ -234,6 +260,25 @@ def domain() -> dict:
 def coverage_endpoint() -> dict:
     """Ingested date range and row count."""
     return coverage()
+
+
+@app.get("/state")
+def state_endpoint() -> dict:
+    """What the Pacific is doing today, in the two numbers that need no context.
+
+    The header ribbon's whole payload: the ENSO phase from Nino 3.4 and the share
+    of the basin in a marine heatwave against the date's normal. Every other
+    endpoint answers a question the visitor has already framed; this one answers
+    the question they arrive with.
+
+    Both halves are rollup reads — `region_daily` for `nino34` and for the whole
+    `pacific` box — so this is a few thousand rows and milliseconds, not a scan.
+    Not instrumented: it is page-load plumbing, fired once per visit like
+    `/domain` and `/coverage`, and a `state_viewed` event on every load would say
+    nothing a page view does not already say. The ribbon's *clicks* are tracked,
+    in the frontend, because those are choices.
+    """
+    return state.pacific_state()
 
 
 @app.get("/variables")

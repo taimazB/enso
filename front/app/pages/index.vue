@@ -33,14 +33,15 @@
           :loading="store.activeSeriesLoading"
           :empty-message="emptyPointMessage"
           :error="!!store.activeError"
-          :stops="store.activeStops"
-          :categorical="store.activeIsCategorical"
-          :unit="store.activeUnitLabel"
-          :precision="store.domain?.variables?.[store.variable]?.precision"
+          :stops="store.seriesStops"
+          :categorical="store.seriesIsCategorical"
+          :unit="store.seriesUnitLabel"
+          :precision="store.seriesPrecision"
           :signed="store.variable === 'anom'"
           :variable-label="variableLabel"
           :period="store.period"
           :selected-date="store.selectedDate"
+          :rank-order="rankOrder"
         />
 
         <!-- One panel, both scopes. A region's ranking is the same question over
@@ -55,15 +56,15 @@
           v-if="store.activeRanking || store.activeSeriesLoading"
           class="min-h-0 grow border-t border-default pt-3"
           :ranking="store.activeRanking"
-          :stops="store.activeStops"
+          :stops="store.seriesStops"
           :loading="store.activeSeriesLoading"
           :empty-message="emptyPointMessage"
           :error="!!store.activeError"
           :selected-date="store.selectedDate"
-          :unit="store.activeUnitLabel"
-          :categorical="store.activeIsCategorical"
+          :unit="store.seriesUnitLabel"
+          :categorical="store.seriesIsCategorical"
           :zero-line="store.variable === 'anom'"
-          :precision="store.domain?.variables?.[store.variable]?.precision"
+          :precision="store.seriesPrecision"
           :rank-order="rankOrder"
           :period="store.period"
           @select="store.setDate($event)"
@@ -99,10 +100,11 @@
           :error="!!store.activeError"
           :title="chartTitle"
           :selected-date="store.selectedDate"
-          :stops="store.activeStops"
+          :stops="store.seriesStops"
           :zero-line="store.variable === 'anom'"
-          :unit="store.activeUnitLabel"
-          :categorical="store.activeIsCategorical"
+          :unit="store.seriesUnitLabel"
+          :categorical="store.seriesIsCategorical"
+          :label="variableLabel"
           @select="store.setDate($event)"
         />
       </div>
@@ -112,8 +114,14 @@
 
 <script setup lang="ts">
 import { useMainStore } from '~/stores/main'
+import { useUrlState } from '~/composables/useUrlState'
 
 const store = useMainStore()
+
+// Keeps the address bar saying what is on screen, and honours one that already
+// does. Called here rather than in `app.vue` because it is about the page's
+// selection, and the header knows nothing about that.
+useUrlState()
 
 /**
  * Open. The panel needs no selection to have something to say — the app lands in
@@ -131,11 +139,13 @@ const periodLabel = computed(
  * which is the *source's* cadence and collides with the period the panel is
  * actually showing — "Daily sea surface temperature anomaly - 24 Aug to 30 Aug"
  * invites reading a weekly mean as a single day.
+ *
+ * From the store rather than from `variables` directly, because in region scope
+ * `mhw` is not the marine-heatwave category at all — it is the share of the box
+ * in one, and the heading has to say "MHW extent" or the panel labels a
+ * percentage as a category.
  */
-const variableLabel = computed(() => {
-  const meta = store.domain?.variables?.[store.variable]
-  return meta?.shortName || meta?.longName || store.variable
-})
+const variableLabel = computed(() => store.seriesLabel)
 
 /**
  * A cell as hemispheres, not signed degrees.
@@ -201,10 +211,15 @@ const emptyPointMessage = computed(
 )
 
 /**
- * What rank 1 means for the active variable. "Warmest" is right for a
- * temperature and wrong for a heatwave category, where the ranking is by mean
- * severity — nothing about it is a temperature.
+ * What rank 1 means for what is actually plotted. "Warmest" is right for a
+ * temperature, wrong for a heatwave category — where the ranking is by mean
+ * severity and nothing about it is a temperature — and wrong again for a
+ * region's extent, which ranks by how much of the box was affected rather than
+ * by how bad it got. Three quantities, three words.
  */
-const rankOrder = computed(() => (store.variable === 'mhw' ? 'most severe' : 'warmest'))
+const rankOrder = computed(() => {
+  if (store.activeQuantity === 'mhw_extent') return 'most widespread'
+  return store.variable === 'mhw' ? 'most severe' : 'warmest'
+})
 
 </script>

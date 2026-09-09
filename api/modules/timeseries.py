@@ -49,7 +49,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 
-from shared.domain import global_grid, regions, subset, variable
+from shared.domain import global_grid, quantity, regions, subset, variable
 
 from .clickhouse_helpers import DATABASE, client
 from .periods import Period, bucket_sql
@@ -71,6 +71,35 @@ MHW_SOURCE = """
         ON m.gy = d.gy AND m.gx = d.gx AND m.date = d.date
     WHERE d.gy = %(gy)s AND d.gx = %(gx)s{where}
 """
+
+
+def region_quantity(variable_name: str) -> str | None:
+    """The `quantities` key a region series reports, or None for the variable's own.
+
+    Only `mhw` has one: over a box it is an extent in percent, not a category.
+    Everything that formats a region value — units, precision, colour ramp, the
+    axis name, the CSV header — reads this rather than testing the variable name,
+    so adding a second such quantity later is a line in `domain.yml` and an entry
+    here.
+    """
+    return REGION_MHW_QUANTITY if variable_name == "mhw" else None
+
+
+def _series_units(variable_name: str, *, region: bool) -> str:
+    """The unit a series' values carry, which is not always the variable's.
+
+    A region's `mhw` is a percentage of area; a point's is an unnamed ordinal
+    class. Resolved in one place so the timeseries, the ranking and the CSV
+    cannot disagree about what the numbers are in.
+    """
+    key = region_quantity(variable_name) if region else None
+    return quantity(key).units if key else variable(variable_name).units
+
+
+# The climatology every anomaly here is against, and the normal the point SST
+# series carries. A string because it is a label, not arithmetic: it names
+# `sst_clim`'s source files and nothing computes with it.
+CLIMATOLOGY_BASELINE = "1991-2020"
 
 
 def check_variable(name: str) -> str:
@@ -117,6 +146,86 @@ def _date_filter(start: dt.date | None, end: dt.date | None, alias: str = "") ->
 MMDD_SQL = "toMonth({d}) * 100 + toDayOfMonth({d})"
 
 
+def mhw_events(
+    gy: int, gx: int, start: dt.date | None = None, end: dt.date | None = None
+) -> dict:
+    """Runs of consecutive marine-heatwave days at one cell.
+
+    A category answers "how bad is it today"; a run answers "how long has this
+    been going on", which is the question a heatwave is actually followed by and
+    the one the daily series makes a reader count by eye. Two runs are reported:
+    the one in progress at the end of the range, if any, and the longest in the
+    record.
+
+    **Computed on days, never on buckets.** A weekly series has already taken the
+    max over seven days, so folding it would call a single Cat 1 day a heatwave
+    week and join two of them across a gap of six calm days. This reads the cell's
+    own daily record — the same ~15k-row primary-key read the series makes,
+    against both tables' `(gy, gx, date)` order — and walks it.
+
+    **A gap in the archive breaks a run, and that is deliberate.** Consecutive
+    means consecutive *dates*, not consecutive rows: `mhw_daily` is sparse, so
+    the day after a heatwave day is absent whether it was calm or never ingested,
+    and stitching across it would invent duration out of a missing file. The
+    difference is visible in `/coverage`, which is where it belongs.
+
+    Returns `current: None` when the cell is not in a heatwave on the last day of
+    the range — which is most cells most of the time, and is a real answer.
+    """
+    where, params = _date_filter(start, end)
+    params |= {"gy": gy, "gx": gx}
+    rows = client().query(
+        f"""
+        SELECT date, cat FROM {DATABASE}.mhw_daily
+        WHERE gy = %(gy)s AND gx = %(gx)s{where}
+        ORDER BY date
+        """,
+        parameters=params,
+    ).result_rows
+
+    last_day = client().query(
+        f"""
+        SELECT max(date) FROM {DATABASE}.sst_daily
+        WHERE gy = %(gy)s AND gx = %(gx)s{where}
+        """,
+        parameters=params,
+    ).result_rows[0][0]
+
+    runs: list[dict] = []
+    for date, cat in rows:
+        run = runs[-1] if runs else None
+        if run is not None and date - run["_end"] == dt.timedelta(days=1):
+            run["_end"] = date
+            run["days"] += 1
+            run["peak"] = max(run["peak"], int(cat))
+        else:
+            runs.append({"_end": date, "start": date, "days": 1, "peak": int(cat)})
+
+    def shape(run: dict) -> dict:
+        return {
+            "start": str(run["start"]),
+            "end": str(run["_end"]),
+            "days": run["days"],
+            "peak": run["peak"],
+        }
+
+    longest = max(runs, key=lambda r: r["days"]) if runs else None
+    # In progress only if it reaches the last day the cell has SST for. Testing
+    # against the SST table rather than against `end` is what keeps a cell whose
+    # heatwave ended last week from reporting a stale "current" run.
+    current = runs[-1] if runs and last_day is not None and runs[-1]["_end"] == last_day else None
+
+    return {
+        "current": None if current is None else shape(current),
+        "longest": None if longest is None else shape(longest),
+        # Every heatwave day in the range, which is what says whether a long
+        # single event or many short ones is the cell's normal.
+        "days": sum(r["days"] for r in runs),
+        "events": len(runs),
+        "through": None if last_day is None else str(last_day),
+    }
+
+
 def point_timeseries(
     lat: float,
     lon: float,
@@ -151,14 +260,29 @@ def point_timeseries(
             GROUP BY bucket ORDER BY bucket
         """
     elif name == "sst":
-        where, params = _date_filter(start, end)
+        # LEFT JOIN, not INNER, and that is the whole difference from the `anom`
+        # branch below. The climatology comes along so the chart can draw the
+        # normal this cell's temperature is departing from — which is what makes
+        # an absolute SST readable without switching variables — but about 3.2%
+        # of the box's ocean has SST and no climatology, and an inner join would
+        # silently drop the ice fringe's dates from the SST series itself. A null
+        # `clim` is the honest answer there; `avgOrNull` keeps it null for a
+        # whole bucket rather than averaging the days that do have one, which
+        # would make a bucket's normal cover a different set of days than its
+        # value.
+        where, params = _date_filter(start, end, alias="d")
         params |= {"gy": gy, "gx": gx}
+        bucket = bucket_sql(period).replace("date", "d.date")
         sql = f"""
-            SELECT {bucket_sql(period)} AS bucket,
-                   avg(sst) AS value,
-                   count() AS n
-            FROM {DATABASE}.sst_daily
-            WHERE gy = %(gy)s AND gx = %(gx)s{where}
+            SELECT {bucket} AS bucket,
+                   avg(d.sst) AS value,
+                   count() AS n,
+                   if(countIf(c.clim_raw IS NULL) > 0, NULL, avg(c.clim)) AS clim
+            FROM {DATABASE}.sst_daily AS d
+            LEFT JOIN {DATABASE}.sst_clim AS c
+                ON c.gy = d.gy AND c.gx = d.gx
+               AND c.mmdd = {MMDD_SQL.format(d="d.date")}
+            WHERE d.gy = %(gy)s AND d.gx = %(gx)s{where}
             GROUP BY bucket ORDER BY bucket
         """
     else:
@@ -181,8 +305,27 @@ def point_timeseries(
     # Rounded to the variable's own precision rather than a fixed 2: `mhw` is an
     # integer category and "3.0" invites the reader to look for a 3.4.
     places = variable(name).precision
+    extra: dict = {}
+    if name == "sst":
+        # The 1991-2020 normal for each bucket, drawn under the line. Present
+        # only on `sst`: `anom` is already a departure from it and has a zero
+        # line, and a category has no normal at all.
+        extra["climatology"] = [
+            None if len(r) < 4 or r[3] is None else round(float(r[3]), places)
+            for r in rows
+        ]
+        extra["climatologyBaseline"] = CLIMATOLOGY_BASELINE
+    if name == "mhw":
+        # Runs of consecutive heatwave days at this cell. Its own daily read
+        # rather than a fold of the buckets above, because an event is a fact
+        # about days and a weekly series has already taken a max over seven of
+        # them. See `mhw_events`.
+        extra["events"] = mhw_events(gy, gx, start, end)
     return {
         "variable": name,
+        # None: at a cell the value IS the variable — a class for `mhw`, degrees
+        # for the other two. Present so a client reads one field in both scopes.
+        "quantity": None,
         "units": variable(name).units,
         "period": period,
         "requested": {"lat": lat, "lon": lon},
@@ -195,6 +338,7 @@ def point_timeseries(
         "dates": [str(r[0]) for r in rows],
         "values": [None if r[1] is None else round(float(r[1]), places) for r in rows],
         "n_days": [int(r[2]) for r in rows],
+        **extra,
     }
 
 
@@ -235,8 +379,27 @@ def _region_clim_by_mmdd(key: str) -> dict[int, float]:
 _ROLLUP_COLUMNS = {
     "sst": ("mean_sst", "n_cells"),
     "anom": ("mean_sst_clim", "n_cells_clim"),
-    "mhw": ("mean_mhw", "n_cells"),
+    # **Extent, not mean category.** Over a box, `mhw` is the share of the ocean
+    # area in a heatwave (`REGION_MHW_QUANTITY`), because that is the question a
+    # box is asked and it needs no explaining. `mean_mhw` is still in the table
+    # and still the only column carrying severity, but it is an area mean of
+    # ordinal classes -- half a box at Cat 1 and a tenth at Cat 5 both come to
+    # ~0.5 -- so it is a secondary card rather than the plotted series.
+    "mhw": ("mhw_area_frac", "n_cells"),
 }
+
+# What a REGION's `mhw` series actually is. A point's stays the category itself,
+# which is why this is not simply a rename of the variable: the same toggle means
+# a class at a cell and a percentage over a box, and the response says which by
+# carrying this key so no client has to infer it from the scope.
+REGION_MHW_QUANTITY = "mhw_extent"
+
+# `mhw_area_frac` is stored as a fraction and served as a percentage. Stored
+# unscaled because that is what the weighted sums produce and a rollup should not
+# carry a presentation choice; scaled here, in the one place a region's mhw value
+# leaves the database, so the chart, the stat cards, the ranking and the CSV all
+# get the same units without each applying its own factor.
+_MHW_EXTENT_SCALE = 100.0
 
 
 def _region_daily_rows(
@@ -258,9 +421,12 @@ def _region_daily_rows(
     """
     value_col, count_col = _ROLLUP_COLUMNS[variable_name]
     where, params = _date_filter(start, end)
+    # See `_MHW_EXTENT_SCALE`: the fraction becomes a percentage here rather than
+    # in each consumer.
+    value = f"{value_col} * {_MHW_EXTENT_SCALE}" if variable_name == "mhw" else value_col
     return client().query(
         f"""
-        SELECT date, {value_col}, {count_col}
+        SELECT date, {value}, {count_col}
         FROM {DATABASE}.region_daily FINAL
         WHERE region = %(key)s AND isFinite({value_col}){where}
         ORDER BY date
@@ -272,21 +438,32 @@ def _region_daily_rows(
 def _region_mhw_daily(
     gy0: int, gy1: int, gx0: int, gx1: int, where: str, params: dict
 ) -> list[tuple]:
-    """Per-day cos(lat)-weighted mean MHW category over a box, and its cell count.
+    """Per-day share of a box's ocean AREA that is in a marine heatwave, as a %.
+
+    The live twin of `region_daily.mhw_area_frac`, for an arbitrary box that has
+    no rollup — same numerator, same denominator, same scaling, so a drawn box
+    and a named region report the same quantity in the same units.
+
+    **Extent, not mean category.** The numerator used to be `sum(cat * cos(lat))`,
+    an area mean of NOAA's five ordinal classes, which folds severity and extent
+    into one number so completely that half a box at Cat 1 and a tenth of it at
+    Cat 5 both come to about 0.5. Dropping the `cat` factor and weighting each
+    heatwave cell equally answers the question a box is actually asked.
 
     **Deliberately not a join.** `mhw_daily` is sparse, so a LEFT JOIN over a box
     would put the whole box's ocean on the left — 14.55 B rows for the PDO domain
-    — to add zeros that contribute nothing to a sum. Instead the two halves of
-    the mean are computed separately and divided:
+    — to add zeros that contribute nothing to a sum. Instead the two halves are
+    computed separately and divided:
 
-        numerator   sum(cat * cos(lat))  over mhw_daily   -- sparse, cheap
-        denominator sum(cos(lat))        over sst_daily   -- the box's ocean
+        numerator   sum(cos(lat)) over mhw_daily   -- sparse, and every row in it
+                                                      is a heatwave cell already
+        denominator sum(cos(lat)) over sst_daily   -- the box's ocean
 
     The denominator has to come from `sst_daily` because it is the only table
     that knows which cells are ocean on a given date, and the ice edge moves. A
     day with no heatwave anywhere in the box has no numerator row at all, and is
-    reported as a mean of 0 rather than dropped — "no heatwave" is a real answer,
-    not a gap.
+    reported as a real 0% rather than dropped — "no heatwave" is an answer, not a
+    gap.
     """
     box = {"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1}
     weight = "cos(lat * pi() / 180)"
@@ -295,7 +472,7 @@ def _region_mhw_daily(
         date: float(value)
         for date, value in client().query(
             f"""
-            SELECT date, sum(cat * {weight}) AS weighted
+            SELECT date, sum({weight}) AS weighted_area
             FROM {DATABASE}.mhw_daily
             WHERE gy BETWEEN %(gy0)s AND %(gy1)s
               AND gx BETWEEN %(gx0)s AND %(gx1)s{where}
@@ -307,7 +484,7 @@ def _region_mhw_daily(
     }
 
     return [
-        (date, numerator.get(date, 0.0) / float(total), int(n_cells))
+        (date, _MHW_EXTENT_SCALE * numerator.get(date, 0.0) / float(total), int(n_cells))
         for date, total, n_cells in client().query(
             f"""
             SELECT date, sum({weight}) AS total, count() AS n_cells
@@ -412,7 +589,11 @@ def region_timeseries(
     ordered = sorted(buckets)
     return {
         "variable": name,
-        "units": variable(name).units,
+        # A box's `mhw` is an extent in percent, not a category — see
+        # `region_quantity`. Carried explicitly rather than left to be inferred
+        # from the scope, so a client formats it from the response it has.
+        "quantity": region_quantity(name),
+        "units": _series_units(name, region=True),
         "period": period,
         "label": label,
         "bounds": {"lat": list(lat_bounds), "lon": list(lon_bounds)},
@@ -665,6 +846,15 @@ def _region_ranking_source(name: str) -> str:
     at climatology" — and which would otherwise drag that month's mean.
     """
     value_col, _ = _ROLLUP_COLUMNS[name]
+    if name == "mhw":
+        # Percent, matching `_region_daily_rows` — the ranking must be in the
+        # same units as the series it ranks, or the panel's rows read as
+        # hundredths beside a chart drawn in percent.
+        return f"""
+            SELECT date, {value_col} * {_MHW_EXTENT_SCALE} AS value
+            FROM {DATABASE}.region_daily FINAL
+            WHERE region = %(key)s AND isFinite({value_col})
+        """
     if name == "anom":
         # 366 rows on the right, one per MMDD. The commuting-means identity is
         # applied per day here rather than per month, so a month spanning the
@@ -711,6 +901,7 @@ def monthly_ranking(
 
     return {
         "variable": name,
+        "quantity": None,
         "units": variable(name).units,
         "requested": {"lat": lat, "lon": lon},
         "cell": {
@@ -750,7 +941,8 @@ def region_monthly_ranking(
 
     return {
         "variable": name,
-        "units": variable(name).units,
+        "quantity": region_quantity(name),
+        "units": _series_units(name, region=True),
         "region": key,
         "label": region.label,
         "bounds": {"lat": list(region.lat), "lon": list(region.lon)},

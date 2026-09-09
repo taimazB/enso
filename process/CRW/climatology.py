@@ -148,10 +148,16 @@ def load_climatology(client, *, force: bool = False, batch: int = 5) -> dict[str
     return counts
 
 
-def build_region_clim(client) -> int:
+def build_region_clim(client, keys: list[str] | None = None) -> int:
     """Fill `region_clim`: each named region's cos(lat)-weighted mean per MMDD.
 
-    8 regions x 366 = 2,928 rows, and it is the *entire* precomputation layer.
+    366 rows per region, and it is the *entire* precomputation layer.
+
+    `keys` narrows it to some of them, which is what a region ADDED to
+    `domain.yml` after `init` needs: the table is a `ReplacingMergeTree` on
+    (region, mmdd), so re-inserting one key collapses on merge and re-running the
+    whole set is idempotent either way. Reading `sst_clim` rather than the 366
+    NetCDF files is what makes that cheap enough to redo on demand.
     A region anomaly series needs no join against `sst_daily` because
 
         mean(sst - clim) == mean(sst) - mean(clim)
@@ -164,8 +170,9 @@ def build_region_clim(client) -> int:
     """
     grid = global_grid()
     rows: list[list] = []
+    selected = regions() if keys is None else {k: regions()[k] for k in keys}
 
-    for key, region in regions().items():
+    for key, region in selected.items():
         gy0, gy1 = sorted(int(grid.gy(v)) for v in region.lat)
         gx0, gx1 = sorted(int(grid.gx(v)) for v in region.lon)
         result = client.query(

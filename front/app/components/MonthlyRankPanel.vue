@@ -205,13 +205,17 @@ function onGuideToggle(open: boolean) {
 function exportRanking() {
   const ranking = props.ranking
   if (!ranking) return
-  const variable = ranking.variable ?? 'anom'
+  // Same rule as the series export: the filename names what the numbers ARE, so
+  // a region's heatwave file says `mhw_extent` rather than `mhw`. A folder of
+  // both is otherwise two files that look comparable and are not.
+  const variable = ranking.quantity ?? ranking.variable ?? 'anom'
   const subject = ranking.region
     ? slug(ranking.label ?? ranking.region)
     : ranking.cell ? cellSlug(ranking.cell) : 'selection'
   trackEvent('csv_downloaded', {
     kind: 'ranking',
-    variable,
+    variable: ranking.variable ?? 'anom',
+    quantity: ranking.quantity ?? null,
     scope: ranking.region ? 'region' : 'point',
     months: 12,
   })

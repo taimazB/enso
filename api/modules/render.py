@@ -31,6 +31,7 @@ from shared.render import (  # noqa: F401 — re-exported for call sites
     colorize,
     colormap_stops,
     encode,
+    quantity_stops,
     to_mercator,
     write_cache,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "colorize",
     "colormap_stops",
     "encode",
+    "quantity_stops",
     "render",
     "to_mercator",
 ]

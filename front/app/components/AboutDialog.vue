@@ -62,7 +62,27 @@
                 aria-hidden="true"
               >
                 <div class="pointer-events-none w-max select-none">
-                  <UFieldGroup v-if="step.figure === 'field'" size="xs">
+                  <!-- Live, like the other figures: it names the phase and the
+                       extent actually on screen rather than a frozen example
+                       that would read as stale the day ENSO turns over. -->
+                  <div
+                    v-if="step.figure === 'ribbon'"
+                    class="flex items-center gap-2 text-xs"
+                  >
+                    <span
+                      class="rounded px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
+                      :class="phaseChip.class"
+                    >{{ phaseChip.label }}</span>
+                    <span class="text-muted">Niño 3.4</span>
+                    <span class="h-4 w-px bg-accented" />
+                    <span class="rounded bg-orange-500/15 px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-orange-400">Heatwave</span>
+                    <span class="text-muted">
+                      <span class="tabular-nums text-highlighted">{{ store.pacific?.heatwave?.extent ?? '—' }}%</span>
+                      of the Pacific
+                    </span>
+                  </div>
+
+                  <UFieldGroup v-else-if="step.figure === 'field'" size="xs">
                     <UButton
                       v-for="v in FIELDS"
                       :key="v.value"
@@ -308,7 +328,27 @@ const PRIOR_WORK = 'https://github.com/IOS-OSD-DPG/Pacific_SST_Monitoring'
  * controls: the order is the order the questions arrive in — what am I looking
  * at, where, when, and then what the panels around it are saying.
  */
+/**
+ * The ribbon figure's badge, matching `StateRibbon`'s own colours.
+ *
+ * Live rather than a frozen example, so the figure cannot show a red El Niño
+ * chip during a La Niña — the one way a decorative replica can actively mislead.
+ */
+const phaseChip = computed(() => ({
+  el_nino: { label: 'El Niño', class: 'bg-red-500/15 text-red-400' },
+  la_nina: { label: 'La Niña', class: 'bg-sky-500/15 text-sky-400' },
+  neutral: { label: 'Neutral', class: 'bg-elevated text-muted' },
+}[store.pacific?.enso?.phase ?? 'neutral']))
+
 const steps = [
+  {
+    title: 'Start with the headline',
+    figure: 'ribbon',
+    text: 'The strip under the title is the state of the basin right now, and needs no setting up: '
+      + 'the El Niño / La Niña phase from the Niño 3.4 anomaly, and how much of the '
+      + 'Pacific is in a marine heatwave against what is normal for the date. Click either half to '
+      + 'open it in the panels below; the (i) beside it says exactly how each is calculated.',
+  },
   {
     title: 'Choose the field',
     figure: 'field',

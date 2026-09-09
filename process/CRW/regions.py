@@ -33,6 +33,16 @@ moves through the year, so the Bering Sea box holds 70,166 ocean cells but only
 `mean(sst - clim) == mean(sst) - mean(clim)` identity precisely over the ice
 fringe, which is where a marine-heatwave question gets asked.
 
+### The two marine-heatwave columns
+
+`mean_mhw` is the area mean of NOAA's five ordinal classes and `mhw_area_frac`
+the share of the box's ocean area at category >= 1. Both come off the same scan
+and the same denominator, and they answer different questions: the first mixes
+severity with extent so completely that half a box at Cat 1 and a tenth of it at
+Cat 5 both come to about 0.5, while the second is simply how much of the box is
+affected. A region's `mhw` series plots the second; the first survives as the
+only column that carries severity at all, shown beside it as a stat card.
+
 `mean_sst_clim` is NaN when a region has no climatology cells at all on a date.
 That cannot happen for the eight regions configured today (the smallest is the
 Bering Sea's 8,764), but a future box further north could, and a silent 0 there
@@ -57,6 +67,8 @@ COLUMNS = (
     "mean_sst_clim",
     "n_cells_clim",
     "mean_mhw",
+    "mhw_area_frac",
+    "n_cells_mhw",
 )
 
 # cos(latitude) area weight. At 60N a 0.05-degree cell covers half the area of
@@ -124,14 +136,17 @@ def build_region_daily(
         client.command(
             f"""
             INSERT INTO {DATABASE}.region_daily
-                (region, date, mean_sst, n_cells, mean_sst_clim, n_cells_clim, mean_mhw)
+                (region, date, mean_sst, n_cells, mean_sst_clim, n_cells_clim,
+                 mean_mhw, mhw_area_frac, n_cells_mhw)
             SELECT %(region)s,
                    s.date,
                    s.mean_sst,
                    s.n_cells,
                    s.mean_sst_clim,
                    s.n_cells_clim,
-                   m.weighted / s.weight_total
+                   m.weighted / s.weight_total,
+                   m.weighted_area / s.weight_total,
+                   m.n_mhw
             FROM (
                 SELECT date,
                        sum(sst * {_WEIGHT}) / sum({_WEIGHT}) AS mean_sst,
@@ -148,7 +163,15 @@ def build_region_daily(
                 GROUP BY date
             ) AS s
             LEFT JOIN (
-                SELECT date, sum(cat * {_WEIGHT}) AS weighted
+                SELECT date,
+                       sum(cat * {_WEIGHT}) AS weighted,
+                       -- No `If` needed: `mhw_daily` holds cat >= 1 only, so
+                       -- every row in it is a heatwave cell by construction.
+                       -- Testing `cat >= 1` here would read as though the table
+                       -- carried zeros, which is the misreading its sparsity
+                       -- causes everywhere else.
+                       sum({_WEIGHT}) AS weighted_area,
+                       count() AS n_mhw
                 FROM {DATABASE}.mhw_daily
                 WHERE gy BETWEEN %(gy0)s AND %(gy1)s
                   AND gx BETWEEN %(gx0)s AND %(gx1)s{where}

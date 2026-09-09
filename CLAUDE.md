@@ -87,7 +87,7 @@ python -m CRW.cli verify-clim                             # full-read all 366 cl
 python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested, per archive
 python -m CRW.cli backfill [--start|--end] [--product sst|mhw] [--reverse] [--fresh] [--delete-nc]
 python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
-python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh]   # region_daily
+python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh] [--clim]  # region_daily
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
 ```
@@ -294,6 +294,13 @@ Both containers mount `./shared` at `/app/shared`. Six modules:
 - **`domain.py` + `domain.yml`** — grid geometry, variable metadata, named region boxes.
   Describes **two** grids and the distinction matters: `global` is the full 7200×3600
   CoralTemp grid that `gy`/`gx` index; `subset` is the Pacific box actually ingested.
+  It also carries a **`quantities`** block, which is deliberately not `variables`: a
+  variable is something `/image` can draw and the frontend's toggle is built from that
+  list, so an entry there with no raster would appear as a map layer rendering nothing.
+  A quantity is a number that only exists once cells have been aggregated over an area.
+  There is one — `mhw_extent`, what `mhw` means over a region — and every timeseries
+  response names its quantity in `quantity` (null at a point) so no client infers it
+  from the scope.
 - **`fields.py`** — NetCDF reading, and the single home of both orientation rules above.
 - **`render.py`** — field array → Web-Mercator WebP. **Takes arrays, never a DB client.**
 - **`periods.py`** — daily/weekly/monthly buckets, shared by query and render.
@@ -368,9 +375,24 @@ mean_sst       Float32   -- over every ocean cell in the box      -> sst
 n_cells        UInt32
 mean_sst_clim  Float32   -- over its has_clim = 1 cells only      -> anom
 n_cells_clim   UInt32
-mean_mhw       Float32   -- sum(cat*cos) / sum(cos) over the ocean -> mhw
+mean_mhw       Float32   -- sum(cat*cos) / sum(cos) over the ocean  (severity, a card)
+mhw_area_frac  Float32   -- sumIf(cos, cat>=1) / sum(cos)           -> mhw
+n_cells_mhw    UInt32
 ENGINE = ReplacingMergeTree(updated_at) ORDER BY (region, date)
 ```
+
+**`mhw` over a region is `mhw_area_frac`, not `mean_mhw`, and that is the point of
+having both.** `mean_mhw` is an area mean of NOAA's five *ordinal* classes, so it folds
+severity and extent into one number: half a box at Cat 1 and a tenth of it at Cat 5 both
+come to about 0.5, and `StatsPanel` carried four sentences of warning saying so. The share
+of the box's ocean **area** at category >= 1 answers the question a box is actually asked,
+needs no warning, and is what the chart plots, the ranking ranks and the CSV exports.
+`mean_mhw` survives as the only column that carries severity at all. Both come off the same
+scan and the same denominator; the fraction is stored unscaled and served as a percentage
+by `_MHW_EXTENT_SCALE`, in the one place a region's `mhw` value leaves the database.
+
+**A point is untouched**: there the value is a class, `max` still reduces a bucket, and an
+"extent" at one cell would only ever be 0% or 100%.
 
 **Measured, this is the 97.6% that `region_clim` is not.** The climatology side costs
 0.296 s live against a daily side of 12.14 s for Niño 3.4 — so `region_clim` removes 2.4%
@@ -396,6 +418,17 @@ read as "exactly at climatology".
 
 **Only named regions have a rollup.** `/regionTimeseries` on an arbitrary box still
 aggregates live, and that is the only difference between the two endpoints.
+
+**`pacific` is the whole ingested box, as a region.** It exists so the basin-wide numbers
+the header ribbon reports are a rollup read rather than a scan, and adding it there rather
+than writing a second aggregation path means `region_daily`, `region_clim`,
+`/region/{key}`, the monthly ranking, the region box on the map and the CSV export all
+serve it with no new code. Its bounds repeat `subset`'s rather than referencing them:
+a region that silently tracked a widened box would change what every stored row means
+without changing its key, so widening is a deliberate two-line edit plus a rebuild of this
+one region. The one cost is that rebuild — 113.8 B rows for this key alone, **measured at
+6 minutes** against seconds for any of the named boxes. A single date, which is what `run`
+appends, is **2.2 s across all nine regions**.
 
 **`ingest_status`** / **`mhw_status`** — `ReplacingMergeTree(updated_at) ORDER BY date`, one
 row per day, one table per archive. Two tables rather than one with a `product` column
@@ -519,6 +552,7 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `GET /health` | liveness + ClickHouse reachability |
 | `GET /domain` | grid extent, image bounds, variable metadata, per-variable colour stops and `encoding` (mix, ranges, `limits`), `noClimColor`, region list |
 | `GET /coverage` | ingested date range, row count, climatology completeness, MHW archive range and completeness |
+| `GET /state` | the header ribbon's two findings: ENSO phase from Nino 3.4, and basin marine-heatwave extent against the date's normal |
 | `GET /variables` | variable list, with `derived` on `anom` |
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
@@ -537,15 +571,61 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
   week*), keeps every period on the same 1..5 scale so one legend serves all three, and
   keeps the invariant the whole period mechanism exists for: a chart point and the map
   frame carrying the same date agree.
-- **A box takes the MEAN of daily area means.** Over a box the daily value is already a
-  cos(lat)-weighted area mean — continuous, and no longer a category — so there is nothing
-  ordinal left for a max to preserve, and a max of daily area means would be a spike
-  detector for each week's worst day.
+- **A box reports EXTENT, and buckets it by the MEAN of daily extents.** A box's `mhw` is
+  the share of its ocean area at category >= 1 (`mhw_extent`, in percent) rather than a
+  category at all — see `region_daily` above for why the mean category it used to report
+  was unreadable. Being continuous, there is nothing ordinal left for a max to preserve,
+  and a max of daily extents would be a spike detector for each week's worst day.
 - **The monthly rankings take the MEAN**, and the point one is the place `mhw` is
-  deliberately averaged at a cell. They rank years against each other, and a max would put
+  deliberately averaged at a cell (a region's ranks its daily extents, which were never a
+  category). They rank years against each other, and a max would put
   most of the archive on Cat 1 and rank nothing; the mean daily category over a month is a
   severity-days index that separates one bad week from a whole month at Cat 1. The region
   ranking is a mean of daily area means, which was never a category to begin with.
+
+#### `/state`, and the two things a point series now carries
+
+**`/state` is the only endpoint that decides what is worth saying rather than serving what
+was asked for.** Everything else answers a question the visitor has already framed — this
+cell, that region, this date — and none of it says whether anything is happening out there.
+It reports two findings and nothing else, because the archive supports exactly two that
+need no context to read:
+
+- **ENSO phase**, from Nino 3.4. **This is ONI-*style*, not the ONI, and the payload says
+  so** (`official: false`, `baseline`). NOAA's index uses a base period that shifts every
+  five years; this archive has one fixed 1991–2020 climatology, so the value here runs
+  warm relative to the official one and the two will not agree to the tenth. Everything
+  else is NOAA's: overlapping three-month seasons, the ±0.5 °C threshold, the five
+  consecutive seasons that separate an **episode** from **conditions** (the ribbon's
+  wording turns on it), and the strength bands. Seasons are built from **complete calendar
+  months only** — the month in progress would drag a running mean that is meant to be three
+  whole months — and it is reported separately as `latestMonth`, flagged partial, with its
+  rank among the same calendar month in every other year.
+- **Marine heatwave extent**, from the `pacific` rollup, against the 1991–2020 mean for
+  that day-of-year over a ±7-day window. The comparison is the finding, not the number:
+  47% means nothing alone and a great deal beside a late-August normal of 15%.
+
+Both halves are rollup reads — a few thousand rows, milliseconds. Not instrumented
+server-side: it is page-load plumbing like `/domain` and `/coverage`. The ribbon's *clicks*
+are tracked in the frontend, because those are choices.
+
+**A point `sst` series carries its climatology** (`climatology`, `climatologyBaseline`) so
+the chart can draw the normal the temperature is departing from — an absolute SST is close
+to unreadable without it, and this is what lets the SST view answer "compared to what"
+without switching variables. **LEFT JOIN, not INNER**, which is the whole difference from
+the `anom` branch: 3.2% of the box's ocean has SST and no climatology, and an inner join
+would silently drop the ice fringe's dates from the SST series itself. A bucket missing any
+day's climatology reports `null` rather than averaging the days that have one, which would
+make a bucket's normal cover a different set of days than its value.
+
+**A point `mhw` series carries its heatwave runs** (`events`). A category answers "how bad
+is it today" and the reader's next question is always "how long has this been going on",
+which the daily line answers only by being counted along by eye and which a weekly line has
+already destroyed by taking a max over seven days. So `mhw_events()` is **its own daily
+read**, never a fold of the buckets. **A gap in the archive breaks a run, deliberately**:
+consecutive means consecutive *dates*, and `mhw_daily` is sparse, so the day after a
+heatwave day is absent whether it was calm or never ingested — stitching across it would
+invent duration out of a missing file.
 
 **`period` — `daily` (default) / `weekly` / `monthly`** — buckets are defined once in
 `shared/periods.py`: weeks start on **Monday** (`toMonday`), months are calendar months, and
@@ -739,6 +819,7 @@ same stack as the ocean-acidification dashboard.
 
 ```
 app/app.vue                        header + coverage badge; awaits store.loadMetadata()
+app/components/StateRibbon.vue     the basin's state in one line, under the header
 app/pages/index.vue                numbers + ranks dock on the left, map over the chart
 app/components/AnomalyMap.vue      MapboxGL + the field image source
 app/components/TimeControl.vue     variable + period toggles, date stepper, playback
@@ -750,6 +831,7 @@ app/components/MonthlyRankPanel.vue  the map's month, every year ranked (under t
 app/components/SideDock.vue        resizable left-hand dock (drag handle, remembered width)
 app/composables/useApi.ts          axios wrapper
 app/composables/usePlayback.ts     play/stop loop + frame prefetch for the map animation
+app/composables/useUrlState.ts     query params <-> store, so a view can be linked
 app/utils/periods.ts               daily/weekly/monthly bucket maths (mirrors the API)
 app/utils/ranking.ts               ranking layout + both ECharts options (pure -> testable headlessly)
 app/utils/colorScale.ts            domain.yml's colour stops evaluated at a single value
@@ -757,6 +839,56 @@ app/utils/csv.ts                   CSV export of the plotted series and the rank
 app/app.config.ts                  maps Nuxt UI's internal icons onto mdi
 app/stores/main.ts                 Pinia store
 ```
+
+#### The state ribbon, and what the series getters are for
+
+**`StateRibbon.vue` is the answer to the question a visitor arrives with**, before they have
+touched a control: the ENSO phase and how much of the Pacific is in a heatwave, in one
+sentence each. It sits under the header rather than in the dock because it describes the
+whole basin and must not move when the selection does. Both halves are buttons, and each
+sets the **variable as well as the region** — reading "El Niño" and landing on a
+marine-heatwave chart of Nino 3.4 would be a non-sequitur. `mhw` is still gated on
+`variableReady`: a rollup existing is not proof the archive is complete.
+
+Its caveats live in an on-demand popover, not in the sentences. The one that must not be
+left unsaid is that the index is not NOAA's ONI, and that is what the popover leads with.
+
+**`store.series*` are a second set of getters beside `store.active*`, and they must stay
+separate.** The `active*` pair describes the **map**, which in region scope still draws
+NOAA's five categories — so its legend stays categorical and in category colours while the
+chart beside it plots a percentage. The two genuinely disagree, and one getter serving both
+is exactly how the legend ends up labelling the chart. `seriesStops`, `seriesIsCategorical`,
+`seriesUnitLabel`, `seriesPrecision` and `seriesLabel` all resolve through
+`activeQuantity` — read off the series the API returned, never derived from `scope` and
+`variable`, so the formatting can never describe a series that is no longer on screen.
+
+**Anything rendered under SSR must pin its locale.** `toLocaleDateString`/`toLocaleString`
+with `undefined` uses Node's container locale on the server and the visitor's in the
+browser, which is a hydration mismatch and nothing else — three of them, found by driving
+Chromium. `utils/periods.ts` already pinned `'en-GB'`; the ribbon and `StatsPanel` now do too.
+
+#### Linkable views
+
+**`useUrlState()` keeps the address bar saying what is on screen** — `?v=anom&p=weekly&d=2026-08-24&at=47.98,-127.98`,
+or `&r=nino34` in region scope. A dashboard whose every view lives at one address cannot be
+sent to anyone, and "look at the Blob in September 2015" is four gestures to describe and
+one link to send.
+
+Three things about it:
+
+- **Client-only, from `onMounted`, deliberately after `loadMetadata()`.** Applying the
+  query during SSR would issue the selection fetches inside the render, and `useApi()` only
+  survives the *synchronous* part of an SSR call chain — the trap `loadRegionSeries`'s
+  `api` parameter exists for. Running after costs at most one extra request (the opening
+  cell the bootstrap already fetched) and cannot strand the page.
+- **`replaceState`, never `push`.** Every one of these is a change of view, not of page;
+  pushing would make Back step through a hundred playback frames instead of leaving.
+- **Variable and period are `$patch`ed, not set through their actions.** Each action fires
+  its own refetch of a selection about to be replaced anyway — three requests for one link
+  — and each reports an analytics event. Arriving on a link is not the same gesture as
+  pressing a toggle, so a deep link looks like a page view rather than like the visitor
+  having changed the variable. The URL writes the resolved **cell**, not the raw click, so
+  a link reopens on the same grid cell.
 
 #### Downloading what is plotted
 
@@ -777,6 +909,11 @@ and `stats.ts` are pure.
   screen, which is not a limit a file has, and a `month` column is what makes the table
   filterable. `partial` is carried as a boolean: it is the difference between a settled rank
   and one that will move.
+
+**Both name the quantity, not the variable, where they differ.** A region's heatwave file
+is `mhw_extent_monthly_whole-pacific_....csv` with a `mhw_extent_pct` column, because a
+file headed `mhw` reads back as a category — and a folder holding both would look like two
+comparable files that are not.
 
 Filenames carry everything that decides what the numbers are —
 `anom_weekly_nino-3-4_1984-12-31_2026-08-24.csv`,
@@ -1168,7 +1305,9 @@ guards at the call sites.
 Events, all fired from the store or the component that owns the gesture rather than from
 each call site: `point_selected`, `region_selected` (with `enteredScope`), `scope_changed`,
 `variable_changed`, `period_changed`, `playback_started`, `color_range_changed`,
-`csv_downloaded` (`kind: series | ranking`), `ranking_guide_opened`, `about_opened`. Server-side:
+`csv_downloaded` (`kind: series | ranking`, plus `quantity`), `ranking_guide_opened`,
+`about_opened`, `state_ribbon_clicked` (`half: enso | heatwave`), `state_guide_opened`.
+Server-side:
 `point_queried` (including the out-of-domain 400 — where people click outside the box is
 the argument for widening it, which costs only a `domain.yml` edit), `point_ranking_queried`,
 `region_queried`, `region_box_queried`, `region_ranking_queried`.
@@ -1253,6 +1392,19 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   rounded rather than named, and its y-axis is not pinned to 0..5 — an archive that never
   leaves 0..1.5 drawn against five classes is a flat line on the axis floor.
 
+- **A region's `mhw` is a percentage, a point's is a category, and the response says
+  which.** Read `quantity` (`mhw_extent` or null), never `scope`. Two code paths serve it
+  and **both** must apply `_MHW_EXTENT_SCALE` — the series (`_region_daily_rows`) and the
+  ranking (`_region_ranking_source`); scaling only one leaves the ranking in hundredths
+  beside a chart drawn in percent, which is a plausible-looking number rather than an error.
+- **Anything a Vue component renders under SSR must pin its locale.** `toLocaleDateString`
+  or `toLocaleString` with `undefined` formats against Node's container locale on the
+  server and the visitor's in the browser: a silent hydration mismatch, visible only as a
+  console warning. Pin `'en-GB'`, as `utils/periods.ts` does.
+- **Adding a region to `domain.yml` after `init` leaves it with no `region_clim`**, so its
+  `anom` series comes back empty with nothing to say why. `CRW.cli rollup --clim` rebuilds
+  that side out of `sst_clim` in seconds — it does not touch the 366 NetCDF files, which is
+  what makes it cheap enough to redo on demand.
 - **Nuxt UI's own icons default to the `lucide` collection**, and only `@iconify-json/mdi`
   is installed. A component reaching for one of its internal icons (`UModal`'s close button
   is the first that does) logs `Collection lucide is not found locally` and renders nothing.
@@ -1387,9 +1539,29 @@ nothing left the machine):
   no console errors, map and panels unchanged.
 
 
-Not built yet: the full-archive backfill and render pass for **both** products (in
-progress — MHW ingest runs at ~2.9 days/s, so ~90 min for the archive), the region-query
-benchmark that decides whether `region_daily` is needed, a cron entry for `run`, tests.
+Verified on the state ribbon, the extent quantity, deep links and the point context cards:
 
-**Until the MHW backfill finishes, `/coverage` reports `mhw.complete: false` and the
-frontend's MHW toggle stays disabled** — deliberately, see the sparse-table note above.
+- **The rollup is exact.** `region_daily.mhw_area_frac` for the `pacific` box reproduces a
+  direct `sum(cos)/sum(cos)` over `mhw_daily` to the second decimal on every spot-checked
+  day (46.95 / 46.82 for 24 and 30 Aug 2026), and its archive maximum, 62.4%, matches the
+  direct scan exactly. Rebuild: 6 min for `pacific`, ~9 min for all nine regions.
+  One date across all nine — what `run` appends daily — is **2.2 s**.
+- **`/state` reads what the panels read.** Its ENSO half puts August 2026 at +2.74 °C,
+  rank 1 of 42 Augusts, which is the number `/region/nino34/monthlyRanking` returns; its
+  heatwave half reports 46.8% against a 14.9% late-August normal, 27th highest of 15,217
+  days. The season label was off by one month before it was checked against the underlying
+  monthly means — every value it produced was still a real season name, just the
+  neighbouring one, which is exactly the class of error that survives a glance.
+- **The normal band is consistent with the anomaly.** At 48.03°N 127.98°W the SST series'
+  16.66 minus its climatology's 16.49 is 0.17, which is what `variable=anom` returns for
+  the same bucket.
+- **Heatwave runs are right about a known event.** The NE Pacific cell's longest run is
+  2014-12-09 to 2015-05-02, 145 days — the Blob, which is what that cell should say.
+- **Browser** (Chromium, per the recipe below): the ribbon renders under SSR and after
+  hydration with **no console errors**; both halves select what their sentence is about;
+  a deep link reopens on the same cell, variable, period and date, and the URL it writes
+  round-trips; the region MHW view reads "45.6% · 2nd most widespread of 500 months ·
+  trend +6.12% per decade" while the map legend beside it stays NOAA's five categories;
+  both CSVs export as `mhw_extent_*` with a `mhw_extent_pct` column.
+
+Not built yet: a cron entry for `run`, tests.

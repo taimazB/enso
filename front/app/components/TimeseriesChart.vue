@@ -78,7 +78,14 @@ const props = defineProps<{
    * cannot occur.
    */
   categorical?: boolean
+  /**
+   * What the plotted line is called, for the tooltip and for the legend the
+   * normal line adds. Only visible where there are two lines to tell apart.
+   */
+  label?: string
 }>()
+
+const seriesName = computed(() => props.label ?? 'Value')
 
 const emit = defineEmits<{ select: [date: string] }>()
 
@@ -232,9 +239,53 @@ function formatValue(value: unknown): string {
   return n === 0 ? '0 (no heatwave)' : `${n}${label ? ` (${label})` : ''}`
 }
 
+/**
+ * The 1991-2020 normal, as a second faint line under the first.
+ *
+ * Only where the API sent one, which is a point `sst` series. An absolute
+ * temperature is close to unreadable on its own — 16.7 °C is warm or cold
+ * depending entirely on where and when — and this is what lets the SST view
+ * answer "compared to what" without switching to the anomaly. `anom` needs none
+ * (it IS the departure, and has its zero line), and a category has no normal.
+ *
+ * Deliberately not a shaded band between the two lines. The gap is signed, and a
+ * single-colour fill would read the same whether the water is 2 °C warm or 2 °C
+ * cold — the very distinction the dashboard exists to show, and which the line's
+ * own colour already carries.
+ */
+const normals = computed(() => props.series?.climatology ?? null)
+
+function normalSeries(): echarts.SeriesOption[] {
+  const clim = normals.value
+  if (!clim?.some(v => v != null)) return []
+  return [{
+    type: 'line',
+    name: normalName.value,
+    data: (props.series?.dates ?? []).map((date, i) => [date, clim[i] ?? null]),
+    showSymbol: false,
+    large: true,
+    // Never coloured by the visualMap — it is pinned to `seriesIndex: 0` — so
+    // this keeps one flat muted colour and reads as the reference it is rather
+    // than as a second measurement.
+    lineStyle: { width: 1, type: 'dashed', color: 'rgba(148, 163, 184, 0.65)' },
+    // The legend swatch and the tooltip marker come from `itemStyle`, not from
+    // `lineStyle`: without this ECharts hands the series the next colour in its
+    // default palette, and the normal is marked in a green that appears nowhere
+    // on the plot — beside a data line whose own marker is a different green.
+    itemStyle: { color: 'rgba(148, 163, 184, 0.85)' },
+    // Behind the data line where they cross, which is most of the year.
+    z: 1,
+    silent: true,
+  }]
+}
+
+const normalName = computed(() =>
+  `${props.series?.climatologyBaseline ?? '1991-2020'} normal`)
+
 function option(): echarts.EChartsOption {
   const points = (props.series?.dates ?? []).map((date, i) => [date, props.series!.values[i]])
   const ramp = visualMap()
+  const normal = normalSeries()
   return {
     animation: false,
     grid: { top: 24, right: 16, bottom: 44, left: 52 },
@@ -283,9 +334,22 @@ function option(): echarts.EChartsOption {
       { type: 'slider', height: 18, bottom: 6, textStyle: { color: AXIS_LABEL } },
     ],
     visualMap: ramp,
+    // Only worth a legend when there are two lines to tell apart.
+    legend: normal.length
+      ? {
+          show: true,
+          top: 0,
+          right: 8,
+          itemWidth: 18,
+          itemHeight: 8,
+          textStyle: { color: AXIS_LABEL, fontSize: 10 },
+          data: [normalName.value],
+        }
+      : undefined,
     series: [
       {
         type: 'line',
+        name: seriesName.value,
         data: points,
         showSymbol: false,
         large: true,
@@ -295,7 +359,9 @@ function option(): echarts.EChartsOption {
         // scale.
         lineStyle: ramp ? { width: 1 } : { width: 1, color: '#38bdf8' },
         markLine: markLine(),
+        z: 2,
       },
+      ...normal,
     ],
   }
 }
