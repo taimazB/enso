@@ -4,7 +4,7 @@
 #
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 #
-# Four differences from docker-compose.dev.yml, all deliberate:
+# Five differences from docker-compose.dev.yml, all deliberate:
 #
 #   1. No source bind mounts. The images carry api/, process/ and shared/ as
 #      built, so a deploy is `--build`, not a file copy. `./shared` is NOT
@@ -27,6 +27,9 @@
 #      That is also the shape a cron entry wants. Add `--no-deps` for `render`,
 #      which reads NetCDF off disk and touches neither ClickHouse nor the
 #      network; `backfill`, `rollup` and `run` all need db-ch up.
+#   5. A `maintenance` service, also behind a profile, which takes over front's
+#      and api's published ports while they are stopped. See its own comment
+#      below for why a migration needs the site down rather than merely slow.
 #
 # One deploy prerequisite compose will not tell you about: create DATA_DIR,
 # CH_DATA_DIR and CH_LOG_DIR on the host and chown them to UID:GID FIRST.
@@ -163,6 +166,49 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
+
+  # Stands in for `front` and `api` while the pipeline does something that makes
+  # the live site wrong rather than merely slow — `CRW.cli repartition` is the
+  # case it was added for. It binds the SAME published ports as those two, so it
+  # can only start once they are stopped, and the host's TLS proxy keeps getting
+  # an answer instead of a refused connection.
+  #
+  # Why the site has to come down at all, since it is not obvious: a migration
+  # moves whole partitions out of `sst_daily`/`mhw_daily` before it puts them
+  # back. Neither `/coverage` nor the frontend's `mhw.complete` gate can see
+  # that — those read `ingest_status`/`mhw_status`, which the migration does not
+  # touch — so the dashboard stays up and confidently reports category 0 for
+  # every year currently in flight. Wrong and plausible beats down, every time.
+  #
+  #   docker compose -f docker-compose.prod.yml --env-file .env.prod stop front api
+  #   docker compose -f docker-compose.prod.yml --env-file .env.prod \
+  #     --profile maintenance up -d maintenance
+  #   ... run the migration ...
+  #   docker compose -f docker-compose.prod.yml --env-file .env.prod \
+  #     --profile maintenance down maintenance
+  #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+  #
+  # The bind mounts are the one place this file allows them, and they are not the
+  # thing rule 1 above forbids: a static page and an nginx conf are not code that
+  # `api`/`process`/`shared` can drift away from, and baking them into an image
+  # would mean a rebuild to fix a typo in a page you only see when everything
+  # else is off.
+  maintenance:
+    image: nginx:alpine
+    profiles: ["maintenance"]
+    ports:
+      - "${FRONT_PORT:-3000}:3000"
+      - "${API_PORT:-4000}:4000"
+    volumes:
+      # Directories, not the two files individually. A bind mount of a single
+      # file pins an inode, and every editor writes-then-renames — so editing
+      # the page on the host leaves the running container serving the old one,
+      # with nothing to say so. Mounting the parent directory tracks the change.
+      # (It still needs a `up -d --force-recreate maintenance` for the conf, or
+      # `nginx -s reload`; only the served HTML picks up on its own.)
+      - ./deploy/maintenance/conf:/etc/nginx/conf.d:ro
+      - ./deploy/maintenance/html:/usr/share/nginx/html:ro
     restart: unless-stopped
 
   process:

@@ -65,6 +65,49 @@ Downloads, ingests and renders every day from the last ingested through yesterda
 re-checks the recent tail for files CoralTemp has revised in place. Safe to run from cron;
 a date that is not published yet is a no-op, not a failure.
 
+### Repartitioning (one-off)
+
+Both daily tables partition **by decade, and by year from 2024 on** — not by year
+throughout. `ORDER BY (gy, gx, date)` already makes one cell's whole history a contiguous
+key range, and a partition key cuts that range into a piece per partition. The cost is not
+bytes (a point query reads ~8.5 MiB either way) but **file opens**, ~4 per selected part,
+and a file open is ~50 us on NVMe against ~4.3 ms on a spinning disk.
+
+Measured on the production box, one cold cell over the full archive: **196 parts, ~790 file
+opens, 3.4 s**. The new key takes that to 8 parts and ~32 opens, which the same arithmetic
+puts near 0.15 s — a prediction until the migration has actually run. A second query on the
+same cell is ~0.18 s either way, which is why this only ever showed up as *the first click
+is slow*.
+
+Editing the DDL does nothing to a database that already holds the archive
+(`ensure_schema()` is `CREATE TABLE IF NOT EXISTS`), so there is a migration. Start with the
+plan — it is read-only and free:
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.prod \
+  run --rm --no-deps process python -m CRW.cli repartition --dry-run
+```
+
+Three things to know before running it for real:
+
+- **Take the site down first.** The migration moves partitions out of the daily tables
+  before putting them back, and nothing the frontend reads can see that — `/coverage`'s
+  `mhw.complete` gate is computed from the status tables, which the migration never
+  touches. So the dashboard stays up and reports a confident **category 0** for every year
+  currently in flight. `docker-compose.prod.yml` carries a `maintenance` profile for this:
+  a stock nginx that takes over `front`'s and `api`'s ports and answers **503** — never 200,
+  which crawlers index and uptime monitors read as healthy.
+- **Forward only.** Source partitions are dropped as each one lands, so the run resumes at
+  any partition boundary but cannot be abandoned half-way.
+- **Run it detached** — `run -d --name ...`, then `docker logs -f`. A `docker compose run`
+  container outlives the client that started it, so closing a terminal does not stop the
+  migration; starting a second one gives two concurrent runs, which silently duplicate rows
+  that every per-partition count still agrees with. Guarded, but not worth meeting.
+
+It never needs room for a second copy of the table: it copies one partition and drops the
+source before taking the next, so occupancy stays flat with a one-partition bulge. Full
+runbook and rationale in [CLAUDE.md](CLAUDE.md).
+
 ### Scale
 
 | | |
@@ -84,6 +127,7 @@ front/       Nuxt 4 frontend (everything under front/app/)
 process/     CRW.cli download / ingest / render pipeline
 shared/      grid geometry, NetCDF reading, rendering, schema — mounted into api and process
 clickhouse/  local ClickHouse volumes and user config
+deploy/maintenance/  the 503 page and nginx conf the `maintenance` profile serves
 data/sst/          the daily SST NetCDF archive, pruned to a retention window (untracked)
 data/MHW/          the daily marine-heatwave archive, pruned the same way (untracked)
 data/climatology/  the 366-file 1991-2020 daily climatology, kept forever (untracked)

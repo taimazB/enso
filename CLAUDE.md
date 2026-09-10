@@ -43,7 +43,7 @@ api 4000) and can recreate dependent services on the wrong ports.
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ```
 `docker-compose.prod.yml` carries its own header comment explaining every divergence from
-the dev file; `.env.prod.example` is the template. The five that matter:
+the dev file; `.env.prod.example` is the template. The six that matter:
 
 - **`name: enso-prod`.** Both compose files would otherwise take the project name `enso`
   from the directory and clobber each other's containers, network and volumes.
@@ -63,6 +63,32 @@ the dev file; `.env.prod.example` is the template. The five that matter:
   here — the image's entrypoint writes `users.d/default-user.xml` itself, so a `:ro` mount
   stops the container starting, and the file it generates already grants `default` the
   `::/0` networks that dev's `allow_docker_network.xml` is there for.
+- **A `maintenance` service, behind its own profile**, which takes over `front`'s and
+  `api`'s published ports while those two are stopped — `deploy/maintenance/`, an
+  `nginx:alpine` and two files, no build. It answers **503**, never 200: a maintenance page
+  served as 200 is cached by intermediaries, indexed by crawlers, and recorded by uptime
+  monitors as a healthy site. The frontend's port gets a page; the API's port gets JSON in
+  the same shape `SERVER.py`'s errors use (`detail` a sentence, `error.code` machine
+  readable), so a client that parses one parses this. It exists because a migration makes
+  the live site **wrong rather than merely slow** — see `repartition` below.
+
+  Two details, both verified by driving it: the API port answers an `OPTIONS` preflight
+  **204 with the CORS headers**, because a tab left open on the dashboard sends
+  `POST /timeseries` with a JSON content type and a preflight answered 503 surfaces as a
+  CORS error, which says nothing about maintenance. And the volumes are **directories, not
+  the two files** — a bind mount of a single file pins an inode and every editor
+  writes-then-renames, so editing the page would leave the container serving the old one
+  with nothing to say so.
+
+  ```bash
+  docker compose -f docker-compose.prod.yml --env-file .env.prod stop front api
+  docker compose -f docker-compose.prod.yml --env-file .env.prod \
+    --profile maintenance up -d maintenance
+  # ... the migration ...
+  docker compose -f docker-compose.prod.yml --env-file .env.prod \
+    --profile maintenance down maintenance
+  docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+  ```
 - **`process` sits behind the `tools` profile**, so `up -d` starts three services and not a
   fourth idling on `sleep infinity`. Drive it the same way as dev, which is also the shape
   a cron entry wants:
@@ -753,6 +779,33 @@ it started with, so it is a finishing touch rather than the point.
 
 Do `mhw_daily` first: same code, a fortieth of the bytes, and it is the bigger share of the
 `mhw` variable's latency anyway, since that query pays both tables' part counts.
+
+**Take the site down while it runs, and the reason is not politeness.** A migration moves
+whole partitions out of the daily tables before it puts them back, and **nothing the
+frontend reads can see that**: `/coverage`'s `mhw.complete` gate is computed from
+`mhw_status`, not from `mhw_daily`'s contents, and the migration does not touch the status
+tables. So the dashboard stays up, keeps offering `mhw`, and the sparse table's LEFT JOIN
+reports a confident **category 0** for every year currently in flight — the exact failure
+`mhw.complete` exists to prevent, arriving by a route it cannot observe. `sst_daily` is the
+same shape without even the gate: migrated-away years simply go missing. Use the
+`maintenance` profile above.
+
+**Once started it has to finish.** Source partitions are dropped as they land, so there is
+no half-way rollback, only forward. Interruption is fine and expected — it resumes at a
+partition boundary — but abandonment leaves the archive split across two tables.
+
+**Skip `--optimize` on the first pass over `sst_daily`.** It re-reads and rewrites every
+partition again, 129 GB of extra HDD I/O, and background merges consolidate the decade
+partitions on their own as long as free space exceeds the largest one (~31 GiB against
+90 GB). Check `system.parts` afterwards and spend it only where something is still
+fragmented.
+
+**Run it detached** — `run -d --name ...`, then `docker logs -f`. A `docker compose run`
+container **outlives the client that started it**, so a terminal closing does not stop the
+migration; starting a second one then gives two concurrent runs, which is what
+`_assert_no_concurrent_run` and `finish()`'s total check are both there to catch. Found the
+hard way: it put 491 M duplicate rows into a single year, and every per-partition count
+still agreed, because each run verifies only the delta its own INSERT produced.
 
 #### Downloading, and revisions in place
 
