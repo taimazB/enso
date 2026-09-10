@@ -95,6 +95,9 @@ def cmd_init(args) -> int:
                 **counts
             )
         )
+        cells = regions_mod.build_region_cells(client)
+        for key, n in sorted(cells.items()):
+            print(f"region_cells: {key} -> {n:,} cell(s)")
         n = climatology.build_region_clim(client)
         print(f"region_clim: {n} rows")
     return 0
@@ -278,6 +281,31 @@ def cmd_render(args) -> int:
     return 0
 
 
+def cmd_mask(args) -> int:
+    """Rewrite `region_cells` for the polygon regions.
+
+    Separate from `rollup` — which calls it anyway — because it is the command a
+    CHANGED polygon needs, and the two costs are nothing alike: this is a
+    point-in-polygon pass over a bounding box, seconds, while the rollup it
+    invalidates is a scan of the daily tables. Running this alone tells you what
+    the new geometry covers before you spend the rollup on it.
+
+    It does NOT rebuild `region_daily` or `region_clim`, and both are stale the
+    moment the mask moves. Follow it with `rollup --clim --region <key> --fresh`.
+    """
+    ensure_schema()
+    with get_client() as client:
+        counts = regions_mod.build_region_cells(client, keys=args.region)
+    if not counts:
+        print("no polygon regions selected; every named region here is a plain box")
+        return 0
+    for key, n in sorted(counts.items()):
+        box = regions_mod.box_of(regions()[key])
+        area = (box[1] - box[0] + 1) * (box[3] - box[2] + 1)
+        print(f"  {key:<20} {n:>7,} cell(s) of {area:,} in its bounding box")
+    return 0
+
+
 def cmd_rollup(args) -> int:
     """Build `region_daily`, the per-region daily area means the API reads.
 
@@ -302,6 +330,12 @@ def cmd_rollup(args) -> int:
     """
     ensure_schema()
     with get_client() as client:
+        # Before either side. A polygon region's rollup is only the zone if the
+        # mask is current, and both sides intersect the same table — so this runs
+        # even without `--clim`, and re-running it is 26k rows.
+        cells = regions_mod.build_region_cells(client, keys=args.region)
+        for key, n in sorted(cells.items()):
+            print(f"region_cells: {key:<20} {n:>7,} cell(s)")
         if args.clim:
             # Read out of `sst_clim`, not off the 366 files, so this is seconds
             # rather than the 20 minutes `init` spends loading them. A region
@@ -556,6 +590,14 @@ def main(argv: list[str] | None = None) -> int:
         help="rebuild region_clim for the same regions first (needed for a newly added region)",
     )
     p_roll.set_defaults(func=cmd_rollup)
+
+    p_mask = sub.add_parser(
+        "mask",
+        help="rasterise polygon regions into region_cells (after a geometry change)",
+    )
+    p_mask.add_argument("--region", action="append", choices=sorted(regions()),
+                        help="repeatable; default every named region")
+    p_mask.set_defaults(func=cmd_mask)
 
     p_rend = with_selection(sub.add_parser("render", help="render images in bulk"))
     p_rend.add_argument("--period", action="append", choices=PERIODS,

@@ -87,6 +87,7 @@ python -m CRW.cli verify-clim                             # full-read all 366 cl
 python -m CRW.cli scan     [--limit N]                    # disk vs. already ingested, per archive
 python -m CRW.cli backfill [--start|--end] [--product sst|mhw] [--reverse] [--fresh] [--delete-nc]
 python -m CRW.cli render   [--start|--end] [--variable|--period] [--workers N] [--force]
+python -m CRW.cli mask     [--region KEY]                  # region_cells, for polygon regions
 python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh] [--clim]  # region_daily
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
@@ -224,6 +225,65 @@ product definition — it is the five names in the legend — so the rule surviv
 encodings and whatever NOAA ships next. The fill value is what changed; the categories are
 what did not.
 
+#### Two baselines, and they are not reconcilable
+
+**`anom` and `mhw` are measured against different climatologies, and nothing in
+either number says so.** This is the one thing about the dashboard a reader is
+most likely to get wrong, because the natural assumption — that a big anomaly is
+roughly a high category — is false and looks true.
+
+| | `anom` | `mhw` |
+|---|---|---|
+| years | **1991-2020** (30) | **1985-2012** (28) |
+| window | 1 day (`window-01day`) | **11 days**, centred on the day of year |
+| statistic | mean | mean **and 90th percentile** |
+| leap day | its own file, `day0229` (366 files) | excluded; derived as the mean of Feb 28 and Mar 1 (**365** files) |
+| computed | here, from `sst_clim` | by NOAA, before we see the file |
+
+The MHW climatology lives at `.../marine_heatwave/v1.0.1/climatology/nc/` as
+`noaa-crw_mhw_v1.0_climatology_{001..365}.nc`, carrying `sst_clim_mean` and
+`sst_clim_ninetieth_percentile_variable`. **Nothing in this repo downloads it** —
+`download.py` fetches only `category/nc/{YYYY}/` — and it should stay that way:
+we ingest the finished category, not a temperature, so the baseline is a fact
+about the incoming file rather than a choice.
+
+**Re-basing `anom` onto 1985-2012 to "match" would not work, and the numbers say
+why.** Cat 1 is `SST > P90`, an *exceedance*, and the P90-minus-mean departure it
+represents is a different number in every cell: measured over this box for day
+001, **+1.02 degC mean, +0.60 at p5, +1.62 at p95**. The two baselines' means
+differ by only **+0.104 degC** over the same cells (median +0.110, sd 0.116;
+1991-2020 is the warmer one). So the shift is ~10% of the spread that would have
+to close, and no anomaly value maps to a category under any baseline. Three
+further costs, if it is ever proposed again: 1991-2020 is the WMO normal the
+ONI-style index in `/state` needs; `has_clim` is a stored column in
+`sst_daily`, so the valid mask changing means a **full re-ingest**; and all
+~17.9 k cached `anom` frames encode the anomaly value, with only the retention
+window's NetCDF left on disk to re-render from.
+
+One real point in the other direction, recorded so it is not rediscovered as a
+bug: the MHW climatology covers **7,477,923 cells in this box against 1991-2020's
+7,261,562** (Jan 1) — every ocean cell, with sensible ice-fringe values around
+-1.2..-1.8 degC. Adopting it would retire the `NO_CLIM_RGBA` grey third state.
+It is also **south-up**, like the dailies, where the ct5km climatology is
+north-up.
+
+**The method is not NOAA's, and the UI says so.** NOAA Coral Reef Watch applies
+the algorithm and publishes the product; the definition and the five category
+names are **Hobday et al. 2016** (Prog. Oceanogr. 141, 227-238), **Hobday et al.
+2018** (Oceanography 31(2)) and **Oliver et al. 2018** (Nat. Commun. 9, 1324).
+Asked for by a user, and it is a real misattribution rather than a missing
+nicety.
+
+**Where this is said, and it is said once.** `domain.yml` declares a `baseline`
+block per variable — `period`, `statistic` (`mean` | `p90`), `window_days`,
+`label`, `computed_by` (`here` | `noaa`), `note`, `references` — validated by
+`shared/domain.py`'s `_check_baseline()` and shipped through `/domain`. The
+string used to be a constant in `api/modules/state.py`, another in
+`api/modules/timeseries.py`, and a literal in `ranking.ts`, `AboutDialog.vue`
+and `app.vue`; all five now read the declaration. `statistic` is the
+load-bearing field: it picks the preposition, so a `p90` baseline is phrased as
+something the value **exceeds** rather than something it departs from.
+
 **The climatology is a second archive**: 366 files in `./data/climatology/`, mounted at
 `/opt/data/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
 mapping rule to invent. Baseline 1991–2020. 1.6 GB, static, and **kept forever**: image
@@ -275,6 +335,34 @@ entirely plausible when wrong, which is why `check_orientation()` raises rather 
 Widening it needs no re-ingest: `gy`/`gx` index the *global* grid, so only `domain.yml`'s
 `subset` block changes.
 
+#### One named region is a polygon, not a box
+
+Every named region is a lat/lon rectangle except **`bc_eez`**, which declares a
+`polygon:` and no bounds — `shared/domain.py` derives its box from the ring, so a
+hand-written box cannot go stale behind a changed geometry, and `shared/mask.py` cuts that
+box down to the 26,158 cells actually in the zone. See `region_cells` below for the cost
+of not doing this, and `shared/mask.py` for how a cell is decided.
+
+**Provenance matters here in a way it does not for a Niño box.** A Niño index box is a
+convention anyone can write down; a maritime limit is a legal instrument, and Canada and
+the United States do not agree about two pieces of this one — the Dixon Entrance A–B line
+in the north and the wedge off Juan de Fuca in the south. The geometry is the **Flanders
+Marine Institute's (VLIZ) Marine Regions v12** `Canadian Exclusive Economic Zone`
+(mrgid 8493), Pacific component only, and the file records its own source, retrieval date
+and simplification. That is the widely cited marine-science rendering and **not** the
+Canadian authority. **DFO's Open Maps does not publish the limit as a standalone vector**:
+its catalogue carries only products *clipped* to the zone, and the `DFO Regions 2021`
+"Pacific" polygon is land — checked by point-in-polygon, the Strait of Georgia and
+everything offshore fall outside it. A cross-check that the footprint is right anyway:
+this ring's bounding box (`−138.795…−122.836`, `46.568…56.012`) matches the extent DFO's
+own BC-EEZ raster climatologies are published on to three decimals.
+
+Two things about the stored file. It carries **outer rings only** — the 2,588 interior
+rings are islands, and land is cut by `sst_daily` holding ocean cells, not by the
+geometry, which also keeps the outline clean on the map. And it is **Douglas–Peucker
+simplified at 0.002°**, a twenty-fifth of a grid cell: measured, that moves **21 of 26,155
+cells** against the unsimplified ring, and takes 37,875 vertices to 6,001 (120 KB).
+
 #### The third state: ocean with no anomaly
 
 About **3.2% of the box's ocean has SST but no climatology** — the seasonal ice fringe,
@@ -289,7 +377,7 @@ Transparent would read as land; any scale colour would read as a real near-zero 
 
 ### `shared/` — the contract between `api` and `process`
 
-Both containers mount `./shared` at `/app/shared`. Six modules:
+Both containers mount `./shared` at `/app/shared`. Seven modules:
 
 - **`domain.py` + `domain.yml`** — grid geometry, variable metadata, named region boxes.
   Describes **two** grids and the distinction matters: `global` is the full 7200×3600
@@ -301,6 +389,18 @@ Both containers mount `./shared` at `/app/shared`. Six modules:
   There is one — `mhw_extent`, what `mhw` means over a region — and every timeseries
   response names its quantity in `quantity` (null at a point) so no client infers it
   from the scope.
+- **`mask.py` + `regions/*.geojson`** — the one region that is **not a box**. A region is
+  normally a lat/lon rectangle; the BC EEZ is a 200-nautical-mile arc closed by two
+  negotiated lateral boundaries, and its bounding box is 60,990 cells against the zone's
+  26,158 — so 57% of what a box query would average is Alaskan, American or high-seas
+  water. The box survives as the **prefilter** (`ORDER BY (gy, gx, date)` makes it
+  contiguous key ranges) and this rasterises the polygon into `region_cells`, which the
+  two rollup builders intersect it with. **A cell is in the region when its centre is
+  inside the ring** — no partial weighting, because a fractional-coverage weight would be
+  a second, subtler definition of "in the region" that `n_cells` could not describe.
+  Nothing here decides what is *ocean*: the mask is pure geometry and includes the land
+  inside the zone, which `sst_daily` then excludes — which is also why the stored polygon
+  carries no interior rings for the islands.
 - **`fields.py`** — NetCDF reading, and the single home of both orientation rules above.
 - **`render.py`** — field array → Web-Mercator WebP. **Takes arrays, never a DB client.**
 - **`periods.py`** — daily/weekly/monthly buckets, shared by query and render.
@@ -361,6 +461,36 @@ consequences, both load-bearing:
    reached, not a gap — so `/coverage` carries `mhw.complete` and the frontend refuses to
    offer the variable until it is true. This is the same shape as `climatology.complete`
    gating `anom`, but sharper: there is no value that could signal the difference.
+
+**`region_cells`** — which grid cells a **polygon** region covers: one row per (region,
+cell), and rows only for the `domain.yml` regions that declare a `polygon`. **26,158 rows
+today**, all of them the BC EEZ.
+
+A plain box needs none — its `BETWEEN` says everything there is to say about which cells
+it holds. A maritime zone is not a rectangle: the BC EEZ's bounding box is 60,990 cells
+against the zone's 26,158, so **57% of what a box query would average is Alaskan, American
+or high-seas water**. Measured on 2021-06-28, the heat dome: the zone's SST mean is
+13.98 °C against the box's 13.66, and its anomaly +1.58 against +1.46 — the box dilutes
+the thing the region exists to show.
+
+**Materialised rather than evaluated.** Point-in-polygon over 60,990 cells is
+milliseconds, but it would sit inside the rollup's 113-billion-row scan and be re-decided
+on every pass. Written once by `CRW.cli mask`, read thereafter as a set membership —
+`AND (gy, gx) IN (SELECT gy, gx FROM region_cells WHERE region = ...)`, appended after the
+`gy`/`gx` BETWEEN that still does the primary-key work.
+
+**It is applied by `process`, never by `api`.** A named region is served entirely from
+`region_daily` and `region_clim`, so the mask reaches the API only in the numbers those
+tables already hold. Nothing in `api/` reads this table, and nothing should: adding a live
+masked path would be a second definition of what the region covers.
+
+**Both sides or neither.** `regions.mask_filter()` is appended to the SST half *and* the
+MHW half of the daily rollup, and to `region_clim`'s query. Masking one only would divide
+a zone numerator by a bounding-box denominator, or put the zone's anomaly against the
+box's climatology — the `mean(sst - clim) == mean(sst) - mean(clim)` identity needs both
+sides averaging the same cells. Verified: `/region/bc_eez?variable=anom` for 2021-06-28
+returns **1.578** against a direct cell-wise `avg(sst - clim)` over the polygon of
+**1.5785**, on the same 23,814 cells.
 
 **`region_clim`** — 8 regions × 366 MMDD = **2,928 rows**. The climatology side of a
 region anomaly.
@@ -557,8 +687,9 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `POST /timeseries` | `{lat, lon, start?, end?, period?, variable?}` → record at the nearest cell |
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region, using `region_clim` |
-| `POST /monthlyRanking` | every calendar month at a cell, ranked within its month-of-year |
-| `GET /region/{key}/monthlyRanking` | the same ranking over a named region, from `region_daily` |
+| `GET /region/{key}/geometry` | a polygon region's outline as GeoJSON; 404 for a plain box |
+| `POST /monthlyRanking` | every calendar month at a cell ranked within its month-of-year, plus every year ranked against every other (`annual`) |
+| `GET /region/{key}/monthlyRanking` | the same two rankings over a named region, from `region_daily` |
 | `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
 
 **`variable` — `sst` (default) / `anom` / `mhw`** — is accepted by every endpoint above.
@@ -642,15 +773,28 @@ plain-string `detail` and a structured `error` object** (`code: "outside_domain"
 working; `error.code` is what lets the frontend show this as an informational empty state
 rather than a red failure.
 
-**The monthly rankings are always monthly, whatever the caller's `period`**, and they rank
-`anom` by default because ranking years by absolute SST is a different question. Every
-month is ranked including the archive's truncated edge months, which carry `partial: true`
-— the month in progress is the one people most want to look at, so it is starred rather
-than hidden. A month missing an *interior* day is **not** partial: it is as complete as it
-will ever be.
+**The rankings never follow the caller's `period`**, and they rank `anom` by default
+because ranking years by absolute SST is a different question. Every period is ranked
+including the archive's truncated edges, which carry `partial: true` — the month or year in
+progress is the one people most want to look at, so it is starred rather than hidden. A
+month missing an *interior* day is **not** partial: it is as complete as it will ever be.
+
+**Each response carries two rankings, not one: `months` and `annual`.** The panel's heading
+read as the whole year when it was one calendar month — "2015 was the warmest" when what it
+said was "the warmest August" — so ranking whole calendar years is now the other half of the
+same answer rather than a thing that cannot be asked. **A year's mean is the mean of its
+days, never of its twelve monthly means**: the months are not the same length, so averaging
+averages would weight February like July.
+
+**Both groupings come off one scan**, via `GROUP BY GROUPING SETS ((month, year), (year))`.
+The annual set arrives with `month = 0`, which is also the window function's partition — so
+the years are ranked against each other by exactly the same expression that ranks the
+Augusts against each other, and there is still one definition of "the ranking". Two queries
+would have been two definitions of it again. `_ranked_periods()` splits `month = 0` out
+into `annual` on the way to the response, so no client has to know about the sentinel.
 
 **There are two of them — a cell and a named region — and the ranking itself is defined
-once.** `_ranked_months()` takes any subquery yielding `(date, value)` and does the
+once.** `_ranked_periods()` takes any subquery yielding `(date, value)` and does the
 grouping, the `stddevSamp` and the `row_number()`; only the series underneath differs, so
 the two cannot drift into meaning different things. A cell's series is the ~15k-row
 primary-key read the point timeseries makes; a **named region's is `region_daily`**, folded
@@ -824,6 +968,7 @@ app/pages/index.vue                numbers + ranks dock on the left, map over th
 app/components/AnomalyMap.vue      MapboxGL + the field image source
 app/components/TimeControl.vue     variable + period toggles, date stepper, playback
 app/components/ColorLegend.vue     gradient + the colour range control (popover)
+app/components/BaselineNote.vue    what the chart's values are measured against (+ popover)
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/ScopeControl.vue    point / named-region switch, over the map
 app/components/StatsPanel.vue      the dock's headline value and stat cards
@@ -966,9 +1111,25 @@ measurement:
   the bottom, and the map saturates it the same way. The ranking's copy follows too:
   rank 1 is "most severe", not "warmest".
 
-The monthly ranking **refetches on a variable change** but not on a period change: ranking
+The ranking **refetches on a variable change** but not on a period change: ranking
 years by absolute SST is a different question from ranking by anomaly, whereas the ranking
 is period-independent by construction.
+
+**`MonthlyRankPanel`'s `Month | Year` toggle refetches nothing.** Both groupings arrive in
+the one payload, so the toggle picks which array to draw — no loading state, no guard
+against a stale response, and switching back and forth costs nothing. It is the one choice
+this panel owns; the *month* is still the map's, since a month picker here would be a
+second date control disagreeing with the time bar. Three things follow the basis rather
+than being written twice: the heading (the month's name, or nothing beside a selected
+`Year`), `partialNote`'s denominator (`periodDays()` — 242 of 365, not of 31), and the
+reading guide's nouns. **Clicking a row on the `Year` basis moves only the year**, keeping
+the map's month: a year has no one date to land on, and jumping to 1 January would make two
+clicked years incomparable on the map, which is the comparison the click is being made to
+see. The CSV follows too — `anom_annual-ranks_nino-3-4.csv`, one row per year and no
+`month` column, because a 0 there would read back as a thirteenth month. **`AboutDialog`'s
+"Compare years" step names both bases and carries the toggle as a replica**, like every
+other step there: the guide is the only place the panel is explained before it is clicked,
+and a control it does not mention is one nobody looks for.
 
 #### The colour range control
 
@@ -1213,6 +1374,18 @@ chords bowing off it.
 plainly on screen. This is the same lesson as `preserveDrawingBuffer: false`: take a
 screenshot and look at it.
 
+**A polygon region draws its real outline, fetched on demand.** `/domain` carries
+`masked` per region and the ring itself lives at `/region/{key}/geometry` — 120 KB against
+~2 KB for the whole domain payload, and most sessions never select it — so `AnomalyMap`
+fetches it once, keeps it in a module-level `Map`, and guards the response against the
+selection having moved while it was in flight. **Nothing is drawn until it arrives**:
+showing the bounding box first and swapping it for the zone a moment later reads as a bug,
+and for the BC EEZ the box is 2.3× the zone's area, so it would be claiming the numbers
+cover water they do not. If the fetch fails, the region draws no box at all rather than a
+rectangle that misstates it — the numbers beside it are unaffected, since they come off a
+rollup built from the mask. `frameRegion()` still flies to the **bounding box**, which is
+what a camera wants.
+
 **Only one box is ever drawn, and only in region scope.** The box is the visual half of what
 the numbers panel is reading, so the two are one selection seen twice rather than a layer
 with a toggle of its own.
@@ -1305,7 +1478,9 @@ guards at the call sites.
 Events, all fired from the store or the component that owns the gesture rather than from
 each call site: `point_selected`, `region_selected` (with `enteredScope`), `scope_changed`,
 `variable_changed`, `period_changed`, `playback_started`, `color_range_changed`,
-`csv_downloaded` (`kind: series | ranking`, plus `quantity`), `ranking_guide_opened`,
+`csv_downloaded` (`kind: series | ranking`, plus `quantity` and, on a ranking,
+`basis: month | year`), `ranking_guide_opened`, `ranking_basis_changed`,
+`baseline_note_opened` (`variable`),
 `about_opened`, `state_ribbon_clicked` (`half: enso | heatwave`), `state_guide_opened`.
 Server-side:
 `point_queried` (including the out-of-domain 400 — where people click outside the box is
@@ -1392,6 +1567,14 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   rounded rather than named, and its y-axis is not pinned to 0..5 — an archive that never
   leaves 0..1.5 drawn against five classes is a flat line on the axis floor.
 
+- **The anomaly's baseline is not the heatwave category's**, and nothing computes
+  with either string — so anything that prints one must read
+  `domain.yml`'s per-variable `baseline` block (through `/domain`, or
+  `store.baselineFor`) rather than writing out `1991-2020`. `anom` departs from a
+  1991-2020 daily mean computed here; `mhw` exceeds NOAA's 1985-2012 90th
+  percentile over an 11-day window, applied before ingest and not re-derivable
+  from anything in this database. Printing one beside the other's number is a
+  plausible-looking sentence rather than an error.
 - **A region's `mhw` is a percentage, a point's is a category, and the response says
   which.** Read `quantity` (`mhw_extent` or null), never `scope`. Two code paths serve it
   and **both** must apply `_MHW_EXTENT_SCALE` — the series (`_region_daily_rows`) and the
@@ -1401,6 +1584,15 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   or `toLocaleString` with `undefined` formats against Node's container locale on the
   server and the visitor's in the browser: a silent hydration mismatch, visible only as a
   console warning. Pin `'en-GB'`, as `utils/periods.ts` does.
+- **A polygon region is only the zone once `region_cells` is current.** Change the
+  geometry and the mask, `region_daily` and `region_clim` are all stale, in that order and
+  silently: the rollup keeps serving the cells the *old* ring covered, which is a real
+  area mean of the wrong water. `CRW.cli mask` rewrites the mask alone (seconds, and it
+  prints the cell count against the bounding box, which is the number that says whether
+  the new ring is plausible); `rollup --clim --region <key> --fresh` is what actually
+  rebuilds the numbers. `build_region_cells` **deletes before inserting** for the same
+  reason — replacing collapses rows that are still there, so a ring that *shrank* would
+  leave the cells it no longer covers behind.
 - **Adding a region to `domain.yml` after `init` leaves it with no `region_clim`**, so its
   `anom` series comes back empty with nothing to say why. `CRW.cli rollup --clim` rebuilds
   that side out of `sst_clim` in seconds — it does not touch the 366 NetCDF files, which is
@@ -1563,5 +1755,79 @@ Verified on the state ribbon, the extent quantity, deep links and the point cont
   round-trips; the region MHW view reads "45.6% · 2nd most widespread of 500 months ·
   trend +6.12% per decade" while the map legend beside it stays NOAA's five categories;
   both CSVs export as `mhw_extent_*` with a `mhw_extent_pct` column.
+
+Verified on the BC EEZ (the first polygon region):
+
+- **The mask is the zone, not its box.** 26,158 cells of a 60,990-cell bounding box, and
+  point-in-polygon spot checks land where they should: Puget Sound and SE Alaska outside,
+  the Strait of Georgia, offshore Haida Gwaii and the water off Tofino inside, the high
+  seas 250 nm out excluded.
+- **The rollup agrees with the geometry, end to end.** For 2021-06-28,
+  `/region/bc_eez?variable=anom` returns **1.578** on **23,814** cells; recomputing the
+  same day in Python — pull the 43,040 bounding-box rows out of ClickHouse, test each
+  cell centre against the ring, take the cos(lat)-weighted `avg(sst − clim)` — gives
+  **1.5785** on **23,814** cells. So the SQL mask and `shared/mask.py` select the same
+  cells, and the commuting-means identity survives the mask.
+- **The box would have been a different number**: 1.4558 over the same day, on 43,040
+  cells. The mask is worth 0.12 °C on the heat dome's peak day and 0.08–0.32 °C on the
+  days spot-checked.
+- **Cost.** `mask` is seconds; `rollup --clim --region bc_eez --fresh` builds
+  `region_cells`, all 366 `region_clim` rows and all 15,217 `region_daily` rows in
+  **7.7 s** — it is a small region, and the bounding box still does the key-range work.
+- **`mhw` and the ranking come through it.** The extent series reads 45.1 → 69.5% across
+  25–29 June 2021, and `monthlyRanking` puts June 2015 first (the Blob) and August 2004,
+  2014, 2015 at the top — 42 years, `areaMean: true`.
+- **Browser** (Chromium, per the recipe above): the zone's real outline draws — the
+  200 nm arc, the Dixon Entrance line, the Juan de Fuca boundary — the dock reads
+  `BC EEZ / Area mean over the region`, the chart and the 42-year June ranking populate,
+  and `/region/bc_eez/geometry` is fetched exactly once. One console error appears and is
+  **pre-existing and unrelated**: Mapbox's own marker fog-opacity evaluation
+  (`Marker._evaluateOpacity` → `transform.getOpacityAtLatLng`) throws on the globe at
+  northern latitudes for `gulf_of_alaska` and `ne_pacific` too, and not for `nino34`.
+
+Verified on the annual ranking (Chromium, per the recipe above):
+
+- **The years are the right years.** At 47.98N 127.98W the annual `anom` ranking puts
+  2015, 2014, 2016 on top — the Blob — and Nino 3.4's puts 2015, 1987, 1997, which are the
+  El Nino years. 2026 is starred and reads `ranked on 242 of 365 days`.
+- **The toggle fetches nothing.** Month -> Year -> Month issues no `/monthlyRanking` at
+  all; the payload already holds both. Measured, the extra grouping set costs nothing
+  visible: a cell's ranking is 70 ms end to end.
+- **A clicked row keeps the month.** On the `Year` basis, clicking 2016 while the map is on
+  August 2015 moves it to 2016-08-01, not to January.
+- **The copy follows the basis.** The guide reads `Every year on record at the selected
+  cell` and `an edge year of the archive`; the tooltip drops the month prefix (`2015 / mean
+  +1.3 degC / sd 0.6 degC over 365 days / rank 1 of 42`). Over a region on `mhw` it still
+  reads `most widespread first · area mean` and names the extent quantity.
+- **The CSV is its own file.** `anom_annual-ranks_47-98n_127-98w.csv`, header
+  `year,rank,mean_anom_degC,sd,days,partial`, no `month` column.
+- No console errors in either scope.
+
+Verified on the baseline labelling (Chromium, per the recipe above):
+
+- **The note follows the variable.** Anomaly reads `SST anomaly vs the 1991-2020
+  daily mean`, MHW reads `MHW exceeds the 1985-2012 90th percentile, applied by
+  NOAA`, and `sst` — which declares no baseline — renders no row at all rather
+  than an empty phrase. In region scope it reads `MHW extent`, following
+  `seriesLabel` rather than the map's field.
+- **The header does the same.** `app.vue`'s subtitle was a hard-coded
+  `vs. 1991-2020` behind a `v-if` on `anom`; it now reads the declaration and
+  says the right one for all three.
+- **The popover contrasts the two** without naming either variable in code — it
+  finds the other declared baseline whose `period` differs, so a fourth variable
+  would appear there with no edit — and lists the three Hobday/Oliver citations
+  as links.
+- **The ranking payload names its own baseline.** `climatologyBaseline` is
+  `1991-2020` on an `anom` ranking and **null** on `mhw` and `sst`, since neither
+  is a departure; the reading guide falls back to naming no years rather than the
+  wrong ones.
+- **A pre-existing layout bug surfaced and is fixed**: `TimeseriesChart`'s root
+  was `relative size-full` with `size-full` on the plot too, so the canvas
+  overflowed the pane by exactly `TimeControl`'s height (measured: canvas bottom
+  984 against a 950 viewport) and the x-axis labels ran off the bottom of the
+  screen. It is a flex column now, and the plot ends where its container does.
+- No console errors. The two eslint errors in the touched files
+  (`vue/no-multiple-template-root` in `index.vue`, `no-dynamic-delete` in
+  `main.ts`) are pre-existing.
 
 Not built yet: a cron entry for `run`, tests.

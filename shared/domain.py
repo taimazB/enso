@@ -9,6 +9,7 @@ which also documents the two orientation conventions this file assumes.
 from __future__ import annotations
 
 import functools
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,66 @@ class Subset:
 
 
 @dataclass(frozen=True)
+class Reference:
+    """One citation, for a method this project did not invent.
+
+    Kept structured rather than as a formatted string because the frontend
+    renders the author/year as the link text and the full citation as its
+    title — and because a bibliography written twice drifts.
+    """
+
+    authors: str
+    year: int
+    title: str
+    source: str
+    url: str
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """What a variable's value is measured *against*, said once.
+
+    This exists because the dashboard carries **two different baselines** and
+    nothing in the numbers themselves says so. `anom` is computed here, against
+    a 1991-2020 daily mean; `mhw` arrives already categorised by NOAA against a
+    1985-2012 mean **and 90th percentile**. The years differ, the window differs
+    (1 day against 11), and the statistic differs — so a +1 degC anomaly and a
+    Category 1 are not two views of one departure, and a reader who assumes they
+    are will read the map wrong.
+
+    The string used to be a constant in `api/modules/state.py`, another in
+    `api/modules/timeseries.py`, and a literal in two TypeScript files and a Vue
+    template. Declaring it here puts it where the rest of a variable's metadata
+    already is and ships it through `/domain`, so the About dialog, the reading
+    guide, the inline note and the API payloads cannot disagree about what the
+    number is relative to.
+
+    `statistic` is the load-bearing field. `mean` makes a departure; `p90` makes
+    an EXCEEDANCE, which is why no anomaly value maps to a category: measured
+    over this box, the P90-minus-mean departure a Cat 1 needs averages +1.02 degC
+    but spans +0.60 at p5 to +1.62 at p95, so the threshold is a different number
+    in every cell.
+    """
+
+    # "1991-2020". The years alone, for the many places that print just those.
+    period: str
+    # `mean` | `p90`. What the comparison is against, not merely over what years.
+    statistic: str
+    # One sentence naming the comparison, e.g. "the 1991-2020 daily mean".
+    label: str
+    # Who computed it. `here` means this project derived it from the source
+    # archive; `noaa` means it arrived already applied and cannot be re-based.
+    computed_by: str
+    # Width in days of the window each day-of-year is averaged over. Ours is 1;
+    # NOAA's MHW climatology uses 11, centred.
+    window_days: int = 1
+    # The longer explanation, shown in the inline note's popover.
+    note: str | None = None
+    # The method's own authors, where they are not the data provider.
+    references: tuple[Reference, ...] = ()
+
+
+@dataclass(frozen=True)
 class Category:
     """One class of a categorical variable: its code, colour and name."""
 
@@ -171,6 +232,11 @@ class Variable:
     # and the control does not exist for it. Validated against `range_limits()`
     # by the loader; see `Preset`.
     presets: tuple[Preset, ...] = ()
+    # What this variable's value is measured against, where that is a
+    # question at all. `sst` is an absolute temperature and declares none;
+    # `anom` and `mhw` declare DIFFERENT ones, which is the whole reason
+    # this is per-variable metadata rather than a single project constant.
+    baseline: Baseline | None = None
 
     def range_limits(self) -> tuple[float, float]:
         """Bounds for a user-chosen display range, clipped to what is encodable."""
@@ -277,11 +343,42 @@ class Quantity:
 
 @dataclass(frozen=True)
 class Region:
+    """A named area for the rollups: a lat/lon box, optionally cut by a polygon.
+
+    `lat`/`lon` are always present and always the region's bounding box, because
+    that box is what makes a region cheap: `ORDER BY (gy, gx, date)` turns it
+    into a set of contiguous key ranges rather than a scan. For a polygon region
+    the box is derived from the ring rather than written by hand, so the two
+    cannot drift, and it is a PREFILTER — `region_cells` narrows it to the cells
+    actually inside the zone. See `shared/mask.py`.
+    """
+
     key: str
     label: str
     lat: tuple[float, float]
     lon: tuple[float, float]
     partial: bool = False
+    # Outer rings, longitudes 0-360, or None for a plain box. No interior rings:
+    # the islands inside a maritime zone are land, and land is excluded by
+    # `sst_daily` holding ocean cells only, not by the geometry.
+    polygon: tuple[tuple[tuple[float, float], ...], ...] | None = None
+
+    @property
+    def masked(self) -> bool:
+        """Whether this region needs `region_cells` to mean what it says."""
+        return self.polygon is not None
+
+    def gy_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive `(first, last)` global row index of the bounding box."""
+        return tuple(sorted(int(grid.gy(v)) for v in self.lat))
+
+    def gx_range(self, grid: GlobalGrid) -> tuple[int, int]:
+        """Inclusive `(first, last)` global column index of the bounding box.
+
+        Contiguous, not wrapping, for the reason `Subset.gx_range` documents:
+        `lon0` is on the 0-360 convention precisely so a Pacific box is one range.
+        """
+        return tuple(sorted(int(grid.gx(v)) for v in self.lon))
 
 
 @functools.lru_cache(maxsize=1)
@@ -312,8 +409,13 @@ def variables() -> dict[str, Variable]:
             cfg["limits"] = tuple(cfg["limits"])
         cfg["colors"] = tuple(Category(**c) for c in cfg.get("colors", ()))
         cfg["presets"] = tuple(Preset(**p) for p in cfg.get("presets", ()))
+        if cfg.get("baseline") is not None:
+            b = dict(cfg["baseline"])
+            b["references"] = tuple(Reference(**r) for r in b.get("references", ()))
+            cfg["baseline"] = Baseline(**b)
         out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
         _check_presets(out[name])
+        _check_baseline(out[name])
     return out
 
 
@@ -332,6 +434,35 @@ def _check_presets(v: Variable) -> None:
                 f"{v.name}: preset {p.label!r} spans {p.vmin}..{p.vmax}, "
                 f"outside the adjustable range {lo}..{hi}"
             )
+
+
+def _check_baseline(v: Variable) -> None:
+    """Reject a baseline that claims something the rest of the code contradicts.
+
+    Two rules, both cheap and both guarding a confusion that is invisible in the
+    output. A `statistic` outside the known pair would be printed verbatim into
+    the UI, where an unrecognised word reads as a typo rather than as a claim.
+    And `computed_by: here` asserts that this project derived the comparison and
+    could re-base it — true of `anom`, false of `mhw`, whose categories arrive
+    already fixed against NOAA's own climatology and cannot be recomputed from
+    anything in this database.
+    """
+    b = v.baseline
+    if b is None:
+        return
+    if b.statistic not in ("mean", "p90"):
+        raise ValueError(
+            f"{v.name}: baseline statistic {b.statistic!r} is not 'mean' or 'p90'"
+        )
+    if b.computed_by not in ("here", "noaa"):
+        raise ValueError(
+            f"{v.name}: baseline computed_by {b.computed_by!r} is not 'here' or 'noaa'"
+        )
+    if b.window_days < 1 or b.window_days % 2 == 0:
+        # A centred window has to be odd, or it has no centre day.
+        raise ValueError(
+            f"{v.name}: baseline window_days {b.window_days} is not a positive odd number"
+        )
 
 
 def variable(name: str) -> Variable:
@@ -357,15 +488,60 @@ def quantity(name: str) -> Quantity:
         raise KeyError(f"unknown quantity {name!r}; known: {sorted(quantities())}") from None
 
 
+_REGION_DIR = Path(__file__).with_name("regions")
+
+
+def _load_polygon(filename: str) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Outer rings of a stored region polygon, longitudes on the 0-360 frame.
+
+    Plain `json` rather than a geometry library: the file is read once per
+    process and nothing here needs an operation on it beyond point-in-polygon,
+    which `shared/mask.py` gets from matplotlib.
+    """
+    with (_REGION_DIR / filename).open() as fh:
+        feature = json.load(fh)
+    geom = feature["geometry"]
+    polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+    rings = tuple(
+        tuple((float(x), float(y)) for x, y in poly[0])
+        for poly in polys
+        if len(poly[0]) >= 4
+    )
+    if not rings:
+        raise ValueError(f"{filename}: no usable ring")
+    return rings
+
+
 @functools.lru_cache(maxsize=1)
 def regions() -> dict[str, Region]:
-    return {
-        key: Region(
+    """The named regions, boxes and polygons alike.
+
+    A polygon region declares `polygon:` and NO bounds: its box is derived from
+    the ring here, so widening or replacing the geometry cannot leave a stale
+    hand-written box behind quietly selecting the wrong key ranges. A box region
+    declares bounds and no polygon. Declaring both is an error rather than a
+    precedence rule — there would be no way to tell which one a stored row meant.
+    """
+    out = {}
+    for key, cfg in _raw()["regions"].items():
+        polygon = _load_polygon(cfg["polygon"]) if cfg.get("polygon") else None
+        if polygon is not None and ("lat" in cfg or "lon" in cfg):
+            raise ValueError(
+                f"region {key!r}: declares both a polygon and explicit bounds; "
+                "a polygon's box is derived from its ring"
+            )
+        if polygon is not None:
+            xs = [x for ring in polygon for x, _ in ring]
+            ys = [y for ring in polygon for _, y in ring]
+            lat, lon = (min(ys), max(ys)), (min(xs), max(xs))
+        else:
+            lat, lon = tuple(cfg["lat"]), tuple(cfg["lon"])
+        out[key] = Region(
             key=key,
             label=cfg["label"],
-            lat=tuple(cfg["lat"]),
-            lon=tuple(cfg["lon"]),
+            lat=lat,
+            lon=lon,
             partial=cfg.get("partial", False),
+            polygon=polygon,
         )
-        for key, cfg in _raw()["regions"].items()
-    }
+    return out

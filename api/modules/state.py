@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from shared.domain import regions
+from shared.domain import regions, variable
 
 from .clickhouse_helpers import DATABASE, client
 from .timeseries import _MHW_EXTENT_SCALE, MMDD_SQL
@@ -72,7 +72,12 @@ NORMAL_WINDOW_DAYS = 7
 
 # The climatological baseline, matching `sst_clim` and every anomaly this API
 # serves. Reported in the payload so the ribbon can name it rather than assume.
-BASELINE = "1991-2020"
+#
+# Read off `anom`'s own declaration rather than restated, because the dashboard
+# has TWO baselines — `mhw`'s is NOAA's 1985-2012 90th percentile — and a
+# hard-coded string here is how the wrong one gets printed beside the right
+# number. `domain.yml` is the single definition; see `shared.domain.Baseline`.
+BASELINE = variable("anom").baseline.period
 
 
 def _monthly_nino34() -> list[tuple[dt.date, float, int]]:

@@ -56,6 +56,7 @@ import logging
 
 from shared.ch import DATABASE
 from shared.domain import global_grid, regions
+from shared.mask import cells_in
 
 log = logging.getLogger(__name__)
 
@@ -80,14 +81,71 @@ _WEIGHT = "cos(lat * pi() / 180)"
 def box_of(region) -> tuple[int, int, int, int]:
     """The region's inclusive (gy0, gy1, gx0, gx1) on the GLOBAL grid.
 
-    Via `shared.domain.global_grid()` rather than hand-rolled arithmetic — cell
-    identity does not depend on the current subset, and the 0-360 longitude
-    convention is applied in exactly one place.
+    Via `shared.domain` rather than hand-rolled arithmetic — cell identity does
+    not depend on the current subset, and the 0-360 longitude convention is
+    applied in exactly one place.
+
+    For a POLYGON region this is the bounding box, which is the prefilter and not
+    the region: `mask_filter()` below narrows it to the cells actually inside.
     """
     grid = global_grid()
-    gy0, gy1 = sorted(int(grid.gy(v)) for v in region.lat)
-    gx0, gx1 = sorted(int(grid.gx(v)) for v in region.lon)
-    return gy0, gy1, gx0, gx1
+    return (*region.gy_range(grid), *region.gx_range(grid))
+
+
+def mask_filter(region) -> str:
+    """The SQL clause that cuts a box down to a polygon region's own cells.
+
+    Empty for a plain box, so every query below reads the same whether or not the
+    region has a mask — one aggregation, not two that could drift into computing
+    different means.
+
+    A set membership rather than a join: `region_cells` holds 26,158 rows for the
+    BC EEZ, ClickHouse builds the tuple set once and probes it per row, and the
+    `gy`/`gx` BETWEEN in front of it still does the primary-key work.
+    """
+    if not region.masked:
+        return ""
+    return (
+        " AND (gy, gx) IN ("
+        f"SELECT gy, gx FROM {DATABASE}.region_cells FINAL WHERE region = %(region)s)"
+    )
+
+
+def build_region_cells(client, keys: list[str] | None = None) -> dict[str, int]:
+    """Rasterise every polygon region into `region_cells`.
+
+    Cheap and idempotent — 26,158 rows for the only region that has one today,
+    and a `ReplacingMergeTree` on (region, gy, gx) — so it is re-run rather than
+    checked: `init` and `rollup` both call it, and a changed polygon needs no
+    migration beyond running it again.
+
+    **Old cells are deleted first.** Replacing collapses rows that are still
+    there; a polygon that SHRANK would otherwise leave the cells it no longer
+    covers behind, quietly averaging water outside the zone. A region with no
+    polygon is deleted and not rewritten, which is what demoting a polygon region
+    back to a box needs.
+    """
+    grid = global_grid()
+    selected = regions() if keys is None else {k: regions()[k] for k in keys}
+    counts: dict[str, int] = {}
+
+    for key, region in selected.items():
+        client.command(
+            f"DELETE FROM {DATABASE}.region_cells WHERE region = %(region)s",
+            parameters={"region": key},
+        )
+        if not region.masked:
+            continue
+        gy, gx = cells_in(region, grid)
+        client.insert(
+            f"{DATABASE}.region_cells",
+            [[key, int(y), int(x)] for y, x in zip(gy, gx)],
+            column_names=["region", "gy", "gx"],
+        )
+        counts[key] = int(len(gy))
+        log.info("region_cells: %s -> %d cell(s)", key, len(gy))
+
+    return counts
 
 
 def _date_filter(start: dt.date | None, end: dt.date | None) -> tuple[str, dict]:
@@ -132,6 +190,10 @@ def build_region_daily(
     for key, region in selected.items():
         gy0, gy1, gx0, gx1 = box_of(region)
         params = date_params | {"gy0": gy0, "gy1": gy1, "gx0": gx0, "gx1": gx1, "region": key}
+        # Appended to BOTH halves. Applying it to only one would divide a masked
+        # numerator by an unmasked denominator, which is a plausible-looking
+        # extent rather than an error.
+        mask = mask_filter(region)
 
         client.command(
             f"""
@@ -159,7 +221,7 @@ def build_region_daily(
                           nan) AS mean_sst_clim
                 FROM {DATABASE}.sst_daily
                 WHERE gy BETWEEN %(gy0)s AND %(gy1)s
-                  AND gx BETWEEN %(gx0)s AND %(gx1)s{where}
+                  AND gx BETWEEN %(gx0)s AND %(gx1)s{mask}{where}
                 GROUP BY date
             ) AS s
             LEFT JOIN (
@@ -174,7 +236,7 @@ def build_region_daily(
                        count() AS n_mhw
                 FROM {DATABASE}.mhw_daily
                 WHERE gy BETWEEN %(gy0)s AND %(gy1)s
-                  AND gx BETWEEN %(gx0)s AND %(gx1)s{where}
+                  AND gx BETWEEN %(gx0)s AND %(gx1)s{mask}{where}
                 GROUP BY date
             ) AS m ON s.date = m.date
             """,

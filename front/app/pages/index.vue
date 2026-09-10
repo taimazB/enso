@@ -92,21 +92,29 @@
         <ColorLegend class="absolute bottom-4 left-1/2 z-10 -translate-x-1/2" />
       </div>
 
-      <div class="relative h-[38%] shrink-0 border-t border-default p-3">
-        <TimeseriesChart
-          :series="store.activeSeries"
-          :loading="store.activeSeriesLoading"
-          :empty-message="emptyPointMessage"
-          :error="!!store.activeError"
-          :title="chartTitle"
-          :selected-date="store.selectedDate"
-          :stops="store.seriesStops"
-          :zero-line="store.variable === 'anom'"
-          :unit="store.seriesUnitLabel"
-          :categorical="store.seriesIsCategorical"
-          :label="variableLabel"
-          @select="store.setDate($event)"
-        />
+      <!-- The chart and, under it, what its values are measured against. The
+           note is a row of the same column rather than an overlay so it can
+           never sit on top of the line, and the chart takes whatever height is
+           left — the note is ~18px and only present for a variable that
+           declares a baseline. -->
+      <div class="flex h-[38%] shrink-0 flex-col border-t border-default p-3">
+        <div class="relative min-h-0 grow">
+          <TimeseriesChart
+            :series="store.activeSeries"
+            :loading="store.activeSeriesLoading"
+            :empty-message="emptyPointMessage"
+            :error="!!store.activeError"
+            :title="chartTitle"
+            :selected-date="store.selectedDate"
+            :stops="store.seriesStops"
+            :zero-line="store.variable === 'anom'"
+            :unit="store.seriesUnitLabel"
+            :categorical="store.seriesIsCategorical"
+            :label="variableLabel"
+            @select="store.setDate($event)"
+          />
+        </div>
+        <BaselineNote class="mt-1 shrink-0" />
       </div>
     </div>
   </div>
