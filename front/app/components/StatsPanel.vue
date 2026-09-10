@@ -247,8 +247,18 @@ const rows = computed(() => {
   const out: Array<{ label: string, value: string, unit: string, note: string }> = []
 
   if (s.max) out.push({ label: `Highest ${noun}`, value: fmt(s.max.value), unit, note: s.max.date })
-  if (s.min) out.push({ label: `Lowest ${noun}`, value: fmt(s.min.value), unit, note: s.min.date })
-  if (s.recentMean != null) {
+  // No lowest card for a categorical variable: `mhw` is 0 over most of the
+  // archive at any cell, so the card reports the first calm bucket on record —
+  // a date, arbitrary among thousands of ties, dressed as a finding.
+  if (s.min && !props.categorical) {
+    out.push({ label: `Lowest ${noun}`, value: fmt(s.min.value), unit, note: s.min.date })
+  }
+  // The mean of the last 12 months is deliberately absent for a categorical
+  // variable: `mhw` prints at precision 0, so both the mean of ordinal classes
+  // and its departure from the archive mean round to a whole category and the
+  // card says nothing the reader can act on. The heatwave-day count and the run
+  // cards below answer the same question in units that survive averaging.
+  if (s.recentMean != null && !props.categorical) {
     out.push({
       label: 'Last 12 months',
       value: fmt(s.recentMean),
@@ -276,22 +286,40 @@ const rows = computed(() => {
     // which the daily line answers only by being counted along by eye, and
     // which a weekly line has already destroyed by taking a max over seven
     // days. Both runs come off the cell's own daily record; see `mhw_events`.
+    //
+    // Both cards are drawn whether or not there is a run to report: absent is a
+    // real answer here (most cells are not in a heatwave most of the time), and
+    // dropping the card instead would reshuffle the whole grid as the visitor
+    // clicks from cell to cell, which reads as the panel changing what it
+    // reports rather than the cell changing.
     const e = events.value
-    if (e?.current) {
-      out.push({
-        label: 'In a heatwave for',
-        value: `${e.current.days}`,
-        unit: e.current.days === 1 ? 'day' : 'days',
-        note: `since ${runSpan(e.current).split(' – ')[0]}, peak Cat ${e.current.peak}`,
-      })
-    }
-    if (e?.longest) {
-      out.push({
-        label: 'Longest heatwave',
-        value: `${e.longest.days}`,
-        unit: 'days',
-        note: `${runSpan(e.longest)}, peak Cat ${e.longest.peak}`,
-      })
+    if (e) {
+      out.push(e.current
+        ? {
+            label: 'In a heatwave for',
+            value: `${e.current.days}`,
+            unit: e.current.days === 1 ? 'day' : 'days',
+            note: `since ${runSpan(e.current).split(' – ')[0]}, peak Cat ${e.current.peak}`,
+          }
+        : {
+            label: 'In a heatwave for',
+            value: '—',
+            unit: '',
+            note: 'no heatwave at this time',
+          })
+      out.push(e.longest
+        ? {
+            label: 'Longest heatwave',
+            value: `${e.longest.days}`,
+            unit: 'days',
+            note: `${runSpan(e.longest)}, peak Cat ${e.longest.peak}`,
+          }
+        : {
+            label: 'Longest heatwave',
+            value: '—',
+            unit: '',
+            note: 'none in this record',
+          })
     }
   }
   else if (s.trendPerDecade != null) {

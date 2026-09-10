@@ -12,7 +12,7 @@
  * exactly the line they are looking at, gaps included.
  */
 import type { Series, VariableName } from '~/stores/main'
-import type { MonthlyRanking } from '~/utils/ranking'
+import type { MonthlyRanking, RankingRow } from '~/utils/ranking'
 import { MONTHS } from '~/utils/ranking'
 import type { Period } from '~/utils/periods'
 import { bucketEnd } from '~/utils/periods'
@@ -107,35 +107,48 @@ export function seriesCsv(series: Series, opts: SeriesCsvOptions): string {
 }
 
 /**
- * Every month's ranking as one CSV, not just the month the rail has open.
+ * The ranking as one CSV — every month, or every year, following the basis.
  *
- * The browser shows one month at a time because 45 rows twelve times over is not
- * readable on screen — but a file has no such limit, and a `month` column is
- * exactly what makes the whole table filterable in the tool the user is
- * exporting to. `partial` is carried through as a boolean: it is the difference
+ * On the monthly basis it is all twelve months rather than the one on screen:
+ * the browser shows one because 45 rows twelve times over is not readable, which
+ * is not a limit a file has, and a `month` column is exactly what makes the
+ * table filterable in the tool the user is exporting to. The annual basis has no
+ * such column — one row per year is the whole table — so it is left out rather
+ * than filled with a 0, which would read back as a thirteenth month.
+ *
+ * `partial` is carried through as a boolean either way: it is the difference
  * between a settled rank and one that will move, and dropping it would export
- * the archive's edge month as an ordinary datum.
+ * the archive's edge period as an ordinary datum.
  */
-export function rankingCsv(ranking: MonthlyRanking, precision = 2): string {
+export function rankingCsv(
+  ranking: MonthlyRanking,
+  precision = 2,
+  basis: 'month' | 'year' = 'month',
+): string {
   // The quantity where there is one: over a region `mhw` is a percentage of
   // area, and a column headed `mean_mhw` would read back as a category.
   const variable = ranking.quantity ?? ranking.variable ?? 'anom'
   const column = ranking.units === 'degC'
     ? `mean_${variable}_degC`
     : ranking.units === '%' ? `mean_${variable}_pct` : `mean_${variable}`
-  const rows: Cell[][] = [['month', 'month_name', 'year', 'rank', column, 'sd', 'days', 'partial']]
+  const tail = (row: RankingRow): Cell[] => [
+    row.year,
+    row.rank,
+    number(row.mean, precision),
+    number(row.sd, precision),
+    row.n,
+    row.partial ? 'true' : 'false',
+  ]
+  const head: Cell[] = ['year', 'rank', column, 'sd', 'days', 'partial']
+
+  if (basis === 'year') {
+    return csvText([head, ...(ranking.annual ?? []).map(tail)])
+  }
+
+  const rows: Cell[][] = [['month', 'month_name', ...head]]
   for (let m = 1; m <= 12; m++) {
     for (const row of ranking.months[String(m)] ?? []) {
-      rows.push([
-        m,
-        MONTHS[m - 1],
-        row.year,
-        row.rank,
-        number(row.mean, precision),
-        number(row.sd, precision),
-        row.n,
-        row.partial ? 'true' : 'false',
-      ])
+      rows.push([m, MONTHS[m - 1], ...tail(row)])
     }
   }
   return csvText(rows)

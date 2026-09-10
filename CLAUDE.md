@@ -225,6 +225,65 @@ product definition — it is the five names in the legend — so the rule surviv
 encodings and whatever NOAA ships next. The fill value is what changed; the categories are
 what did not.
 
+#### Two baselines, and they are not reconcilable
+
+**`anom` and `mhw` are measured against different climatologies, and nothing in
+either number says so.** This is the one thing about the dashboard a reader is
+most likely to get wrong, because the natural assumption — that a big anomaly is
+roughly a high category — is false and looks true.
+
+| | `anom` | `mhw` |
+|---|---|---|
+| years | **1991-2020** (30) | **1985-2012** (28) |
+| window | 1 day (`window-01day`) | **11 days**, centred on the day of year |
+| statistic | mean | mean **and 90th percentile** |
+| leap day | its own file, `day0229` (366 files) | excluded; derived as the mean of Feb 28 and Mar 1 (**365** files) |
+| computed | here, from `sst_clim` | by NOAA, before we see the file |
+
+The MHW climatology lives at `.../marine_heatwave/v1.0.1/climatology/nc/` as
+`noaa-crw_mhw_v1.0_climatology_{001..365}.nc`, carrying `sst_clim_mean` and
+`sst_clim_ninetieth_percentile_variable`. **Nothing in this repo downloads it** —
+`download.py` fetches only `category/nc/{YYYY}/` — and it should stay that way:
+we ingest the finished category, not a temperature, so the baseline is a fact
+about the incoming file rather than a choice.
+
+**Re-basing `anom` onto 1985-2012 to "match" would not work, and the numbers say
+why.** Cat 1 is `SST > P90`, an *exceedance*, and the P90-minus-mean departure it
+represents is a different number in every cell: measured over this box for day
+001, **+1.02 degC mean, +0.60 at p5, +1.62 at p95**. The two baselines' means
+differ by only **+0.104 degC** over the same cells (median +0.110, sd 0.116;
+1991-2020 is the warmer one). So the shift is ~10% of the spread that would have
+to close, and no anomaly value maps to a category under any baseline. Three
+further costs, if it is ever proposed again: 1991-2020 is the WMO normal the
+ONI-style index in `/state` needs; `has_clim` is a stored column in
+`sst_daily`, so the valid mask changing means a **full re-ingest**; and all
+~17.9 k cached `anom` frames encode the anomaly value, with only the retention
+window's NetCDF left on disk to re-render from.
+
+One real point in the other direction, recorded so it is not rediscovered as a
+bug: the MHW climatology covers **7,477,923 cells in this box against 1991-2020's
+7,261,562** (Jan 1) — every ocean cell, with sensible ice-fringe values around
+-1.2..-1.8 degC. Adopting it would retire the `NO_CLIM_RGBA` grey third state.
+It is also **south-up**, like the dailies, where the ct5km climatology is
+north-up.
+
+**The method is not NOAA's, and the UI says so.** NOAA Coral Reef Watch applies
+the algorithm and publishes the product; the definition and the five category
+names are **Hobday et al. 2016** (Prog. Oceanogr. 141, 227-238), **Hobday et al.
+2018** (Oceanography 31(2)) and **Oliver et al. 2018** (Nat. Commun. 9, 1324).
+Asked for by a user, and it is a real misattribution rather than a missing
+nicety.
+
+**Where this is said, and it is said once.** `domain.yml` declares a `baseline`
+block per variable — `period`, `statistic` (`mean` | `p90`), `window_days`,
+`label`, `computed_by` (`here` | `noaa`), `note`, `references` — validated by
+`shared/domain.py`'s `_check_baseline()` and shipped through `/domain`. The
+string used to be a constant in `api/modules/state.py`, another in
+`api/modules/timeseries.py`, and a literal in `ranking.ts`, `AboutDialog.vue`
+and `app.vue`; all five now read the declaration. `statistic` is the
+load-bearing field: it picks the preposition, so a `p90` baseline is phrased as
+something the value **exceeds** rather than something it departs from.
+
 **The climatology is a second archive**: 366 files in `./data/climatology/`, mounted at
 `/opt/data/climatology/`, one per MMDD **including `day0229`** — so there is no leap-day
 mapping rule to invent. Baseline 1991–2020. 1.6 GB, static, and **kept forever**: image
@@ -629,8 +688,8 @@ FastAPI in `SERVER.py`. **Timeseries are read live from ClickHouse; imagery is n
 | `POST /regionTimeseries` | `{lat: [a,b], lon: [a,b], ...}` → area-mean over an arbitrary box |
 | `GET /region/{key}` | same, for a named `domain.yml` region, using `region_clim` |
 | `GET /region/{key}/geometry` | a polygon region's outline as GeoJSON; 404 for a plain box |
-| `POST /monthlyRanking` | every calendar month at a cell, ranked within its month-of-year |
-| `GET /region/{key}/monthlyRanking` | the same ranking over a named region, from `region_daily` |
+| `POST /monthlyRanking` | every calendar month at a cell ranked within its month-of-year, plus every year ranked against every other (`annual`) |
+| `GET /region/{key}/monthlyRanking` | the same two rankings over a named region, from `region_daily` |
 | `GET /image/{date}.webp` | one bucket as a Web-Mercator WebP |
 
 **`variable` — `sst` (default) / `anom` / `mhw`** — is accepted by every endpoint above.
@@ -714,15 +773,28 @@ plain-string `detail` and a structured `error` object** (`code: "outside_domain"
 working; `error.code` is what lets the frontend show this as an informational empty state
 rather than a red failure.
 
-**The monthly rankings are always monthly, whatever the caller's `period`**, and they rank
-`anom` by default because ranking years by absolute SST is a different question. Every
-month is ranked including the archive's truncated edge months, which carry `partial: true`
-— the month in progress is the one people most want to look at, so it is starred rather
-than hidden. A month missing an *interior* day is **not** partial: it is as complete as it
-will ever be.
+**The rankings never follow the caller's `period`**, and they rank `anom` by default
+because ranking years by absolute SST is a different question. Every period is ranked
+including the archive's truncated edges, which carry `partial: true` — the month or year in
+progress is the one people most want to look at, so it is starred rather than hidden. A
+month missing an *interior* day is **not** partial: it is as complete as it will ever be.
+
+**Each response carries two rankings, not one: `months` and `annual`.** The panel's heading
+read as the whole year when it was one calendar month — "2015 was the warmest" when what it
+said was "the warmest August" — so ranking whole calendar years is now the other half of the
+same answer rather than a thing that cannot be asked. **A year's mean is the mean of its
+days, never of its twelve monthly means**: the months are not the same length, so averaging
+averages would weight February like July.
+
+**Both groupings come off one scan**, via `GROUP BY GROUPING SETS ((month, year), (year))`.
+The annual set arrives with `month = 0`, which is also the window function's partition — so
+the years are ranked against each other by exactly the same expression that ranks the
+Augusts against each other, and there is still one definition of "the ranking". Two queries
+would have been two definitions of it again. `_ranked_periods()` splits `month = 0` out
+into `annual` on the way to the response, so no client has to know about the sentinel.
 
 **There are two of them — a cell and a named region — and the ranking itself is defined
-once.** `_ranked_months()` takes any subquery yielding `(date, value)` and does the
+once.** `_ranked_periods()` takes any subquery yielding `(date, value)` and does the
 grouping, the `stddevSamp` and the `row_number()`; only the series underneath differs, so
 the two cannot drift into meaning different things. A cell's series is the ~15k-row
 primary-key read the point timeseries makes; a **named region's is `region_daily`**, folded
@@ -896,6 +968,7 @@ app/pages/index.vue                numbers + ranks dock on the left, map over th
 app/components/AnomalyMap.vue      MapboxGL + the field image source
 app/components/TimeControl.vue     variable + period toggles, date stepper, playback
 app/components/ColorLegend.vue     gradient + the colour range control (popover)
+app/components/BaselineNote.vue    what the chart's values are measured against (+ popover)
 app/components/TimeseriesChart.vue ECharts line with dataZoom
 app/components/ScopeControl.vue    point / named-region switch, over the map
 app/components/StatsPanel.vue      the dock's headline value and stat cards
@@ -1038,9 +1111,25 @@ measurement:
   the bottom, and the map saturates it the same way. The ranking's copy follows too:
   rank 1 is "most severe", not "warmest".
 
-The monthly ranking **refetches on a variable change** but not on a period change: ranking
+The ranking **refetches on a variable change** but not on a period change: ranking
 years by absolute SST is a different question from ranking by anomaly, whereas the ranking
 is period-independent by construction.
+
+**`MonthlyRankPanel`'s `Month | Year` toggle refetches nothing.** Both groupings arrive in
+the one payload, so the toggle picks which array to draw — no loading state, no guard
+against a stale response, and switching back and forth costs nothing. It is the one choice
+this panel owns; the *month* is still the map's, since a month picker here would be a
+second date control disagreeing with the time bar. Three things follow the basis rather
+than being written twice: the heading (the month's name, or nothing beside a selected
+`Year`), `partialNote`'s denominator (`periodDays()` — 242 of 365, not of 31), and the
+reading guide's nouns. **Clicking a row on the `Year` basis moves only the year**, keeping
+the map's month: a year has no one date to land on, and jumping to 1 January would make two
+clicked years incomparable on the map, which is the comparison the click is being made to
+see. The CSV follows too — `anom_annual-ranks_nino-3-4.csv`, one row per year and no
+`month` column, because a 0 there would read back as a thirteenth month. **`AboutDialog`'s
+"Compare years" step names both bases and carries the toggle as a replica**, like every
+other step there: the guide is the only place the panel is explained before it is clicked,
+and a control it does not mention is one nobody looks for.
 
 #### The colour range control
 
@@ -1389,7 +1478,9 @@ guards at the call sites.
 Events, all fired from the store or the component that owns the gesture rather than from
 each call site: `point_selected`, `region_selected` (with `enteredScope`), `scope_changed`,
 `variable_changed`, `period_changed`, `playback_started`, `color_range_changed`,
-`csv_downloaded` (`kind: series | ranking`, plus `quantity`), `ranking_guide_opened`,
+`csv_downloaded` (`kind: series | ranking`, plus `quantity` and, on a ranking,
+`basis: month | year`), `ranking_guide_opened`, `ranking_basis_changed`,
+`baseline_note_opened` (`variable`),
 `about_opened`, `state_ribbon_clicked` (`half: enso | heatwave`), `state_guide_opened`.
 Server-side:
 `point_queried` (including the out-of-domain 400 — where people click outside the box is
@@ -1476,6 +1567,14 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   rounded rather than named, and its y-axis is not pinned to 0..5 — an archive that never
   leaves 0..1.5 drawn against five classes is a flat line on the axis floor.
 
+- **The anomaly's baseline is not the heatwave category's**, and nothing computes
+  with either string — so anything that prints one must read
+  `domain.yml`'s per-variable `baseline` block (through `/domain`, or
+  `store.baselineFor`) rather than writing out `1991-2020`. `anom` departs from a
+  1991-2020 daily mean computed here; `mhw` exceeds NOAA's 1985-2012 90th
+  percentile over an 11-day window, applied before ingest and not re-derivable
+  from anything in this database. Printing one beside the other's number is a
+  plausible-looking sentence rather than an error.
 - **A region's `mhw` is a percentage, a point's is a category, and the response says
   which.** Read `quantity` (`mhw_extent` or null), never `scope`. Two code paths serve it
   and **both** must apply `_MHW_EXTENT_SCALE` — the series (`_region_daily_rows`) and the
@@ -1685,5 +1784,50 @@ Verified on the BC EEZ (the first polygon region):
   **pre-existing and unrelated**: Mapbox's own marker fog-opacity evaluation
   (`Marker._evaluateOpacity` → `transform.getOpacityAtLatLng`) throws on the globe at
   northern latitudes for `gulf_of_alaska` and `ne_pacific` too, and not for `nino34`.
+
+Verified on the annual ranking (Chromium, per the recipe above):
+
+- **The years are the right years.** At 47.98N 127.98W the annual `anom` ranking puts
+  2015, 2014, 2016 on top — the Blob — and Nino 3.4's puts 2015, 1987, 1997, which are the
+  El Nino years. 2026 is starred and reads `ranked on 242 of 365 days`.
+- **The toggle fetches nothing.** Month -> Year -> Month issues no `/monthlyRanking` at
+  all; the payload already holds both. Measured, the extra grouping set costs nothing
+  visible: a cell's ranking is 70 ms end to end.
+- **A clicked row keeps the month.** On the `Year` basis, clicking 2016 while the map is on
+  August 2015 moves it to 2016-08-01, not to January.
+- **The copy follows the basis.** The guide reads `Every year on record at the selected
+  cell` and `an edge year of the archive`; the tooltip drops the month prefix (`2015 / mean
+  +1.3 degC / sd 0.6 degC over 365 days / rank 1 of 42`). Over a region on `mhw` it still
+  reads `most widespread first · area mean` and names the extent quantity.
+- **The CSV is its own file.** `anom_annual-ranks_47-98n_127-98w.csv`, header
+  `year,rank,mean_anom_degC,sd,days,partial`, no `month` column.
+- No console errors in either scope.
+
+Verified on the baseline labelling (Chromium, per the recipe above):
+
+- **The note follows the variable.** Anomaly reads `SST anomaly vs the 1991-2020
+  daily mean`, MHW reads `MHW exceeds the 1985-2012 90th percentile, applied by
+  NOAA`, and `sst` — which declares no baseline — renders no row at all rather
+  than an empty phrase. In region scope it reads `MHW extent`, following
+  `seriesLabel` rather than the map's field.
+- **The header does the same.** `app.vue`'s subtitle was a hard-coded
+  `vs. 1991-2020` behind a `v-if` on `anom`; it now reads the declaration and
+  says the right one for all three.
+- **The popover contrasts the two** without naming either variable in code — it
+  finds the other declared baseline whose `period` differs, so a fourth variable
+  would appear there with no edit — and lists the three Hobday/Oliver citations
+  as links.
+- **The ranking payload names its own baseline.** `climatologyBaseline` is
+  `1991-2020` on an `anom` ranking and **null** on `mhw` and `sst`, since neither
+  is a departure; the reading guide falls back to naming no years rather than the
+  wrong ones.
+- **A pre-existing layout bug surfaced and is fixed**: `TimeseriesChart`'s root
+  was `relative size-full` with `size-full` on the plot too, so the canvas
+  overflowed the pane by exactly `TimeControl`'s height (measured: canvas bottom
+  984 against a 950 viewport) and the x-axis labels ran off the bottom of the
+  screen. It is a flex column now, and the plot ends where its container does.
+- No console errors. The two eslint errors in the touched files
+  (`vue/no-multiple-template-root` in `index.vue`, `no-dynamic-delete` in
+  `main.ts`) are pre-existing.
 
 Not built yet: a cron entry for `run`, tests.

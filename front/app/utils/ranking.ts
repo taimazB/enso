@@ -5,8 +5,10 @@
  * arithmetic over the API's response, so the chart can be rendered and checked
  * without a browser, and `MonthlyRankPanel.vue` stays presentational.
  *
- * `detailOption()` builds the one chart there is: the calendar month the map is
- * on, one row per year, ranked.
+ * `detailOption()` builds the one chart there is: one row per year, ranked —
+ * either within the calendar month the map is on, or over the whole year. The
+ * two are the same plot over a different set of rows, which is why the basis
+ * reaches it only as a heading and a day-count denominator.
  */
 
 import type {
@@ -36,8 +38,8 @@ export interface RankingRow {
   /** 1 = warmest year on record for this calendar month. */
   rank: number
   /**
-   * Truncated by the edge of the archive — the month still filling up, or the
-   * one the record starts mid-way through. Ranked with the rest, but starred:
+   * Truncated by the edge of the archive — the month or year still filling up,
+   * or the one the record starts mid-way through. Ranked with the rest, but starred:
    * its mean is over a part-month and its rank will move as the days land.
    */
   partial?: boolean
@@ -66,6 +68,15 @@ export interface MonthlyRanking {
    */
   quantity?: string | null
   units?: string
+  /**
+   * The years the ranked anomaly is a departure from, e.g. "1991-2020", or null
+   * where the value is not a departure at all — `sst` is absolute and an `mhw`
+   * rank counts exceedances of a percentile. The API supplies it because this
+   * dashboard has **two baselines** (`mhw`'s categories are NOAA's, against
+   * 1985-2012), so naming one in the reading guide beside a number computed
+   * against the other is a silent misstatement.
+   */
+  climatologyBaseline?: string | null
   /** Every month ranked, edge months included — first of the first to last of the last. */
   span: { start: string, end: string } | null
   /** Last day with data, which is where a trailing partial month has got to. */
@@ -74,6 +85,15 @@ export interface MonthlyRanking {
   top: number
   /** Keyed by month number as a string, '1'..'12', each already in rank order. */
   months: Record<string, RankingRow[]>
+  /**
+   * The same years ranked over the **whole calendar year**, already in rank
+   * order — the API's second grouping set, off the same scan as `months`.
+   *
+   * It is a mean of the year's *days*, never of its twelve monthly means: the
+   * months are not the same length, so averaging averages would weight February
+   * like July.
+   */
+  annual: RankingRow[]
 }
 
 export const MONTHS = [
@@ -133,6 +153,30 @@ export function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate()
 }
 
+/** Days in a calendar year — 365, or 366 on a leap year. */
+export function daysInYear(year: number): number {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 366 : 365
+}
+
+/**
+ * The two things the panel ranks: one calendar month, or the whole year.
+ *
+ * `null` is the year rather than a `'annual'` string because it is the *absence*
+ * of a month — the API's own encoding, where the annual grouping set arrives
+ * with `month = 0` — and every consumer here already had a month to switch on.
+ */
+export type RankBasis = number | null
+
+/** How many days the period `basis` holds in `year`; the denominator a `*` needs. */
+export function periodDays(basis: RankBasis, year: number): number {
+  return basis === null ? daysInYear(year) : daysInMonth(year, basis)
+}
+
+/** What the period is called in a heading, a tooltip and the guide's copy. */
+export function periodName(basis: RankBasis): string {
+  return basis === null ? 'Year' : MONTHS[basis - 1]!
+}
+
 /**
  * The starred rows of a month, if any — at most the archive's two edge months.
  *
@@ -140,11 +184,14 @@ export function daysInMonth(year: number, month: number): number {
  * whole ones (August 2026 lands at rank 2 on 24 days at 45.125°N), so the row is
  * there to be read, with the caveat attached rather than the row removed.
  */
-export function partialNote(rows: RankingRow[], month: number): string | null {
+export function partialNote(rows: RankingRow[], basis: RankBasis): string | null {
   const r = rows.find(row => row.partial)
   if (!r) return null
-  return `* ${MONTHS[month - 1]} ${r.year} is incomplete — ranked on ${r.n} `
-    + `of ${daysInMonth(r.year, month)} days, so its place will move.`
+  // "August 2026" names the period; the year alone does, when the period IS the
+  // year — "Year 2026 is incomplete" reads as a stutter.
+  const subject = basis === null ? `${r.year}` : `${MONTHS[basis - 1]} ${r.year}`
+  return `* ${subject} is incomplete — ranked on ${r.n} `
+    + `of ${periodDays(basis, r.year)} days, so its place will move.`
 }
 
 // --- Shared x-domain ---------------------------------------------------------
@@ -183,8 +230,12 @@ export function xDomainOf(months: RankingRow[][], includeZero = true): XDomain {
 
 export interface DetailOptionInput {
   rows: RankingRow[]
-  /** 1-based calendar month, for the tooltip's heading. */
-  month: number
+  /**
+   * What is being ranked: a 1-based calendar month, or `null` for the whole
+   * year. It reaches the plot only as a heading and as the denominator of a
+   * partial period's day count — the rows arrive already ranked either way.
+   */
+  basis: RankBasis
   stops: ColorStop[]
   domain: XDomain
   /** Vertical px per year, from `detailPitch()`. */
@@ -223,7 +274,7 @@ export interface DetailOptionInput {
 }
 
 export function detailOption({
-  rows, month, stops, domain, pitch, topN, selectedYear, unit = '\u00B0C', categorical = false,
+  rows, basis, stops, domain, pitch, topN, selectedYear, unit = '\u00B0C', categorical = false,
   sdLabel = 'sd', signedScale,
 }: DetailOptionInput): EChartsOption {
   const isSigned = signedScale ?? !categorical
@@ -248,8 +299,10 @@ export function detailOption({
       appendToBody: true,
       formatter: (raw: TooltipComponentFormatterCallbackParams) => {
         const [, mean, , , year, sd, n, rank, partial] = (raw as unknown as ItemParams).value
+        // On the annual basis the year IS the period, so it is not prefixed.
+        const title = basis === null ? `${year}` : `${MONTHS[basis - 1]} ${year}`
         const lines = [
-          `<b>${MONTHS[month - 1]} ${year}${partial ? ' *' : ''}</b>`,
+          `<b>${title}${partial ? ' *' : ''}</b>`,
           `mean&nbsp;&nbsp;<b>${value(mean!)}${suffix}</b>`,
           `${sdLabel}&nbsp;&nbsp;${sd!.toFixed(digits)}${suffix} over ${n} days`,
           `rank&nbsp;&nbsp;${rank} of ${rows.length}`,
@@ -257,7 +310,7 @@ export function detailOption({
         if (partial) {
           lines.push(
             `<span style="opacity:0.75">incomplete — ${n} of `
-            + `${daysInMonth(year!, month)} days</span>`,
+            + `${periodDays(basis, year!)} days</span>`,
           )
         }
         return lines.join('<br/>')
@@ -316,7 +369,7 @@ export function detailOption({
     },
     series: [{
       type: 'custom',
-      name: MONTHS[month - 1],
+      name: periodName(basis),
       // dims: 0 lo, 1 mean, 2 hi, 3 category, then metadata the tooltip reads.
       encode: { x: [0, 1, 2], y: 3 },
       data: rows.map((r, i) => [
@@ -405,8 +458,8 @@ export interface ReadingGuide {
 
 export interface ReadingGuideInput {
   ranking: MonthlyRanking | null
-  /** 1-based calendar month on screen. */
-  month: number
+  /** The period on screen: a 1-based calendar month, or `null` for the year. */
+  basis: RankBasis
   rows: RankingRow[]
   topN: number
   /** What rank 1 means — 'warmest', or 'most severe' for the heatwave category. */
@@ -418,27 +471,38 @@ export interface ReadingGuideInput {
 }
 
 /** What the ranked number is, said in words rather than as a variable key. */
-function rankedQuantity(ranking: MonthlyRanking | null | undefined): string {
+function rankedQuantity(ranking: MonthlyRanking | null | undefined, period: string): string {
   // The quantity wins where there is one: over a region `mhw` is not a category
   // at all, and describing it as one is the exact confusion the extent quantity
   // was introduced to end.
   if (ranking?.quantity === 'mhw_extent') {
     return 'the share of the region’s ocean area in a marine heatwave, '
-      + 'averaged over that month’s days'
+      + `averaged over that ${period}’s days`
   }
   const variable = ranking?.variable
-  if (variable === 'sst') return 'that month’s mean sea-surface temperature'
+  if (variable === 'sst') return `that ${period}’s mean sea-surface temperature`
   if (variable === 'mhw') {
-    return 'that month’s mean daily heatwave category — a severity index, '
+    return `that ${period}’s mean daily heatwave category — a severity index, `
       + 'not a category of its own'
   }
-  return 'that month’s mean anomaly against the 1991–2020 average'
+  // The years come from the ranking's own payload where it carries them, so the
+  // guide cannot name one baseline beside a number computed against another.
+  // The dashboard has two: `mhw`'s categories are NOAA's, against 1985-2012.
+  const baseline = ranking?.climatologyBaseline
+  return baseline
+    ? `that ${period}’s mean anomaly against the ${baseline.replace('-', '–')} average`
+    : `that ${period}’s mean anomaly against the climatological average`
 }
 
 export function readingGuide({
-  ranking, month, rows, topN, rankOrder = 'warmest', unit = '', sdLabel = 'sd',
+  ranking, basis, rows, topN, rankOrder = 'warmest', unit = '', sdLabel = 'sd',
 }: ReadingGuideInput): ReadingGuide {
-  const name = MONTHS[month - 1]
+  // "Every 2015 on record" is nonsense, so the year basis says "year" and the
+  // month basis names the month — the same sentence, one noun apart.
+  const name = basis === null ? 'year' : MONTHS[basis - 1]!
+  // The period as a common noun — "a long bar is a month whose ..." — where the
+  // month's own name would read as "a August".
+  const noun = basis === null ? 'year' : 'month'
   // A cell and a region are not comparable numbers — one is a point reading,
   // the other an area mean — so the guide names which one is on screen.
   const subject = ranking?.region
@@ -448,8 +512,8 @@ export function readingGuide({
   const series = ranking?.areaMean ? 'daily area means' : 'daily values'
 
   const items: GuideItem[] = [
-    { glyph: 'dot', text: `Dot — ${rankedQuantity(ranking)}${suffix}, coloured on the same scale as the map.` },
-    { glyph: 'whisker', text: `Bar — one ${sdLabel} either side of it, so a long bar is a month whose ${series} moved about.` },
+    { glyph: 'dot', text: `Dot — ${rankedQuantity(ranking, noun)}${suffix}, coloured on the same scale as the map.` },
+    { glyph: 'whisker', text: `Bar — one ${sdLabel} either side of it, so a long bar is a ${noun} whose ${series} moved about.` },
     { glyph: 'top', text: `Bold label on a tinted row — the top ${topN}.` },
     { glyph: 'selected', text: 'Amber ring and label — the year the map is currently showing.' },
   ]
@@ -457,15 +521,19 @@ export function readingGuide({
   if (rows.some(r => r.partial)) {
     items.push({
       glyph: 'partial',
-      text: 'Hollow dot and a * — an edge month of the archive, ranked on only part '
-        + 'of its days, so its place will move.',
+      text: `Hollow dot and a * — an edge ${noun} of the `
+        + 'archive, ranked on only part of its days, so its place will move.',
     })
   }
 
   return {
     summary: `Every ${name} on record at ${subject}, ranked ${rankOrder} first — `
-      + `one row per year, ${rows.length} of them.`,
+      + `${rows.length} of them.`,
     items,
-    footer: `Click a row to move the map to that ${name}.`,
+    // On the annual basis the map keeps the month it is on and only the year
+    // moves, which is what makes stepping between years comparable.
+    footer: basis === null
+      ? 'Click a row to move the map to that year.'
+      : `Click a row to move the map to that ${name}.`,
   }
 }

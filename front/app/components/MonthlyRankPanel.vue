@@ -18,11 +18,26 @@
 
     <ClientOnly v-else>
       <section class="flex min-w-0 min-h-0 grow flex-col">
-        <!-- The month is the map's, not a selection of its own: the panel sits
-             under the numbers for the bucket on screen, so a month picker here
-             would be a second date control disagreeing with the time bar. -->
+        <!-- Month / Year is the one choice this panel owns. The *month* is
+             still the map's — a month picker here would be a second date
+             control disagreeing with the time bar — but which of the two
+             questions is being asked is not something the map can answer, and
+             a heading reading "August" was being read as the whole year. -->
         <div class="mb-1 flex shrink-0 items-baseline gap-2">
-          <h3 class="shrink-0 text-sm font-semibold text-highlighted">{{ MONTHS[month - 1] }}</h3>
+          <UFieldGroup size="xs" class="shrink-0 self-center">
+            <UButton
+              v-for="item in BASES"
+              :key="item.label"
+              :label="item.label"
+              :color="isBasis(item.basis) ? 'primary' : 'neutral'"
+              :variant="isBasis(item.basis) ? 'solid' : 'subtle'"
+              :title="item.title"
+              @click="setBasis(item.basis)"
+            />
+          </UFieldGroup>
+          <h3 v-if="basis === 'month'" class="shrink-0 text-sm font-semibold text-highlighted">
+            {{ MONTHS[month - 1] }}
+          </h3>
           <span class="truncate text-xs text-muted">
             {{ rows.length }} years, {{ rankOrder }} first{{ ranking?.areaMean ? ' · area mean' : '' }}
           </span>
@@ -93,7 +108,9 @@
             color="neutral"
             size="xs"
             class="shrink-0"
-            title="Download every month's ranking as CSV"
+            :title="basis === 'month'
+    ? `Download every month's ranking as CSV`
+    : 'Download the annual ranking as CSV'"
             aria-label="Download the rankings as CSV"
             @click="exportRanking()"
           />
@@ -129,7 +146,7 @@
 import * as echarts from 'echarts'
 import { trackEvent } from '~/composables/useAnalytics'
 import type { ColorStop } from '~/utils/colorScale'
-import type { MonthlyRanking } from '~/utils/ranking'
+import type { MonthlyRanking, RankBasis } from '~/utils/ranking'
 import { cellSlug, downloadCsv, rankingCsv, slug } from '~/utils/csv'
 import { type Period, bucketStart, shiftBuckets } from '~/utils/periods'
 import {
@@ -183,6 +200,36 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [date: string] }>()
 
 /**
+ * The two questions the same rows can answer, and the reason this control exists.
+ *
+ * The panel has always ranked one calendar month's years against each other, and
+ * with the map's month in the heading that was being read as the whole year —
+ * "2015 was the warmest" when what it said was "the warmest August". Both are
+ * worth asking, so the basis is a toggle rather than a caption.
+ *
+ * **Neither refetches.** The API returns both groupings off one scan, so this is
+ * a choice of which array to draw — no loading state, no guard against a stale
+ * response, and switching back and forth costs nothing.
+ */
+const BASES = [
+  { basis: 'month' as const, label: 'Month', title: 'Rank the years within the month the map is on' },
+  { basis: 'year' as const, label: 'Year', title: 'Rank whole calendar years against each other' },
+]
+
+const basis = ref<'month' | 'year'>('month')
+const isBasis = (value: 'month' | 'year') => basis.value === value
+
+function setBasis(value: 'month' | 'year') {
+  if (basis.value === value) return
+  basis.value = value
+  trackEvent('ranking_basis_changed', {
+    basis: value,
+    scope: props.ranking?.region ? 'region' : 'point',
+    variable: props.ranking?.variable ?? null,
+  })
+}
+
+/**
  * Save the whole ranking table — all twelve months, not the one on screen.
  *
  * The panel shows one month because that is the one the map is on; a file has no
@@ -199,7 +246,12 @@ const emit = defineEmits<{ select: [date: string] }>()
  * often this is opened is the measure of whether the plot reads on its own.
  */
 function onGuideToggle(open: boolean) {
-  if (open) trackEvent('ranking_guide_opened', { scope: props.ranking?.region ? 'region' : 'point' })
+  if (open) {
+    trackEvent('ranking_guide_opened', {
+      scope: props.ranking?.region ? 'region' : 'point',
+      basis: basis.value,
+    })
+  }
 }
 
 function exportRanking() {
@@ -217,11 +269,16 @@ function exportRanking() {
     variable: ranking.variable ?? 'anom',
     quantity: ranking.quantity ?? null,
     scope: ranking.region ? 'region' : 'point',
-    months: 12,
+    basis: basis.value,
+    months: basis.value === 'month' ? 12 : 0,
   })
+  // The filename says which ranking it is for the same reason it says which
+  // variable and which subject: a folder holding both would otherwise be two
+  // files with the same years and different numbers.
+  const kind = basis.value === 'month' ? 'monthly-ranks' : 'annual-ranks'
   downloadCsv(
-    `${variable}_monthly-ranks_${subject}.csv`,
-    rankingCsv(ranking, props.precision ?? 2),
+    `${variable}_${kind}_${subject}.csv`,
+    rankingCsv(ranking, props.precision ?? 2, basis.value),
   )
 }
 
@@ -246,7 +303,17 @@ const sdLabel = computed(() => (props.ranking?.areaMean ? 'sd of daily means' : 
 const month = computed(() => (props.selectedDate ? Number(props.selectedDate.slice(5, 7)) : 1))
 const selectedYear = computed(() => (props.selectedDate ? Number(props.selectedDate.slice(0, 4)) : null))
 
-const rows = computed(() => monthsOf(props.ranking)[month.value - 1] ?? [])
+/**
+ * The basis as `detailOption` and the guide want it: a month number, or `null`
+ * for the year — the absence of a month, which is also how the API encodes it.
+ */
+const activeBasis = computed<RankBasis>(() => (basis.value === 'year' ? null : month.value))
+
+const rows = computed(() => (
+  basis.value === 'year'
+    ? props.ranking?.annual ?? []
+    : monthsOf(props.ranking)[month.value - 1] ?? []
+))
 const hasData = computed(() => rows.value.length > 0)
 const topN = computed(() => props.ranking?.top ?? 10)
 /**
@@ -257,7 +324,7 @@ const topN = computed(() => props.ranking?.top ?? 10)
  */
 const domain = computed(() => xDomainOf([rows.value], props.zeroLine || props.categorical))
 /** Spells out the `*` on a truncated edge month, when this month has one. */
-const note = computed(() => partialNote(rows.value, month.value))
+const note = computed(() => partialNote(rows.value, activeBasis.value))
 
 /**
  * What every mark on the plot means, built from the ranking on screen so the
@@ -266,7 +333,7 @@ const note = computed(() => partialNote(rows.value, month.value))
  */
 const guide = computed(() => readingGuide({
   ranking: props.ranking,
-  month: month.value,
+  basis: activeBasis.value,
   rows: rows.value,
   topN: topN.value,
   rankOrder: props.rankOrder,
@@ -302,6 +369,11 @@ const detailHeight = computed(() => detailHeightFor(rows.value.length, pitch.val
  * this panel follows the map's month rather than a selection of its own, would
  * bounce it straight off the month just clicked. The first Monday inside the
  * month is the nearest bucket that does not.
+ *
+ * On the annual basis the map keeps the month it is on and only the year moves:
+ * a year has no one date to land on, and jumping to 1 January every time would
+ * make two clicked years incomparable on the map — which is the comparison the
+ * click is being made to see.
  */
 function dateFor(year: number): string {
   const first = `${year}-${String(month.value).padStart(2, '0')}-01`
@@ -328,7 +400,7 @@ function renderDetail() {
   chart.setOption(
     detailOption({
       rows: rows.value,
-      month: month.value,
+      basis: activeBasis.value,
       stops: props.stops,
       domain: domain.value,
       pitch: pitch.value,
@@ -382,7 +454,7 @@ watch([pane, detail], () => {
   nextTick(renderDetail)
 }, { immediate: true, flush: 'post' })
 
-watch([() => props.ranking, () => props.selectedDate, detailHeight], () => {
+watch([() => props.ranking, () => props.selectedDate, basis, detailHeight], () => {
   if (!hasData.value) {
     chart?.dispose()
     chart = null

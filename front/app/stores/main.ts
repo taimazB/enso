@@ -60,6 +60,51 @@ export interface DomainMeta {
     colormap: string | null
     derived: boolean
     /**
+     * What this variable's value is measured AGAINST, or null where that is not
+     * a question — `sst` is an absolute temperature and has none.
+     *
+     * Per variable, not per project, because the dashboard carries **two
+     * different baselines and they are not reconcilable**: `anom` is a
+     * departure from a 1991-2020 daily mean computed in this project, while
+     * `mhw` is a category NOAA assigned against a 1985-2012 90th percentile
+     * over an 11-day window. Different years, different window, different
+     * statistic. Nothing in either number reveals that, so the UI says it.
+     *
+     * `statistic` is what the phrasing turns on: a `mean` baseline makes a
+     * departure ("1.2 degC above normal"), a `p90` one an EXCEEDANCE, and
+     * describing the latter as a departure is the confusion this exists to
+     * stop. Measured over this box, the P90-minus-mean gap a Cat 1 needs runs
+     * +0.60 to +1.62 degC depending on the cell, so no anomaly value maps to a
+     * category.
+     *
+     * Declared in `domain.yml` and served through `/domain`, never written out
+     * here: the years used to be a literal in this file's neighbours and in two
+     * components, which is how the wrong baseline gets printed by the right
+     * number.
+     */
+    baseline: {
+      /** "1991-2020" — the years alone, for places that print only those. */
+      period: string
+      /** `mean` | `p90`. What the comparison is against. */
+      statistic: 'mean' | 'p90'
+      /** Days averaged per day-of-year. Ours is 1; NOAA's MHW is 11, centred. */
+      windowDays: number
+      /** One phrase naming the comparison: "the 1991-2020 daily mean". */
+      label: string
+      /** `here` if this project derived it, `noaa` if it arrived applied. */
+      computedBy: 'here' | 'noaa'
+      /** The longer explanation, for the note's popover. */
+      note: string | null
+      /** The method's own authors, where the data provider did not invent it. */
+      references: Array<{
+        authors: string
+        year: number
+        title: string
+        source: string
+        url: string
+      }>
+    } | null
+    /**
      * Named one-click display ranges for the colour-range control. The default
      * range is NOT among them — it is `vmin`/`vmax` above, and the control
      * builds its chip from those, so there is one definition of it. Empty for a
@@ -607,6 +652,38 @@ export const useMainStore = defineStore('main', {
 
     activeIsCategorical: state =>
       state.domain?.variables?.[state.variable]?.categorical ?? false,
+
+    /**
+     * What a variable is measured against, or null for an absolute one.
+     *
+     * A getter rather than a reach into `domain` at each call site so that the
+     * About dialog, the inline note under the chart and the ranking guide all
+     * read one thing. They must: the whole point is that `anom` and `mhw` do
+     * NOT share a baseline, and three components each fetching their own would
+     * be three chances to print the other variable's years.
+     */
+    baselineFor: state => (variable: VariableName) =>
+      state.domain?.variables?.[variable]?.baseline ?? null,
+
+    /** The baseline of the variable currently on screen. */
+    activeBaseline(state) {
+      return this.baselineFor(state.variable)
+    },
+
+    /**
+     * The baseline phrased as a comparison, ready to print after the variable's
+     * name: "vs the 1991-2020 daily mean".
+     *
+     * The preposition follows `statistic`, which is the one distinction worth
+     * spending a branch on. A mean is something a value departs FROM; a 90th
+     * percentile is something it EXCEEDS, and "vs NOAA's 1985-2012 90th
+     * percentile" would invite reading a category as a departure of some size.
+     */
+    activeBaselinePhrase(): string {
+      const b = this.activeBaseline
+      if (!b) return ''
+      return b.statistic === 'p90' ? `exceeds ${b.label}` : `vs ${b.label}`
+    },
 
     /**
      * The unit suffix to print after a value, or '' where there is none.

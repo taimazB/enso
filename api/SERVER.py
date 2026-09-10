@@ -172,6 +172,44 @@ def domain() -> dict:
                 ],
                 # `anom` is computed as sst - climatology, not stored.
                 "derived": v.derived,
+                # WHAT THIS VARIABLE IS MEASURED AGAINST, or null where that is
+                # not a question (`sst` is an absolute temperature).
+                #
+                # Shipped per variable rather than as one project-wide constant
+                # because the dashboard carries **two different baselines** and
+                # they are not reconcilable: `anom` is a departure from a
+                # 1991-2020 daily mean computed here, `mhw` a category NOAA
+                # assigned against a 1985-2012 90th percentile with an 11-day
+                # window. Nothing in either number says so, so the UI has to.
+                #
+                # `statistic` is what a client keys off to phrase it correctly:
+                # a `mean` baseline makes a departure, a `p90` one an
+                # exceedance, and calling the latter a departure is the specific
+                # confusion this block exists to prevent.
+                "baseline": (
+                    {
+                        "period": v.baseline.period,
+                        "statistic": v.baseline.statistic,
+                        "windowDays": v.baseline.window_days,
+                        "label": v.baseline.label,
+                        "computedBy": v.baseline.computed_by,
+                        "note": v.baseline.note,
+                        # The method's own authors, where the data provider did
+                        # not invent it. Empty for anything computed here.
+                        "references": [
+                            {
+                                "authors": r.authors,
+                                "year": r.year,
+                                "title": r.title,
+                                "source": r.source,
+                                "url": r.url,
+                            }
+                            for r in v.baseline.references
+                        ],
+                    }
+                    if v.baseline is not None
+                    else None
+                ),
                 # An ordinal class rather than a measurement. The frontend needs
                 # this to draw a step ramp instead of an interpolation, to hide
                 # the colour-range control (there is nothing between two classes
@@ -466,7 +504,10 @@ def named_region_ranking(
     top: int = Query(10, ge=1, le=100),
     variable: Variable = "anom",
 ) -> dict:
-    """Each calendar month's years over a named region, ranked warmest-first.
+    """A named region's years ranked, within each calendar month and over the year.
+
+    `months` and `annual` both come back, off one scan -- the panel toggles
+    between them without a second request.
 
     The cell endpoint's question asked of a box: the ranked value is the month's
     mean of the region's daily cos(lat)-weighted area means, so a year that ranks
@@ -492,14 +533,16 @@ def named_region_ranking(
 
 @app.post("/monthlyRanking")
 def monthly_ranking_endpoint(request: RankingRequest, http_request: Request):
-    """Each calendar month's years at one cell, ranked warmest-first.
+    """One cell's years ranked, within each calendar month (`months`) and over
+    the whole calendar year (`annual`).
 
-    Always monthly regardless of the caller's `period`: ranking weekly buckets
-    against each other is a different question, and letting the period toggle
-    change what this means would make it unreadable.
+    Never the caller's `period`: ranking weekly buckets against each other is a
+    different question, and letting the period toggle change what this means
+    would make it unreadable. The two groupings here are the two that can be
+    asked, and they come off one scan.
 
-    Every month is ranked, the archive's truncated edge months included: the
-    month in progress is the one most worth looking at, so it is shown with
+    Every period is ranked, the archive's truncated edges included: the month or
+    year in progress is the one most worth looking at, so it is shown with
     `partial: true` on its rows -- the frontend stars it and says how many days
     it stands on -- rather than left out.
     """

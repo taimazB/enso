@@ -167,27 +167,34 @@
                     </span>
                   </div>
 
-                  <svg
-                    v-else-if="step.figure === 'ranks'"
-                    viewBox="0 0 300 56" class="h-14 w-[300px]"
-                  >
-                    <g v-for="(row, n) in rankRows" :key="row.label">
-                      <text
-                        x="46" :y="14 + n * 16" text-anchor="end" font-size="8"
-                        class="fill-current" :class="n === 0 ? 'text-highlighted' : 'text-muted'"
-                      >{{ row.label }}</text>
-                      <line
-                        :x1="row.x - 22" :y1="11 + n * 16" :x2="row.x + 22" :y2="11 + n * 16"
-                        class="stroke-current text-muted/50" stroke-width="1"
-                      />
-                      <circle
-                        :cx="row.x" :cy="11 + n * 16" r="4"
-                        :fill="row.open ? 'transparent' : row.color"
-                        :stroke="row.ring ? ACCENT : row.color"
-                        :stroke-width="row.ring ? 2 : 1.5"
-                      />
-                    </g>
-                  </svg>
+                  <!-- The toggle above the rows, because the step is now about
+                       both: which question is being asked, and how to read the
+                       answer. Same replica convention as every other figure. -->
+                  <div v-else-if="step.figure === 'ranks'" class="space-y-2">
+                    <UFieldGroup size="xs">
+                      <UButton label="Month" color="primary" variant="solid" />
+                      <UButton label="Year" color="neutral" variant="subtle" />
+                    </UFieldGroup>
+
+                    <svg viewBox="0 0 300 56" class="h-14 w-[300px]">
+                      <g v-for="(row, n) in rankRows" :key="row.label">
+                        <text
+                          x="46" :y="14 + n * 16" text-anchor="end" font-size="8"
+                          class="fill-current" :class="n === 0 ? 'text-highlighted' : 'text-muted'"
+                        >{{ row.label }}</text>
+                        <line
+                          :x1="row.x - 22" :y1="11 + n * 16" :x2="row.x + 22" :y2="11 + n * 16"
+                          class="stroke-current text-muted/50" stroke-width="1"
+                        />
+                        <circle
+                          :cx="row.x" :cy="11 + n * 16" r="4"
+                          :fill="row.open ? 'transparent' : row.color"
+                          :stroke="row.ring ? ACCENT : row.color"
+                          :stroke-width="row.ring ? 2 : 1.5"
+                        />
+                      </g>
+                    </svg>
+                  </div>
 
                   <div v-else class="flex items-center gap-3">
                     <UButton icon="i-mdi-download" label="Download data" variant="ghost" color="neutral" size="xs" />
@@ -216,7 +223,8 @@
         <section class="space-y-2">
           <p class="text-default">
             Daily sea surface temperature, its anomaly against the 1991&ndash;2020
-            climatology, and marine heatwave category for the Pacific
+            climatology, and NOAA&rsquo;s marine heatwave category &mdash; which uses a
+            <em>different</em> baseline, see below &mdash; for the Pacific
             &mdash; 60&deg;S&ndash;65&deg;N, 100&deg;E&ndash;290&deg;E &mdash; at
             0.05&deg; resolution, from 1985 to the present.
           </p>
@@ -244,10 +252,38 @@
                 target="_blank"
                 class="text-primary"
               >NOAA CRW Marine Heatwave v1.0.1</ULink>
-              &mdash; daily heatwave category, Moderate through Beyond extreme.
+              &mdash; daily heatwave category, Moderate through Beyond extreme,
+              against a 1985&ndash;2012 90th-percentile climatology.
             </li>
             <li v-if="store.coverage">
               Ingested here: {{ store.coverage.start }} &ndash; {{ store.coverage.end }}.
+            </li>
+          </ul>
+        </section>
+
+        <!-- The heatwave method is not NOAA's, and a user was right to say so:
+             NOAA applies the algorithm and publishes the product, but the
+             definition of a marine heatwave and the five category names are
+             Hobday and colleagues'. The citations come from `/domain`, where
+             they sit beside the baseline they describe, rather than being typed
+             out here where they would drift from it. -->
+        <section v-if="mhwReferences.length" class="space-y-2">
+          <h3 class="text-xs font-semibold uppercase tracking-wide text-highlighted">
+            Marine heatwave method
+          </h3>
+          <p class="text-muted">
+            The marine heatwave definition and its categories are not NOAA&rsquo;s.
+            NOAA Coral Reef Watch applies the algorithm to CoralTemp and publishes
+            the result; the method is:
+          </p>
+          <ul class="space-y-1 text-muted">
+            <li v-for="r in mhwReferences" :key="r.url" class="flex gap-2">
+              <span class="mt-1.5 size-1 shrink-0 rounded-full bg-accented" />
+              <span>
+                {{ r.authors }} ({{ r.year }}).
+                <ULink :to="r.url" target="_blank" class="text-primary">{{ r.title }}</ULink>.
+                {{ r.source }}.
+              </span>
             </li>
           </ul>
         </section>
@@ -352,8 +388,10 @@ const steps = [
   {
     title: 'Choose the field',
     figure: 'field',
-    text: 'Temperature, Anomaly (against the 1991\u20132020 climatology) or Marine heatwave category, '
-      + 'in the bar under the map. A field whose archive is not fully loaded stays disabled and says why.',
+    text: 'Temperature, Anomaly (against the 1991\u20132020 climatology) or Marine heatwave category '
+      + '(against NOAA\u2019s 1985\u20132012 90th percentile \u2014 a different baseline), in the bar under '
+      + 'the map. The line under the chart always names the one in force. A field whose archive is not '
+      + 'fully loaded stays disabled and says why.',
   },
   {
     title: 'Choose a place',
@@ -385,15 +423,16 @@ const steps = [
   {
     title: 'Compare years',
     figure: 'ranks',
-    text: 'The panel on the left ranks every year\u2019s version of the month the map is on. Its own '
-      + '\u201cHow to read\u201d popover explains the dots and the whiskers; clicking a row moves the map '
-      + 'to that year.',
+    text: 'The panel on the left ranks the years against each other \u2014 Month ranks every year\u2019s '
+      + 'version of the month the map is on, Year ranks whole calendar years. Its own \u201cHow to '
+      + 'read\u201d popover explains the dots and the whiskers; clicking a row moves the map to that year.',
   },
   {
     title: 'Take the numbers with you',
     figure: 'csv',
-    text: 'Two CSV buttons: one saves the series as plotted, the other all twelve months of rankings. '
-      + 'Both export what is already on screen, so the file and the chart cannot disagree.',
+    text: 'Two CSV buttons: one saves the series as plotted, the other the ranking \u2014 all twelve '
+      + 'months of it, or every year, following the toggle. Both export what is already on screen, so '
+      + 'the file and the chart cannot disagree.',
   },
 ]
 
@@ -403,6 +442,11 @@ const notes = [
   'A weekly or monthly heatwave frame is the worst category reached in that span, not an average \u2014 '
     + 'there is no category between two categories. A region\u2019s heatwave series is an area mean, so it '
     + 'is a severity index rather than a class.',
+  'The anomaly and the heatwave category use DIFFERENT baselines, and neither number shows it. '
+    + 'The anomaly is a departure from the 1991\u20132020 average for that day of the year. A heatwave '
+    + 'category is an exceedance of NOAA\u2019s 1985\u20132012 90th percentile over an 11-day window \u2014 '
+    + 'a threshold that is a different number in every cell. So a large anomaly does not correspond to '
+    + 'any particular category, and the two are not two views of one departure.',
   'Grey ocean has no climatology \u2014 the seasonal ice fringe \u2014 so it has a temperature but no '
     + 'anomaly. Land is transparent, not grey.',
   'The map opens as a globe; the Globe / Flat pair at its top-left switches, and the choice is remembered.',
@@ -438,6 +482,15 @@ const supporters = [
 ]
 
 const store = useMainStore()
+
+/**
+ * The marine heatwave method's own citations, from `/domain`.
+ *
+ * Read off the variable that declares them rather than hard-coded here: the
+ * references belong to a baseline, and a bibliography kept in a component
+ * drifts from the data it describes the first time either is edited.
+ */
+const mhwReferences = computed(() => store.baselineFor('mhw')?.references ?? [])
 const version = useRuntimeConfig().public.version
 const open = ref(false)
 const tab = ref<'guide' | 'about'>('guide')

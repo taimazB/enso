@@ -143,6 +143,26 @@ variables:
       scale: 0.1
       offset: -12.8
       sentinel: 0
+    # WHAT THIS IS MEASURED AGAINST. Declared here so it is said once: it used
+    # to be a constant in api/modules/timeseries.py, another in
+    # api/modules/state.py, and a literal in ranking.ts and AboutDialog.vue.
+    #
+    # Note the contrast with `mhw` below, which is the point of putting both in
+    # one file where they can be read side by side. Different years, a different
+    # window and a different statistic — so an anomaly and a category are NOT
+    # two views of the same departure.
+    baseline:
+      period: '1991-2020'
+      statistic: mean
+      window_days: 1
+      label: the 1991-2020 daily mean
+      computed_by: here
+      note: >-
+        Each day is compared with the average of that same calendar day over
+        1991-2020, from NOAA Coral Reef Watch's CoralTemp v3.1 daily
+        climatology. This is the current WMO 30-year normal, and it is the same
+        baseline NOAA's own CoralTemp SST anomaly product uses. It is NOT the
+        baseline behind the marine heatwave categories.
   mhw:
     long_name: Marine heatwave category
     short_name: MHW
@@ -193,6 +213,60 @@ variables:
       channels: [R]
       scale: 1.0
       offset: 0.0
+    # A DIFFERENT BASELINE FROM `anom` ABOVE, and the reason this block exists.
+    #
+    # The category is not computed here. NOAA applies the Hobday algorithm to
+    # CoralTemp and publishes the finished class, so this baseline is a fact
+    # about the incoming file, not a choice this project can revisit: nothing in
+    # this database could re-base it. Hence `computed_by: noaa`.
+    #
+    # `statistic: p90` is the part that matters most. Cat 1 is SST above the
+    # 90th percentile, which is an EXCEEDANCE, not a departure from the mean —
+    # and the gap between the two varies by cell. Measured over this box for day
+    # 001: P90 minus mean averages +1.02 degC, p5 +0.60, p95 +1.62. So there is
+    # no anomaly value that corresponds to a category anywhere, and re-basing
+    # `anom` onto these same years would not change that (the two means differ
+    # by only +0.104 degC over the box, ~10% of that spread).
+    #
+    # 11-day window, and Feb 29 is excluded from NOAA's calculation entirely —
+    # derived instead as the mean of Feb 28 and Mar 1 — which is why that
+    # climatology ships 365 files against our 366.
+    baseline:
+      period: '1985-2012'
+      statistic: p90
+      window_days: 11
+      # No "NOAA's" here: `computed_by` already says who applied it, and the
+      # inline note appends that, which read as "NOAA's ... applied by NOAA".
+      label: the 1985-2012 90th percentile
+      computed_by: noaa
+      note: >-
+        A marine heatwave is a day whose temperature exceeds the 90th percentile
+        of an 11-day window centred on that day of the year, over 1985-2012, and
+        the category counts how many multiples of that threshold's departure it
+        reaches. This is a percentile exceedance, not a departure from an
+        average, and it uses different years from the anomaly, so a +1 °C
+        anomaly does not correspond to any particular category.
+      # The method is not NOAA's. NOAA applies it and publishes the product; the
+      # definition and the five category names are Hobday and colleagues'. Cited
+      # because a user asked for it, and because attributing someone else's
+      # method to the data provider is a real misattribution rather than a
+      # missing nicety.
+      references:
+        - authors: Hobday et al.
+          year: 2016
+          title: A hierarchical approach to defining marine heatwaves
+          source: Progress in Oceanography 141, 227-238
+          url: https://doi.org/10.1016/j.pocean.2015.12.014
+        - authors: Hobday et al.
+          year: 2018
+          title: Categorizing and naming marine heatwaves
+          source: Oceanography 31(2)
+          url: https://doi.org/10.5670/oceanog.2018.205
+        - authors: Oliver et al.
+          year: 2018
+          title: Longer and more frequent marine heatwaves over the past century
+          source: Nature Communications 9, 1324
+          url: https://doi.org/10.1038/s41467-018-03732-9
 
 # Named boxes for area-mean indices. Bounds are inclusive cell-centre ranges in
 # degrees_east (0-360) / degrees_north, and all of them fit inside `subset`.

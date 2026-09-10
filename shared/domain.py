@@ -97,6 +97,66 @@ class Subset:
 
 
 @dataclass(frozen=True)
+class Reference:
+    """One citation, for a method this project did not invent.
+
+    Kept structured rather than as a formatted string because the frontend
+    renders the author/year as the link text and the full citation as its
+    title — and because a bibliography written twice drifts.
+    """
+
+    authors: str
+    year: int
+    title: str
+    source: str
+    url: str
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """What a variable's value is measured *against*, said once.
+
+    This exists because the dashboard carries **two different baselines** and
+    nothing in the numbers themselves says so. `anom` is computed here, against
+    a 1991-2020 daily mean; `mhw` arrives already categorised by NOAA against a
+    1985-2012 mean **and 90th percentile**. The years differ, the window differs
+    (1 day against 11), and the statistic differs — so a +1 degC anomaly and a
+    Category 1 are not two views of one departure, and a reader who assumes they
+    are will read the map wrong.
+
+    The string used to be a constant in `api/modules/state.py`, another in
+    `api/modules/timeseries.py`, and a literal in two TypeScript files and a Vue
+    template. Declaring it here puts it where the rest of a variable's metadata
+    already is and ships it through `/domain`, so the About dialog, the reading
+    guide, the inline note and the API payloads cannot disagree about what the
+    number is relative to.
+
+    `statistic` is the load-bearing field. `mean` makes a departure; `p90` makes
+    an EXCEEDANCE, which is why no anomaly value maps to a category: measured
+    over this box, the P90-minus-mean departure a Cat 1 needs averages +1.02 degC
+    but spans +0.60 at p5 to +1.62 at p95, so the threshold is a different number
+    in every cell.
+    """
+
+    # "1991-2020". The years alone, for the many places that print just those.
+    period: str
+    # `mean` | `p90`. What the comparison is against, not merely over what years.
+    statistic: str
+    # One sentence naming the comparison, e.g. "the 1991-2020 daily mean".
+    label: str
+    # Who computed it. `here` means this project derived it from the source
+    # archive; `noaa` means it arrived already applied and cannot be re-based.
+    computed_by: str
+    # Width in days of the window each day-of-year is averaged over. Ours is 1;
+    # NOAA's MHW climatology uses 11, centred.
+    window_days: int = 1
+    # The longer explanation, shown in the inline note's popover.
+    note: str | None = None
+    # The method's own authors, where they are not the data provider.
+    references: tuple[Reference, ...] = ()
+
+
+@dataclass(frozen=True)
 class Category:
     """One class of a categorical variable: its code, colour and name."""
 
@@ -172,6 +232,11 @@ class Variable:
     # and the control does not exist for it. Validated against `range_limits()`
     # by the loader; see `Preset`.
     presets: tuple[Preset, ...] = ()
+    # What this variable's value is measured against, where that is a
+    # question at all. `sst` is an absolute temperature and declares none;
+    # `anom` and `mhw` declare DIFFERENT ones, which is the whole reason
+    # this is per-variable metadata rather than a single project constant.
+    baseline: Baseline | None = None
 
     def range_limits(self) -> tuple[float, float]:
         """Bounds for a user-chosen display range, clipped to what is encodable."""
@@ -344,8 +409,13 @@ def variables() -> dict[str, Variable]:
             cfg["limits"] = tuple(cfg["limits"])
         cfg["colors"] = tuple(Category(**c) for c in cfg.get("colors", ()))
         cfg["presets"] = tuple(Preset(**p) for p in cfg.get("presets", ()))
+        if cfg.get("baseline") is not None:
+            b = dict(cfg["baseline"])
+            b["references"] = tuple(Reference(**r) for r in b.get("references", ()))
+            cfg["baseline"] = Baseline(**b)
         out[name] = Variable(name=name, encoding=Encoding(**enc), **cfg)
         _check_presets(out[name])
+        _check_baseline(out[name])
     return out
 
 
@@ -364,6 +434,35 @@ def _check_presets(v: Variable) -> None:
                 f"{v.name}: preset {p.label!r} spans {p.vmin}..{p.vmax}, "
                 f"outside the adjustable range {lo}..{hi}"
             )
+
+
+def _check_baseline(v: Variable) -> None:
+    """Reject a baseline that claims something the rest of the code contradicts.
+
+    Two rules, both cheap and both guarding a confusion that is invisible in the
+    output. A `statistic` outside the known pair would be printed verbatim into
+    the UI, where an unrecognised word reads as a typo rather than as a claim.
+    And `computed_by: here` asserts that this project derived the comparison and
+    could re-base it — true of `anom`, false of `mhw`, whose categories arrive
+    already fixed against NOAA's own climatology and cannot be recomputed from
+    anything in this database.
+    """
+    b = v.baseline
+    if b is None:
+        return
+    if b.statistic not in ("mean", "p90"):
+        raise ValueError(
+            f"{v.name}: baseline statistic {b.statistic!r} is not 'mean' or 'p90'"
+        )
+    if b.computed_by not in ("here", "noaa"):
+        raise ValueError(
+            f"{v.name}: baseline computed_by {b.computed_by!r} is not 'here' or 'noaa'"
+        )
+    if b.window_days < 1 or b.window_days % 2 == 0:
+        # A centred window has to be odd, or it has no centre day.
+        raise ValueError(
+            f"{v.name}: baseline window_days {b.window_days} is not a positive odd number"
+        )
 
 
 def variable(name: str) -> Variable:

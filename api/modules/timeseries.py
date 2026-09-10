@@ -39,7 +39,7 @@ the monthly rankings, which are asking a different question.
 
 The rankings come in both shapes for the same reason the timeseries do — a cell
 and a named region — and share one definition of the ranking itself
-(`_ranked_months`) over two different daily series. A named region's is free:
+(`_ranked_periods`) over two different daily series. A named region's is free:
 `region_daily` already holds its ~15k daily area means, the same order of rows as
 one cell's record. An arbitrary box has no rollup, so it has no ranking.
 """
@@ -99,7 +99,12 @@ def _series_units(variable_name: str, *, region: bool) -> str:
 # The climatology every anomaly here is against, and the normal the point SST
 # series carries. A string because it is a label, not arithmetic: it names
 # `sst_clim`'s source files and nothing computes with it.
-CLIMATOLOGY_BASELINE = "1991-2020"
+#
+# Taken from `anom`'s declaration in `domain.yml`, not written out again: `mhw`
+# declares a DIFFERENT baseline (NOAA's 1985-2012 90th percentile) and the two
+# are a step apart in the same payload, so the only safe version of this string
+# is the one the variable itself carries.
+CLIMATOLOGY_BASELINE = variable("anom").baseline.period
 
 
 def check_variable(name: str) -> str:
@@ -728,6 +733,23 @@ def _partial_months(lo: dt.date, hi: dt.date) -> set[tuple[int, int]]:
     return partial
 
 
+def _partial_years(lo: dt.date, hi: dt.date) -> set[int]:
+    """The calendar years the archive covers only partly -- the same rule, a year up.
+
+    At most two, and in practice usually two: the record opens on 1985-01-01 (so
+    the first year is whole) and the last year is always the one in progress.
+    Ranked with the rest and starred, exactly as a partial month is: an annual
+    mean over eight months is the number people most want to see and the one
+    most in need of the caveat.
+    """
+    partial = set()
+    if (lo.month, lo.day) != (1, 1):
+        partial.add(lo.year)
+    if (hi.month, hi.day) != (12, 31):
+        partial.add(hi.year)
+    return partial
+
+
 def _finite(value) -> float | None:
     """Round for the response, or `None` if the value is not a real number."""
     if value is None:
@@ -736,63 +758,99 @@ def _finite(value) -> float | None:
     return round(value, 3) if math.isfinite(value) else None
 
 
-def _ranked_months(source: str, params: dict) -> dict:
-    """Rank one daily series' calendar months against each other, year by year.
+def _ranked_periods(source: str, params: dict) -> dict:
+    """Rank one daily series' calendar months *and* its calendar years.
 
-    `source` is any subquery yielding `(date, value)` — one cell's record, or a
+    `source` is any subquery yielding `(date, value)` -- one cell's record, or a
     named region's daily area means. **The ranking itself is defined once, here**,
     so a region's ranks and a cell's cannot drift into meaning different things:
-    same grouping, same `stddevSamp`, same `row_number()`, same partial-month
-    flagging. Only the series underneath differs.
+    same grouping, same `stddevSamp`, same `row_number()`, same partial flagging.
+    Only the series underneath differs.
 
-    Returns the `months` mapping plus the archive edges the caller reports.
+    **Both groupings come off one scan**, via `GROUP BY GROUPING SETS` -- the
+    annual set arrives with `month = 0`, which is also the partition the window
+    function ranks it within, so the years are ranked against each other by
+    exactly the same expression that ranks the Augusts against each other. Two
+    queries would have been two definitions of the ranking again, which is the
+    one thing this function exists to prevent.
+
+    A year's mean is the mean of its **days**, not of its twelve monthly means:
+    the months are not the same length, and averaging averages would weight
+    February like July.
+
+    Returns the `months` mapping, the `annual` list, and the archive edges the
+    caller reports.
     """
     months: dict[str, list[dict]] = {str(m): [] for m in range(1, 13)}
+    annual: list[dict] = []
     edges = _archive_edges()
     if edges is None:
-        return {"months": months, "edges": None}
+        return {"months": months, "annual": annual, "edges": None}
 
-    partial = _partial_months(*edges)
+    partial_months = _partial_months(*edges)
+    partial_years = _partial_years(*edges)
     rows = client().query(
         f"""
-        SELECT toMonth(date) AS month,
-               toYear(date)  AS year,
-               avg(value)    AS mean_value,
+        SELECT month,
+               year,
+               avg(value)        AS mean_value,
                stddevSamp(value) AS sd,
-               count()       AS n,
+               count()           AS n,
                row_number() OVER (
-                   PARTITION BY toMonth(date) ORDER BY avg(value) DESC
+                   PARTITION BY month ORDER BY avg(value) DESC
                ) AS rank
-        FROM ({source})
-        GROUP BY month, year
+        FROM (
+            SELECT toMonth(date) AS month, toYear(date) AS year, value
+            FROM ({source})
+        )
+        GROUP BY GROUPING SETS ((month, year), (year))
         ORDER BY month, rank
         """,
         parameters=params,
     ).result_rows
 
     for month, year, mean_value, sd, n, rank in rows:
-        months[str(month)].append({
-            "year": int(year),
+        month, year = int(month), int(year)
+        row = {
+            "year": year,
             "mean": round(float(mean_value), 3),
-            # `stddevSamp` of a single day is NaN, not NULL — which is what a
+            # `stddevSamp` of a single day is NaN, not NULL -- which is what a
             # month at the edge of the archive is on the day it opens. Starlette
             # serialises with `allow_nan=False`, so letting one through is a 500
             # for the whole ranking rather than one missing field.
             "sd": _finite(sd),
             "n": int(n),
             "rank": int(rank),
-            # Truncated by the edge of the archive, so its mean is over a
-            # part-month and its rank will move as the rest lands.
-            "partial": (int(year), int(month)) in partial,
-        })
+            # Truncated by the edge of the archive, so its mean is over a part
+            # period and its rank will move as the rest lands.
+            "partial": (
+                year in partial_years if month == 0
+                else (year, month) in partial_months
+            ),
+        }
+        # `month = 0` is the grouping set with no month at all: the whole year.
+        (annual if month == 0 else months[str(month)]).append(row)
 
-    return {"months": months, "edges": edges}
+    return {"months": months, "annual": annual, "edges": edges}
 
 
-def _ranking_envelope(ranked: dict, top: int) -> dict:
-    """The span/through/top fields both ranking endpoints report identically."""
+def _ranking_envelope(ranked: dict, top: int, name: str) -> dict:
+    """The span/through/top fields both ranking endpoints report identically.
+
+    `climatologyBaseline` is here rather than only on the series because the
+    ranking's own reading guide names what the number is measured against, and
+    this dashboard has **two baselines**: `anom` departs from the 1991-2020
+    daily mean computed here, while `mhw` is NOAA's category against a 1985-2012
+    90th percentile. It is null for anything that is not a departure at all --
+    `sst` is absolute, and an `mhw` rank is an exceedance count, so naming a
+    climatology beside either would be the wrong claim rather than a missing one.
+    """
     edges = ranked["edges"]
+    baseline = variable(name).baseline
     return {
+        "climatologyBaseline": (
+            baseline.period if baseline and baseline.statistic == "mean" else None
+        ),
         "span": None if edges is None else {
             "start": str(edges[0].replace(day=1)),
             "end": str(_month_end(edges[1])),
@@ -800,11 +858,12 @@ def _ranking_envelope(ranked: dict, top: int) -> dict:
         "through": None if edges is None else str(edges[1]),
         "top": top,
         "months": ranked["months"],
+        "annual": ranked["annual"],
     }
 
 
 def _point_ranking_source(name: str) -> str:
-    """The daily `(date, value)` series at one cell, for `_ranked_months`."""
+    """The daily `(date, value)` series at one cell, for `_ranked_periods`."""
     if name == "mhw":
         # **Mean, not max** — the one place `mhw` is deliberately averaged.
         # This ranks years against each other, and a max would put half the
@@ -877,11 +936,13 @@ def _region_ranking_source(name: str) -> str:
 def monthly_ranking(
     lat: float, lon: float, top: int = 10, variable_name: str = "anom"
 ) -> dict:
-    """Every calendar month at the nearest cell, ranked within its month-of-year.
+    """Every calendar month at the nearest cell, ranked within its month-of-year,
+    and every calendar year ranked against every other.
 
     One row per (month-of-year, year): the mean daily value, the standard
     deviation of the daily values inside that month, and the year's rank among
-    all years for that month, warmest first.
+    all years for that month, warmest first. `annual` is the same row shape over
+    the whole year -- a mean of the year's days, not of its monthly means.
 
     `sd` is day-to-day spread at a single cell, so it is much wider than the same
     statistic on `region_monthly_ranking()`'s area means — spatial averaging
@@ -897,7 +958,7 @@ def monthly_ranking(
 
     grid = global_grid()
     gy, gx = int(grid.gy(lat)), int(grid.gx(lon))
-    ranked = _ranked_months(_point_ranking_source(name), {"gy": gy, "gx": gx})
+    ranked = _ranked_periods(_point_ranking_source(name), {"gy": gy, "gx": gx})
 
     return {
         "variable": name,
@@ -910,7 +971,7 @@ def monthly_ranking(
             "lat": float(grid.lat(gy)),
             "lon": float(grid.lon(gx)),
         },
-        **_ranking_envelope(ranked, top),
+        **_ranking_envelope(ranked, top, name),
     }
 
 
@@ -937,7 +998,7 @@ def region_monthly_ranking(
     """
     region = regions()[key]
     name = check_variable(variable_name)
-    ranked = _ranked_months(_region_ranking_source(name), {"key": key})
+    ranked = _ranked_periods(_region_ranking_source(name), {"key": key})
 
     return {
         "variable": name,
@@ -950,5 +1011,5 @@ def region_monthly_ranking(
         # question than it does at a cell. Flagged rather than renamed: the
         # column is the same statistic over a different series.
         "areaMean": True,
-        **_ranking_envelope(ranked, top),
+        **_ranking_envelope(ranked, top, name),
     }

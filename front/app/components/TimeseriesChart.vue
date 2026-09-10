@@ -1,10 +1,18 @@
 <template>
-  <div class="relative size-full">
-    <TimeControl />
+  <!--
+    A flex COLUMN, so the plot gets the height left over after the control row
+    rather than a full 100% of the pane on top of it. It was `relative size-full`
+    with `size-full` on the plot too, which made the canvas overflow the pane by
+    exactly the control's height and pushed the x-axis labels off the bottom of
+    the viewport. Invisible while nothing sat under the pane; not once anything
+    did.
+  -->
+  <div class="relative flex size-full flex-col">
+    <TimeControl class="shrink-0" />
 
     <div
       v-if="!hasData"
-      class="flex size-full items-center justify-center px-6 text-center text-sm text-muted"
+      class="flex min-h-0 grow items-center justify-center px-6 text-center text-sm text-muted"
     >
       <UIcon v-if="loading" name="i-mdi-loading" class="size-5 animate-spin" />
       <!-- An outright failure is not the same as nothing to show yet, so it
@@ -18,7 +26,7 @@
 
     <ClientOnly v-else>
       <!-- Clicking the plot sets the map date, so the whole rail reads as clickable. -->
-      <div ref="container" class="size-full cursor-pointer" />
+      <div ref="container" class="min-h-0 grow cursor-pointer" />
     </ClientOnly>
 
     <!-- A refetch keeps the previous series on screen rather than blanking it —

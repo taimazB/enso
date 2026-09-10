@@ -15,7 +15,10 @@
           <h1 class="text-sm font-semibold leading-tight">Pacific Sea Surface Temperature</h1>
           <p class="text-xs text-muted leading-tight">
             NOAA Coral Reef Watch CoralTemp v3.1 &middot; daily &middot; 0.05&deg;
-            <span v-if="store.variable === 'anom'"> &middot; vs. 1991&ndash;2020</span>
+            <!-- The years come from the variable's own declaration, not from a
+                 literal: `mhw` has a DIFFERENT baseline, so a hard-coded pair
+                 here is one `v-if` away from labelling the wrong one. -->
+            <span v-if="store.activeBaseline"> &middot; {{ store.activeBaselinePhrase }}</span>
           </p>
         </div>
         <div class="grow" />
