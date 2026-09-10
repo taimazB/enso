@@ -91,6 +91,7 @@ python -m CRW.cli mask     [--region KEY]                  # region_cells, for p
 python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh] [--clim]  # region_daily
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
+python -m CRW.cli repair-mhw-land [--date]                # re-do the leap days (see below)
 ```
 
 **There are two daily archives and every command covers both by default.** CoralTemp SST
@@ -224,6 +225,37 @@ Testing `<= 5` rather than the file's own `_FillValue` is deliberate: 1..5 is fi
 product definition — it is the five names in the legend — so the rule survives both
 encodings and whatever NOAA ships next. The fill value is what changed; the categories are
 what did not.
+
+**And there is a third failure of the same field, which the 1..5 bound cannot catch: every
+29 February in the archive ships with land collapsed into ocean at category 5.** Not a
+re-encoding — a bad file, in a product that is otherwise fine either side of it:
+
+| | land as `-127` | land as `5` | `mask == 2` (land) |
+|---|---|---|---|
+| 2024-02-28 | 8,726,860 | — | 8,726,860 |
+| **2024-02-29** | **0** | **8,731,446** | **0** |
+| 2016-02-29 / 2020-02-29 | 0 | ~8,727,000 | 0 |
+
+The companion `mask` variable is wrong the same way — it reports water where land is — and
+its ice count is byte-identical across 2016, 2020 and 2024, so the leap-day mask is frozen
+boilerplate rather than that day's. 5 is a legal category, so nothing in the value can
+reject it: it put **2,022,077 land cells a day at Cat 5** in `mhw_daily`, took the basin's
+heatwave extent to **62.4%** on 2024-02-29 against ~30% either side, and drew the continents
+in Cat 5's dark red on every leap-day frame. All ten leap days were affected.
+
+`read_mhw_raw` therefore stops trusting the file's own land encoding: it asks the `mask`
+variable whether the file carries **any** land — a global grid always does — and when it
+does not, takes the land mask from the same date's CoralTemp file and rewrites those cells
+to `MHW_LAND_CODE`. It **raises** if that file is not on disk rather than falling back,
+which is why `shared/buckets.py` passes `sst_dir` alongside `mhw_dir`: on a leap day the
+CoralTemp file is not a nicety, it is where land comes from. Repaired, 2024-02-29 reads
+2,694,751 heatwave cells with 1,612 at Cat 5, against 02-28's 2,677,962 and 1,901.
+
+`CRW.cli repair-mhw-land` is the remediation, and it is a range rather than one file for
+the same reason `render` is: a weekly frame is a max over seven days, so re-rendering it
+with only the leap day on disk would replace a good seven-day max with a one-day one. Per
+date it fetches the CoralTemp file plus every MHW file the leap day's week and month span,
+re-ingests, re-renders the three `mhw` buckets and rebuilds `region_daily` for that date.
 
 #### Two baselines, and they are not reconcilable
 
@@ -1530,6 +1562,12 @@ menu, pick the default region — report nothing. Found in the browser, not by r
   testing a sign or a fill value — see the source section above for what a floor alone
   costs. The check that catches it in one line, and which belongs in any future test suite:
   `SELECT count() FROM mhw_daily WHERE cat > 5` must be 0.
+- **A category of 5 can also be land, and only on 29 February.** The leap-day files carry no
+  land at all — see the source section — so the value is legal and the row is junk. The
+  one-line check, which the `cat > 5` one above cannot see: for any leap day,
+  `SELECT countIf(cat = 5) FROM mhw_daily WHERE date = '2024-02-29'` must be in the
+  thousands, not the millions. `CRW.cli repair-mhw-land` is the fix, and it needs the
+  date's CoralTemp file — `read_mhw_raw` raises rather than guessing without it.
 - **A missing `mhw_daily` row is not a zero, it is an unknown.** The table is sparse by
   design, and the LEFT JOIN that restores its zeros cannot tell heatwave-free ocean from a
   date that was never ingested. Anything new that reads it must either go through that join

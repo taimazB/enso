@@ -84,6 +84,39 @@ MHW_VARIABLE_NAME = "heatwave_category"
 MHW_MIN_CATEGORY = 1
 MHW_MAX_CATEGORY = 5
 
+# The companion `mask` variable in the same file: 0 water, 1 ice, 2 land.
+MHW_MASK_NAME = "mask"
+MHW_MASK_LAND = 2
+# What a repaired land cell is rewritten to. Any value outside 1..5 does, since
+# `mhw_valid_mask` is the only thing that reads it; the first encoding's own
+# land code is used so a repaired array looks like the file it came from.
+MHW_LAND_CODE = -127
+
+# **A third failure of the source's land encoding, and this one is not a
+# re-encoding — it is a bad file.** Every **29 February** in the archive ships
+# with land collapsed into ocean and set to category 5:
+#
+#     2024-02-28   land: 8,726,860 cells at -127   mask: 8,726,860 cells at 2
+#     2024-02-29   land: none at -127              mask: no 2 at all
+#                  category 5: 8,731,446 cells     mask: 22,240,556 at 0 (water)
+#
+# The `mask` variable is wrong the same way — it reports water where land is —
+# and its ice count is byte-identical across 2016, 2020 and 2024, so the
+# leap-day mask is frozen boilerplate rather than that day's. All ten leap days
+# in the archive are affected.
+#
+# `mhw_valid_mask`'s 1..5 bound cannot catch it: 5 is a legal category. It cost
+# 2,022,077 land cells a day at Cat 5 in `mhw_daily`, took the basin's heatwave
+# extent to 62.4% on 2024-02-29 against ~30% either side, and drew the
+# continents in Cat 5's dark red on every leap-day frame.
+#
+# So the file's own land encoding is not trusted on its own: `read_mhw_raw`
+# checks that the file actually carries land, and when it does not it takes the
+# land mask from the same date's CoralTemp file — the authority on which cells
+# are ocean everywhere else in this project — and rewrites those cells. It
+# raises rather than guessing if that file is not on disk: ingesting a leap day
+# with land at Cat 5 is exactly the silent failure this is here to end.
+
 
 def mmdd_of(date: dt.date) -> int:
     """The climatology key for a date: month*100 + day, e.g. 2026-08-24 -> 824.
@@ -165,8 +198,25 @@ def read_daily_raw(date: dt.date, nc_dir: Path | None = None) -> np.ndarray:
     )
 
 
-def read_mhw_raw(date: dt.date, nc_dir: Path | None = None) -> np.ndarray:
-    """One day's raw Int8 heatwave category over the box.
+def mhw_carries_land(date: dt.date, nc_dir: Path | None = None) -> bool:
+    """Does this MHW file's own `mask` variable flag any land?
+
+    A good file flags ~8.7 M land cells globally. A leap-day file flags none,
+    having collapsed land into water and set its category to 5 — see
+    `MHW_LAND_CODE` above. This is the whole detection: land is not optional on
+    a global grid, so its absence is the file telling you it is wrong.
+    """
+    mask = _read_raw(mhw_path(date, nc_dir), squeeze_time=True, var_name=MHW_MASK_NAME)
+    return bool((mask == MHW_MASK_LAND).any())
+
+
+def read_mhw_raw(
+    date: dt.date,
+    nc_dir: Path | None = None,
+    *,
+    sst_dir: Path | None = None,
+) -> np.ndarray:
+    """One day's raw heatwave category over the box, land repaired if need be.
 
     South-up like the dailies — **verified, not assumed**: the MHW files declare
     `lat[0] = -89.975` exactly as CoralTemp does, so no flip. (NOAA's own browse
@@ -179,11 +229,40 @@ def read_mhw_raw(date: dt.date, nc_dir: Path | None = None) -> np.ndarray:
     *and* ice together, 0 no heatwave. Only 1..5 mean the same thing in both,
     which is why `mhw_valid_mask` bounds the range at both ends rather than
     testing for a fill value. See `MHW_MIN_CATEGORY`.
+
+    **On a file that carries no land at all — every 29 February in the archive —
+    the land mask is taken from the same date's CoralTemp file** and those cells
+    are rewritten to `MHW_LAND_CODE`. That file has to be on disk; without it
+    this raises rather than returning a field with continents at Cat 5. See
+    `MHW_LAND_CODE` for the measurement.
     """
-    return _to_project_frame(
+    raw = _to_project_frame(
         _read_raw(mhw_path(date, nc_dir), squeeze_time=True, var_name=MHW_VARIABLE_NAME),
         flip_lat=False,
     )
+    if mhw_carries_land(date, nc_dir):
+        return raw
+    return _repair_mhw_land(raw, date, sst_dir)
+
+
+def _repair_mhw_land(raw: np.ndarray, date: dt.date, sst_dir: Path | None) -> np.ndarray:
+    """Cut land out of a leap-day MHW field using the day's CoralTemp mask."""
+    path = daily_path(date, sst_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{mhw_path(date).name} carries no land — its category 5 covers the "
+            f"continents (see shared/fields.py) — and {path} is not on disk to "
+            "take a land mask from. Download the CoralTemp file for this date "
+            "and retry; ingesting or rendering it as it stands would put land "
+            "at Cat 5."
+        )
+    land = ~valid_mask(_to_project_frame(_read_raw(path, squeeze_time=True), flip_lat=False))
+    # int16 because MHW_LAND_CODE has to fit whichever dtype the file used, and
+    # the post-2024-07-01 files are unsigned.
+    out = raw.astype("int16")
+    out[land] = MHW_LAND_CODE
+    log.info("%s: repaired %d land cells miscoded as ocean", date, int(land.sum()))
+    return out
 
 
 def mhw_valid_mask(raw: np.ndarray) -> np.ndarray:
