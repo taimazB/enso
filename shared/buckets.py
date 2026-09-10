@@ -49,7 +49,12 @@ def _day_field(
     """
     try:
         if variable_name == "mhw":
-            return fields.as_category(fields.read_mhw_raw(day, mhw_dir)), None
+            # `sst_dir` is not a fallback: on a leap day the MHW file carries
+            # no land of its own and the CoralTemp file is what supplies it.
+            return (
+                fields.as_category(fields.read_mhw_raw(day, mhw_dir, sst_dir=nc_dir)),
+                None,
+            )
         raw = fields.read_daily_raw(day, nc_dir)
         if variable_name == "sst":
             return fields.as_celsius(raw), None

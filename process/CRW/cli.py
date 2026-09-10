@@ -30,14 +30,16 @@ over a range destroys the only source those frames can come from.
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime as dt
 import logging
 import sys
 
 import httpx
-from shared.ch import DATABASE, ensure_schema, get_client
+from shared.ch import DATABASE, STATUS_SUCCESS, ensure_schema, get_client
 from shared.domain import regions
-from shared.periods import PERIODS
+from shared import fields
+from shared.periods import PERIODS, span
 from shared.render import DEFAULT_WIDTH
 
 from . import (
@@ -502,6 +504,102 @@ def cmd_run(args) -> int:
     return 1 if failed else 0
 
 
+def _span_days(first: dt.date, last: dt.date) -> list[dt.date]:
+    return [first + dt.timedelta(days=i) for i in range((last - first).days + 1)]
+
+
+def _leap_days(client) -> list[dt.date]:
+    """Every 29 February inside the ingested MHW range."""
+    lo, hi = client.query(
+        f"SELECT min(date), max(date) FROM {DATABASE}.mhw_status "
+        f"WHERE status = '{STATUS_SUCCESS}'"
+    ).result_rows[0]
+    if not lo or not hi:
+        return []
+    return [
+        dt.date(year, 2, 29)
+        for year in range(lo.year, hi.year + 1)
+        if calendar.isleap(year) and lo <= dt.date(year, 2, 29) <= hi
+    ]
+
+
+def cmd_repair_mhw_land(args) -> int:
+    """Re-ingest and re-render the leap days, whose MHW files carry no land.
+
+    Every 29 February in the archive ships with land collapsed into ocean at
+    category 5 — see `shared/fields.py`'s `MHW_LAND_CODE` for the measurement.
+    `read_mhw_raw` now repairs that from the day's CoralTemp land mask, but the
+    rows and frames already written are wrong and nothing re-derives them: this
+    is what does.
+
+    Per date it downloads the CoralTemp file the land mask comes from, plus
+    **every MHW file the leap day's week and month buckets span** — a weekly
+    frame is a max over seven days and re-rendering it from the one file would
+    replace a good seven-day max with a one-day one — then re-ingests the date,
+    re-renders its three MHW buckets and rebuilds `region_daily` for it.
+    """
+    ensure_schema()
+
+    with get_client() as client, download.new_client() as http:
+        dates = [args.date] if args.date else _leap_days(client)
+        if not dates:
+            print("nothing to repair")
+            return 0
+
+        failed = 0
+        for date in dates:
+            # The days both affected buckets need on disk, not just this one.
+            needed = sorted(
+                {
+                    day
+                    for period in ("weekly", "monthly")
+                    for day in _span_days(*span(date, period))
+                }
+            )
+            log.info("%s: fetching %d MHW file(s) and 1 CoralTemp file", date, len(needed))
+            download.fetch(date, client=http, product=download.SST)
+            on_disk = config.available_mhw_dates()
+            for day in needed:
+                if day not in on_disk and download.head(day, client=http, product=download.MHW):
+                    download.fetch(day, client=http, product=download.MHW)
+
+            nc = next((f for f in config.scan_mhw() if f.date == date), None)
+            if nc is None:
+                log.error("%s: MHW file did not arrive", date)
+                failed += 1
+                continue
+            if fields.mhw_carries_land(date):
+                print(f"{date}: file carries land, nothing to repair")
+                continue
+
+            source = download.url(date, download.MHW)
+            remote = download.head(date, client=http, product=download.MHW) or (0, "")
+            counts = ingest.ingest_files(
+                client, [nc], force=True, batch_days=1,
+                source_url=source, target=ingest.MHW_TARGET,
+            )
+            if counts["failed"]:
+                log.error("%s: re-ingest failed", date)
+                failed += 1
+                continue
+            status_mod.record(
+                client, nc, status_mod.STATUS_SUCCESS,
+                n_rows=counts["rows"], source_url=source,
+                remote_size=remote[0], remote_modified=remote[1],
+                table=status_mod.MHW_TABLE,
+            )
+            imaging.render_date(
+                date,
+                width=args.width,
+                variables=("mhw",),
+                available_mhw=config.available_mhw_dates(),
+            )
+            regions_mod.build_region_daily(client, start=date, end=date)
+            print(f"{date}: re-ingested {counts['rows']:,} row(s), re-rendered, rolled up")
+
+    return 1 if failed else 0
+
+
 def cmd_status(args) -> int:
     with get_client() as client:
         def statuses(table):
@@ -623,6 +721,14 @@ def main(argv: list[str] | None = None) -> int:
                        help="how far back to HEAD for in-place revisions")
     p_run.add_argument("--max-days", type=int, help="cap the catch-up range")
     p_run.set_defaults(func=cmd_run)
+
+    p_fix = sub.add_parser(
+        "repair-mhw-land",
+        help="re-ingest and re-render the leap days, whose MHW files carry no land",
+    )
+    p_fix.add_argument("--date", type=_parse_date, help="one date instead of every leap day")
+    p_fix.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    p_fix.set_defaults(func=cmd_repair_mhw_land)
 
     with_selection(sub.add_parser("status", help="summarise pipeline state")).set_defaults(
         func=cmd_status
