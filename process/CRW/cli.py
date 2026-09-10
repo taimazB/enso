@@ -597,6 +597,11 @@ def cmd_repair_mhw_land(args) -> int:
             regions_mod.build_region_daily(client, start=date, end=date)
             print(f"{date}: re-ingested {counts['rows']:,} row(s), re-rendered, rolled up")
 
+        # Nine rows per repaired date superseding nine others. Trivial, and the
+        # reads use FINAL either way — but `cmd_rollup` collapses after a bulk
+        # build and this is the same shape, so it does too.
+        regions_mod.optimize(client)
+
     return 1 if failed else 0
 
 
