@@ -94,9 +94,9 @@ Three things to know before running it for real:
   before putting them back, and nothing the frontend reads can see that — `/coverage`'s
   `mhw.complete` gate is computed from the status tables, which the migration never
   touches. So the dashboard stays up and reports a confident **category 0** for every year
-  currently in flight. `docker-compose.prod.yml` carries a `maintenance` profile for this:
-  a stock nginx that takes over `front`'s and `api`'s ports and answers **503** — never 200,
-  which crawlers index and uptime monitors read as healthy.
+  currently in flight. `docker-compose.prod.yml` carries a general `maintenance` profile
+  for any planned outage — a stock nginx that takes over `front`'s and `api`'s ports and
+  answers **503**, never 200, which crawlers index and uptime monitors read as healthy.
 - **Forward only.** Source partitions are dropped as each one lands, so the run resumes at
   any partition boundary but cannot be abandoned half-way.
 - **Run it detached** — `run -d --name ...`, then `docker logs -f`. A `docker compose run`
@@ -127,7 +127,7 @@ front/       Nuxt 4 frontend (everything under front/app/)
 process/     CRW.cli download / ingest / render pipeline
 shared/      grid geometry, NetCDF reading, rendering, schema — mounted into api and process
 clickhouse/  local ClickHouse volumes and user config
-deploy/maintenance/  the 503 page and nginx conf the `maintenance` profile serves
+deploy/maintenance/  the 503 page and nginx conf served during any planned outage
 data/sst/          the daily SST NetCDF archive, pruned to a retention window (untracked)
 data/MHW/          the daily marine-heatwave archive, pruned the same way (untracked)
 data/climatology/  the 366-file 1991-2020 daily climatology, kept forever (untracked)

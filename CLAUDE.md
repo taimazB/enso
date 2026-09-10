@@ -65,12 +65,18 @@ the dev file; `.env.prod.example` is the template. The six that matter:
   `::/0` networks that dev's `allow_docker_network.xml` is there for.
 - **A `maintenance` service, behind its own profile**, which takes over `front`'s and
   `api`'s published ports while those two are stopped — `deploy/maintenance/`, an
-  `nginx:alpine` and two files, no build. It answers **503**, never 200: a maintenance page
-  served as 200 is cached by intermediaries, indexed by crawlers, and recorded by uptime
-  monitors as a healthy site. The frontend's port gets a page; the API's port gets JSON in
-  the same shape `SERVER.py`'s errors use (`detail` a sentence, `error.code` machine
-  readable), so a client that parses one parses this. It exists because a migration makes
-  the live site **wrong rather than merely slow** — see `repartition` below.
+  `nginx:alpine` and two files, no build. **It is general**: any planned outage uses it — a
+  schema migration, a ClickHouse upgrade, restoring a backup, host maintenance — and it
+  answers **503**, never 200, because a maintenance page served as 200 is cached by
+  intermediaries, indexed by crawlers, and recorded by uptime monitors as a healthy site.
+  The frontend's port gets a page; the API's port gets JSON in the same shape `SERVER.py`'s
+  errors use (`detail` a sentence, `error.code` machine readable), so a client that parses
+  one parses this.
+
+  **The page names no cause and takes no parameters, deliberately.** Which internal job is
+  running helps no visitor, and a page that must be edited before each use is one that gets
+  used with the previous outage's text still on it. `CRW.cli repartition` is the case it was
+  first needed for — see below for why that one cannot simply run against a live site.
 
   Two details, both verified by driving it: the API port answers an `OPTIONS` preflight
   **204 with the CORS headers**, because a tab left open on the dashboard sends
