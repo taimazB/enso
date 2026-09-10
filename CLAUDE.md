@@ -92,6 +92,7 @@ python -m CRW.cli rollup   [--start|--end] [--region KEY] [--fresh] [--clim]  # 
 python -m CRW.cli run      [--date] [--keep-nc] [--recheck-days N]
 python -m CRW.cli status                                  # per-status day/row counts, per archive
 python -m CRW.cli repair-mhw-land [--date]                # re-do the leap days (see below)
+python -m CRW.cli repartition [--table] [--dry-run] [--optimize] [--finish]  # one-off
 ```
 
 **There are two daily archives and every command covers both by default.** CoralTemp SST
@@ -458,7 +459,9 @@ has_clim  UInt8   -- does this cell have a climatology for this date's MMDD?
 sst       Float32 ALIAS sst_raw * 0.01
 lat       Float32 ALIAS -89.975 + gy * 0.05
 lon       Float32 ALIAS 0.025 + gx * 0.05
-ENGINE = MergeTree PARTITION BY toYear(date) ORDER BY (gy, gx, date)
+ENGINE = MergeTree ORDER BY (gy, gx, date)
+PARTITION BY if(toYear(date) >= 2024, toString(toYear(date)),
+                toString(intDiv(toYear(date), 10) * 10))    -- decades, then years
 ```
 
 **`sst_clim`** — the 1991–2020 daily climatology, one row per (mmdd, ocean cell).
@@ -473,7 +476,9 @@ gx    UInt16
 cat   UInt8   -- 1..5, the source's own ordinal class; no scale factor to undo
 lat   Float32 ALIAS -89.975 + gy * 0.05
 lon   Float32 ALIAS 0.025 + gx * 0.05
-ENGINE = MergeTree PARTITION BY toYear(date) ORDER BY (gy, gx, date)
+ENGINE = MergeTree ORDER BY (gy, gx, date)
+PARTITION BY if(toYear(date) >= 2024, toString(toYear(date)),
+                toString(intDiv(toYear(date), 10) * 10))    -- decades, then years
 ```
 
 **Only `cat >= 1` is stored, and that is what makes it affordable.** Measured over 40
@@ -597,7 +602,7 @@ row per day, one table per archive. Two tables rather than one with a `product` 
 because the sorting key is `date` and a product would have to join it, which cannot be
 altered in place — and because the two archives genuinely progress independently.
 
-Four decisions worth not undoing:
+Five decisions worth not undoing:
 
 1. **There are no projections anywhere, and this is the central design decision.** The
    OISST schema carried a `by_date` projection so whole-day map reads did not scan a table
@@ -619,6 +624,47 @@ Four decisions worth not undoing:
 
 4. **`has_clim` is per (cell, date), not per cell.** The ice edge moves through the year,
    so it cannot be a static property. It is what makes the region identity below exact.
+
+5. **Partitioning is by decade for the archive and by year from 2024 on, and the point
+   query is the whole reason.** `ORDER BY (gy, gx, date)` makes one cell's 15k-row history
+   a single contiguous key range — which is exactly what the chart asks for on every map
+   click — and a partition key cuts that range into one piece per partition. The cost is
+   **not** the bytes: a point query reads ~8.5 MiB either way. It is the **file opens**,
+   measured at **~4.0 per selected part** (729 opens over 181 parts; 12 over 3). Each one
+   is a seek, and that is ~50 us on NVMe against **~4.3 ms** on the production box's HDD.
+
+   Measured against that server, one cold cell, full archive:
+
+   | | partitions | parts | file opens | cold TTFB |
+   |---|---|---|---|---|
+   | `PARTITION BY toYear(date)` | 42 | 196 | ~790 | **~3.4 s** |
+   | this expression | 8 | 8 | ~32 | **~0.14 s** |
+
+   **The symptom this fixes is "only the first click is slow."** A second query on the same
+   cell is ~0.18 s under either scheme, because the granules are in the page cache by then —
+   which is also why prewarming the mark cache changed nothing measurable. `sst_daily`'s
+   marks are only 89 MiB and were already resident; the cost is the *data* granules,
+   scattered over 129 GB, which nothing can hold.
+
+   **2024 onward stays per-year deliberately.** `ingest.delete_day()` replaces a revised
+   date with an `ALTER ... DELETE`, a mutation that rewrites every part it touches, and
+   folding the recent years into a decade would take that from ~3 GB to ~31 GB. The source
+   only ever revises the recent end (`--recheck-days`), so splitting the key at that
+   boundary buys the fast read without paying for it on ingest.
+
+   **It is also sized to the disk it runs on.** Merges are capped by free space, so one
+   ~120 GB `archive` partition would never merge down on a box with 90 GB free — it would
+   settle at a dozen parts instead, silently, which is the thing being fixed. Decade
+   buckets top out at **31.35 GiB** (the 2010s), which merges in that headroom.
+
+   Bumping `shared.ch.PARTITION_BOUNDARY_YEAR` is the maintenance this needs: years past it
+   accumulate one partition each, so around 2034 it is worth moving it forward and
+   re-running the migration. Nothing breaks meanwhile — a point query just picks up one
+   more part per elapsed year.
+
+   **Changing the DDL does not change an existing database.** `ensure_schema()` is
+   `CREATE TABLE IF NOT EXISTS`, so `CRW.cli repartition` is what actually rewrites the
+   archive — see below.
 
 #### Anomaly is derived, and how depends on the query shape
 
@@ -659,9 +705,54 @@ Entry point `process/CRW/cli.py` (`python -m CRW.cli`). Modules:
 - `regions.py` — the `region_daily` rollup (`CRW.cli rollup`)
 - `imaging.py` — day/week/month × sst/anom/mhw rendering, and the retention window
 - `status.py` — the `ingest_status` table
+- `repartition.py` — the one-off partition-key migration (`CRW.cli repartition`)
 
 Inserts are batched across days (`--batch`, default **5** — a day is ~7.5 M rows now, not
 OISST's 96 k, so the old default of 30 was a 225 M-row insert).
+
+#### `repartition`, and why it never needs a second copy of the table
+
+**A one-off migration, and the only command here that rewrites a table it did not
+ingest.** It exists because `ensure_schema()` is `CREATE TABLE IF NOT EXISTS`: editing the
+DDL fixes a fresh database and does nothing at all to the one holding the archive.
+
+**The obvious `INSERT INTO new SELECT * FROM old` wants 129 GB of headroom, and the
+production box has 90 GB.** So it goes one source partition at a time and **drops each one
+once its rows are confirmed landed** — occupancy stays flat at the table's own size with a
+one-year bulge of ~3.1 GB, and the run is resumable at every partition boundary. That is
+the whole design of the module.
+
+The order of operations is the safety rail and only ever moves one way:
+
+```
+rows in old partition -> INSERT -> rows landed == rows expected -> only then DROP
+```
+
+so an interruption loses work, never data. Verified on a synthetic 42-partition table:
+300,000 rows in, 300,000 out, 42 partitions to 8; and separately that `finish` refuses
+while source partitions remain, that a low-disk plan refuses before touching anything,
+and that a row-count mismatch raises **with the source partition still in place**.
+
+Three details worth knowing:
+
+- **Row counts come from `system.parts`, not `count()`.** They are exact and a merge never
+  changes them, so verifying a 2.7-billion-row year is free. The one query in the module
+  that reads data is the stale-row check, which is why it runs **once per invocation**
+  rather than once per year: after the first partition the run has done every subsequent
+  one itself and knows they were clean.
+- **A crash mid-insert leaves a partial year**, which the next run detects and clears with
+  an `ALTER ... DELETE` before retrying. That mutation is expensive and is meant to be — it
+  is the crash path only, and the alternative is a second partial copy appended silently.
+- **Partitions move oldest first**, because the recent end is what `run` touches daily.
+
+`--dry-run` prints the plan and its disk cost; the default copies; `--finish` performs the
+`EXCHANGE TABLES` swap, kept separate because it is the only irreversible moment.
+`--optimize` merges each new partition to one part **where free space allows** and skips
+with a warning where it does not — at that point the table is already ~40x fewer parts than
+it started with, so it is a finishing touch rather than the point.
+
+Do `mhw_daily` first: same code, a fortieth of the bytes, and it is the bigger share of the
+`mhw` variable's latency anyway, since that query pays both tables' part counts.
 
 #### Downloading, and revisions in place
 
@@ -1529,6 +1620,12 @@ menu, pick the default region — report nothing. Found in the browser, not by r
 ## Gotchas
 
 - **`--env-file .env.dev` is required** on every compose invocation, as above.
+- **Editing the DDL in `shared/ch.py` does not repartition an existing database.**
+  `ensure_schema()` is `CREATE TABLE IF NOT EXISTS`, so a changed `PARTITION BY` applies to
+  a fresh deploy and is silently inert on the one that matters. `CRW.cli repartition` is
+  the migration; `shared.ch.is_repartitioned()` is what answers "is this server on the new
+  key". Pause the cron for the duration — `run`'s ingest and the migration would otherwise
+  contend for the same partitions.
 - **`CH_IMAGE_TAG` must be >= the version that wrote `CH_DATA_DIR`.** ClickHouse has no
   downgrade path. Dev runs `clickhouse-server:latest`, so a data directory copied from a
   dev box to prod carries whatever major was current — 26.5.1.882 for the first copy —

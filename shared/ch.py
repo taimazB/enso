@@ -9,6 +9,7 @@ tables. `get_client()` selects between the local docker-compose instance
 from __future__ import annotations
 
 import os
+import re
 
 import clickhouse_connect
 
@@ -40,6 +41,69 @@ def get_client(database: str | None = None, **kwargs):
         database=database,
         **kwargs,
     )
+
+
+# --- Partitioning ------------------------------------------------------------
+#
+# BOTH DAILY TABLES PARTITION BY DECADE, NOT BY YEAR, AND THE POINT QUERY IS WHY.
+#
+# `ORDER BY (gy, gx, date)` makes one cell's whole history a single contiguous
+# key range, which is the shape the chart asks for on every map click. A
+# partition key cuts that range into one piece per partition, and the cost is
+# not the bytes — a point query reads ~8.5 MiB — it is the FILE OPENS, measured
+# at ~4.0 per selected part (729 opens over 181 parts; 12 over 3). Each one is a
+# seek, which an NVMe serves in ~50us and a 7200rpm disk in ~4.3ms.
+#
+# Measured against the production server, one cold cell, full archive:
+#
+#     PARTITION BY toYear(date)   42 partitions, 196 parts   ~790 opens   ~3.4 s
+#     this expression              8 partitions,   8 parts    ~32 opens   ~0.14 s
+#
+# A second query on the same cell is ~0.18s either way — that is the page cache,
+# and it is why the problem only shows up as "the first click is slow".
+#
+# **Recent years stay per-year deliberately.** `ingest.delete_day()` replaces a
+# revised date with an `ALTER ... DELETE`, a mutation that rewrites every part it
+# touches; folding 2024+ into a decade would take that from ~3 GB to ~31 GB. The
+# source only ever revises the recent end (`--recheck-days`), so splitting the
+# key at the boundary below buys the fast read without paying for it on ingest.
+#
+# It is also sized to the disk it runs on. Merges are capped by free space, so a
+# single `archive` partition of ~120 GB would not merge down on a box with 90 GB
+# free — it would silently settle at a dozen parts, which is the thing this is
+# trying to fix. Decade buckets are ~31 GiB at their largest, which merges in
+# that headroom with room to spare.
+#
+# Bumping the boundary is safe and is the maintenance this needs: years past it
+# accumulate one partition each, so around 2034 it is worth moving it forward and
+# re-running `CRW.cli repartition`. Nothing breaks in the meantime; a point query
+# just picks up one more part per elapsed year.
+PARTITION_BOUNDARY_YEAR = 2024
+
+DAILY_PARTITION_SQL = (
+    f"if(toYear(date) >= {PARTITION_BOUNDARY_YEAR}, toString(toYear(date)),"
+    " toString(intDiv(toYear(date), 10) * 10))"
+)
+
+
+def partition_key_of(client, table: str) -> str:
+    """The partition expression the LIVE table carries, whitespace-stripped.
+
+    `ensure_schema()` is `CREATE TABLE IF NOT EXISTS`, so changing the DDL above
+    does nothing to a database that already exists — the migration is
+    `CRW.cli repartition`. This is what lets a command say which of the two a
+    given server is on rather than assuming.
+    """
+    rows = client.query(
+        "SELECT partition_key FROM system.tables WHERE database = %(db)s AND name = %(t)s",
+        parameters={"db": DATABASE, "t": table},
+    ).result_rows
+    return re.sub(r"\s+", "", rows[0][0]) if rows else ""
+
+
+def is_repartitioned(client, table: str) -> bool:
+    """Whether `table` is already on `DAILY_PARTITION_SQL`."""
+    return partition_key_of(client, table) == re.sub(r"\s+", "", DAILY_PARTITION_SQL)
 
 
 # --- Schema -----------------------------------------------------------------
@@ -116,7 +180,7 @@ DDL: tuple[str, ...] = (
         lon       Float32 ALIAS 0.025 + gx * 0.05
     )
     ENGINE = MergeTree
-    PARTITION BY toYear(date)
+    PARTITION BY {DAILY_PARTITION_SQL}
     ORDER BY (gy, gx, date)
     """,
     # The 1991-2020 daily climatology, one row per (day-of-year, ocean cell).
@@ -305,7 +369,7 @@ DDL: tuple[str, ...] = (
         lon       Float32 ALIAS 0.025 + gx * 0.05
     )
     ENGINE = MergeTree
-    PARTITION BY toYear(date)
+    PARTITION BY {DAILY_PARTITION_SQL}
     ORDER BY (gy, gx, date)
     """,
     # One row per date. `remote_size`/`remote_modified` are what a re-check

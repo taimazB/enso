@@ -7,6 +7,7 @@
     python -m CRW.cli rollup   [--start/--end]      # build region_daily
     python -m CRW.cli run      [--date ...]         # download + ingest + render
     python -m CRW.cli status   [--date ...]
+    python -m CRW.cli repartition [--table]      # one-off partition-key migration
 
 `run` is the daily job: for each date it downloads, ingests, then renders that
 date's buckets. `backfill` and `render` are its one-time counterparts over an
@@ -49,6 +50,7 @@ from . import (
     imaging,
     ingest,
     regions as regions_mod,
+    repartition as repartition_mod,
     status as status_mod,
 )
 
@@ -605,6 +607,54 @@ def cmd_repair_mhw_land(args) -> int:
     return 1 if failed else 0
 
 
+def cmd_repartition(args) -> int:
+    """Move a daily table onto the decade partition key. See `shared/ch.py`.
+
+    A one-off migration, and the only command here that rewrites a table it did
+    not ingest. It exists because `ensure_schema()` is `CREATE TABLE IF NOT
+    EXISTS`: changing the DDL fixes new databases and does nothing at all to the
+    one holding the archive.
+
+    It is deliberately three steps rather than one. `--dry-run` prints the plan
+    and its disk cost; the default copies partitions and drops each source only
+    once its rows are confirmed landed; `--finish` performs the atomic swap. The
+    middle step is resumable at every partition boundary, so on a spinning disk
+    this can be run in whatever windows are available rather than needing one
+    long one.
+    """
+    # A dedicated client, for its timeout: see `repartition.CLIENT_TIMEOUT_S`. The default
+    # 300 s is shorter than a single year's insert on a spinning disk, and the timeout does
+    # not fail the migration so much as wedge it.
+    with get_client(send_receive_timeout=repartition_mod.CLIENT_TIMEOUT_S) as client:
+        tables = [args.table] if args.table else list(repartition_mod.TABLES)
+
+        if args.finish:
+            for table in tables:
+                repartition_mod.finish(client, table)
+            return 0
+
+        for table in tables:
+            summary = repartition_mod.migrate(
+                client,
+                table,
+                limit=args.limit,
+                settle_parts=args.settle_parts,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                continue
+            if args.optimize and summary["done"]:
+                repartition_mod.optimize(client, table)
+            if summary["done"]:
+                print(
+                    f"{table}: every partition moved. Verify, then swap it in with\n"
+                    f"    python -m CRW.cli repartition --table {table} --finish"
+                )
+            else:
+                print(f"{table}: {summary['moved']} partition(s) moved; re-run to continue")
+    return 0
+
+
 def cmd_status(args) -> int:
     with get_client() as client:
         def statuses(table):
@@ -734,6 +784,30 @@ def main(argv: list[str] | None = None) -> int:
     p_fix.add_argument("--date", type=_parse_date, help="one date instead of every leap day")
     p_fix.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     p_fix.set_defaults(func=cmd_repair_mhw_land)
+
+    p_part = sub.add_parser(
+        "repartition",
+        help="move a daily table onto the decade partition key (one-off migration)",
+    )
+    p_part.add_argument(
+        "--table", choices=repartition_mod.TABLES,
+        help="one table instead of both; mhw_daily is the small one, do it first",
+    )
+    p_part.add_argument("--limit", type=int, help="stop after N partitions")
+    p_part.add_argument("--dry-run", action="store_true", help="print the plan and stop")
+    p_part.add_argument(
+        "--settle-parts", type=int, default=repartition_mod.SETTLE_PARTS,
+        help="pause between partitions until the busiest one is below this many parts",
+    )
+    p_part.add_argument(
+        "--optimize", action="store_true",
+        help="merge each partition to one part afterwards, where free space allows",
+    )
+    p_part.add_argument(
+        "--finish", action="store_true",
+        help="swap the migrated table into place (atomic, and the irreversible step)",
+    )
+    p_part.set_defaults(func=cmd_repartition)
 
     with_selection(sub.add_parser("status", help="summarise pipeline state")).set_defaults(
         func=cmd_status
